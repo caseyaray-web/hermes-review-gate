@@ -269,24 +269,26 @@ vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8")); page(); Promise.re
         assert matching[0]["props"]["disabled"] is False
 
 
-def test_shipped_dashboard_surfaces_failed_escalation_save_to_mobile_view():
+@pytest.mark.parametrize(("fails", "expected"), [(True, "policy save refused"), (False, "Review-correction escalation policy saved.")])
+def test_shipped_dashboard_surfaces_escalation_save_result_to_mobile_view(fails, expected):
     bundle = plugin_api.Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js"
     status = {"configuration": {"implementation_profile": "impl", "reviewer_profile": "review"},
               "board_policies": [{"board": "default", "implementation_profile": "impl", "reviewer_profile": "review",
                                   "escalation": {"enabled": False, "normal_correction_limit": 2, "max_attempts": 1,
                                                  "implementation_profile": "strong", "reviewer_profile": "strong"}}],
               "counts": {}, "tasks": []}
+    mutation_response = 'Promise.reject(new Error("policy save refused"))' if fails else "Promise.resolve({})"
     script = f'''const fs=require("fs"),vm=require("vm");
 let states=[],cursor=0,page,scrolls=[];const h=(type,props,...children)=>({{type,props:props||{{}},children}});
 const hooks={{useState:(initial)=>{{const i=cursor++;if(!(i in states))states[i]=initial;return [states[i],v=>states[i]=v];}},useEffect:(fn)=>fn()}};
 global.setInterval=()=>0;global.clearInterval=()=>{{}};
-global.window={{scrollTo:(...args)=>scrolls.push(args),__HERMES_PLUGIN_SDK__:{{React:{{createElement:h}},hooks,fetchJSON:(path)=>path.endsWith('/status')?Promise.resolve({json.dumps(status)}):path.endsWith('/profiles')?Promise.resolve({{profiles:["strong"]}}):path.endsWith('/boards')?Promise.resolve({{boards:["default"]}}):Promise.reject(new Error("policy save refused"))}},__HERMES_PLUGINS__:{{register:(_,p)=>page=p}}}};
-(async()=>{{vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8"));page();await Promise.resolve();await Promise.resolve();cursor=0;let tree=page();function nodes(v){{if(Array.isArray(v))return v.flatMap(nodes);if(v&&typeof v==="object")return [v,...nodes(v.children||[])];return []}}const save=nodes(tree).find(x=>x.type==="button"&&x.children.includes("Save escalation policy"));await save.props.onClick();await new Promise(r=>setTimeout(r,0));cursor=0;tree=page();const alert=nodes(tree).find(x=>x.props&&x.props.role==="alert");console.log(JSON.stringify({{scrolls,alert:alert&&alert.children}}));}})();'''
+global.window={{scrollTo:(...args)=>scrolls.push(args),__HERMES_PLUGIN_SDK__:{{React:{{createElement:h}},hooks,fetchJSON:(path)=>path.endsWith('/status')?Promise.resolve({json.dumps(status)}):path.endsWith('/profiles')?Promise.resolve({{profiles:["strong"]}}):path.endsWith('/boards')?Promise.resolve({{boards:["default"]}}):path.endsWith('/escalation')?({mutation_response}):Promise.reject(new Error("unexpected route"))}},__HERMES_PLUGINS__:{{register:(_,p)=>page=p}}}};
+(async()=>{{vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8"));page();await Promise.resolve();await Promise.resolve();cursor=0;let tree=page();function nodes(v){{if(Array.isArray(v))return v.flatMap(nodes);if(v&&typeof v==="object")return [v,...nodes(v.children||[])];return []}}const save=nodes(tree).find(x=>x.type==="button"&&x.children.includes("Save escalation policy"));await save.props.onClick();await new Promise(r=>setTimeout(r,0));cursor=0;tree=page();const feedback=nodes(tree).filter(x=>x.props&&(x.props.role==="alert"||x.props.role==="status")).map(x=>x.children);console.log(JSON.stringify({{scrolls,feedback}}));}})();'''
     result = subprocess.run(["node", "-e", script], text=True, capture_output=True, timeout=30)
     assert result.returncode == 0, result.stderr
     rendered = json.loads(result.stdout)
     assert rendered["scrolls"], rendered
-    assert "policy save refused" in str(rendered["alert"])
+    assert expected in str(rendered["feedback"])
 
 
 def test_policy_scope_exposes_default_recovery_limit_for_legacy_policy(monkeypatch):

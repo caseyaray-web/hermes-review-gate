@@ -20,7 +20,7 @@
     function mutate(path,method,body,message){
       Q(true);E("");N("");
       return request(path,{method:method,headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
-        .then(function(result){N(typeof message === "function" ? message(result) : message);return refresh(true);}).catch(function(e){E(String(e.message || e));window.scrollTo({top:0,behavior:"smooth"});}).finally(function(){Q(false);});
+        .then(function(result){N(typeof message === "function" ? message(result) : message);window.scrollTo({top:0,behavior:"smooth"});return refresh(true);}).catch(function(e){E(String(e.message || e));window.scrollTo({top:0,behavior:"smooth"});}).finally(function(){Q(false);});
     }
     function select(label,value,change){
       const options=profiles.slice();if(value && !options.includes(value))options.push(value);
