@@ -221,7 +221,49 @@ def test_terminal_before_admission_requires_one_exact_ended_replacement(monkeypa
     assert not plugin._terminal_unadmitted_replacement(show, entry)
 
 
+def test_reserve_recovery_rejects_workspace_bound_to_another_board(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda _: True)
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("board-a", activation_id="a", native_run_watermark=0)
+    state.activate_board("board-b", activation_id="b", native_run_watermark=0)
+    first = {"board": "board-a", "task_id": "task-a", "implementation_profile": "impl",
+             "reviewer_profile": "review", "workspace_path": "/shared-linked-worktree"}
+    second = {"board": "board-b", "task_id": "task-b", "implementation_profile": "impl",
+              "reviewer_profile": "review", "workspace_path": "/shared-linked-worktree"}
+    current = state.load_state()
+    current["tasks"]["board-a:task-a"] = first
+    state.save_state(current)
+
+    with pytest.raises(ValueError, match="already bound"):
+        state.reserve_recovery("board-b", "task-b", failed_run_id=2, phase="implementation",
+                               workspace_path="/shared-linked-worktree", checkpoint={}, binding=second, adopted=True)
+
+    persisted = state.load_state()
+    assert state.task_binding("task-b", "board-b") is None
+    assert "board-b:task-b:2:implementation" not in persisted["recovery"]
+    assert persisted["recovery_budgets"].get("board-b:task-b:implementation", 0) == 0
+
+
+def test_adopted_recovery_rejects_unmaterialized_worktree(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda _: True)
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("default", activation_id="adoption", native_run_watermark=0)
+    binding = _binding()
+
+    with pytest.raises(ValueError, match="materialized task-scoped linked worktree"):
+        state.reserve_recovery("default", "task", failed_run_id=1, phase="implementation",
+                               workspace_path="/work", checkpoint={}, binding=binding, adopted=True)
+
+    assert state.task_binding("task", "default") is None
+    assert state.load_state()["recovery"] == {}
+
+
 def test_phase_budget_and_workspace_lease_survive_native_counter_reset(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"; monkeypatch.setattr(state, "state_path", lambda: path); monkeypatch.setattr(state, "profile_exists", lambda _: True)
     binding = _binding(); state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {"default": {"activation_id": "a", "native_run_watermark": 0, "implementation_profile": "impl", "reviewer_profile": "review"}}})
     state.reserve_recovery("default", "task", failed_run_id=1, phase="implementation", workspace_path="/work", checkpoint={}, binding=binding, adopted=True)
@@ -234,6 +276,7 @@ def test_phase_budget_and_workspace_lease_survive_native_counter_reset(tmp_path,
 
 def test_configured_phase_budget_counts_distinct_failed_runs_across_restart_and_policy_changes(tmp_path, monkeypatch):
     """Each failed native run consumes one durable per-phase grant, never a toggle."""
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"
     monkeypatch.setattr(state, "state_path", lambda: path)
     monkeypatch.setattr(state, "profile_exists", lambda _: True)
@@ -284,6 +327,7 @@ def test_recovery_policy_rejects_zero_boolean_fractional_negative_and_excessive_
 
 
 def test_verified_implementation_handoff_terminalizes_only_its_exact_recovery(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"
     monkeypatch.setattr(state, "state_path", lambda: path)
     monkeypatch.setattr(state, "profile_exists", lambda _: True)
@@ -310,6 +354,7 @@ def test_verified_implementation_handoff_terminalizes_only_its_exact_recovery(tm
     ("review", 2, 2),
 ])
 def test_implementation_handoff_recovery_refuses_wrong_run_phase_or_missing_receipt(tmp_path, monkeypatch, phase, authorized_run, receipt_run):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"
     monkeypatch.setattr(state, "state_path", lambda: path)
     monkeypatch.setattr(state, "profile_exists", lambda _: True)

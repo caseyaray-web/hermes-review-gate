@@ -855,6 +855,7 @@ def test_joined_recovery_terminal_before_receipt_releases_only_its_successor(boa
     assert other_workspace != workspace
     binding = dict(original_binding)
     binding['task_id'] = other
+    binding['workspace_path'] = str(other_workspace)
     state.reserve_recovery('default', other, failed_run_id=999, phase='implementation', workspace_path=str(other_workspace),
                            checkpoint={'head': 'a' * 40, 'dirty': []}, binding=binding, adopted=True)
     with pytest.raises(ValueError, match='budget exhausted'):

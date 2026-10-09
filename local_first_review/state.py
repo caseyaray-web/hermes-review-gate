@@ -407,8 +407,20 @@ def reserve_recovery(board: str, task_id: str, *, failed_run_id: int, phase: str
         if holder is not None and holder != key: raise ValueError("workspace recovery lease is held by another task")
         task_key = binding_key(board, task_id)
         current = data["tasks"].get(task_key)
+        binding_workspace = binding.get("workspace_path") if isinstance(binding, dict) else None
+        try:
+            same_workspace = (isinstance(binding_workspace, str) and Path(binding_workspace).is_absolute()
+                              and Path(binding_workspace).resolve() == Path(workspace_path).resolve())
+        except (OSError, RuntimeError):
+            same_workspace = False
+        if not same_workspace:
+            raise ValueError("recovery workspace differs from its immutable task binding")
+        if _workspace_binding_conflict(data, board, task_id, workspace_path):
+            raise ValueError("task-scoped worktree is already bound to another managed task")
         if current is None:
             if not adopted: raise ValueError("recovery requires an immutable binding")
+            if not Path(workspace_path).is_absolute() or not _is_materialized_linked_worktree(workspace_path):
+                raise ValueError("adopted recovery requires a materialized task-scoped linked worktree")
             data["tasks"][task_key] = dict(binding)
         elif current != binding: raise ValueError("existing binding differs from recovery observation")
         record = {"board": board, "task_id": task_id, "failed_run_id": failed_run_id, "phase": phase,
@@ -526,6 +538,7 @@ def _validate_first_run(policy: dict[str, Any], task: dict[str, Any], runs: list
     task_id, workspace = task.get("id"), task.get("workspace_path")
     if not _text(task_id) or task.get("status") != "running": raise ValueError("board policy cannot adopt a non-running task")
     if task.get("workspace_kind") != "worktree" or not _text(workspace) or not Path(workspace).is_absolute(): raise ValueError("board policy requires an absolute task-scoped worktree: Git workspace")
+    if not _is_materialized_linked_worktree(str(workspace)): raise ValueError("board policy requires a materialized task-scoped linked worktree")
     if task.get("assignee") != policy["implementation_profile"] or profile != policy["implementation_profile"]: raise ValueError("board policy task/profile does not match its pinned implementation profile")
     if len(runs) != 1: raise ValueError("board policy will not adopt a task with prior or ambiguous native runs")
     run = runs[0]

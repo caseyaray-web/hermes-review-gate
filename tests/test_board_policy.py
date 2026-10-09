@@ -39,7 +39,8 @@ def native_run(*, run_id=9, profile="impl", started_at=101, ended_at=None):
     return {"id": run_id, "profile": profile, "status": "running", "started_at": started_at, "ended_at": ended_at}
 
 
-def test_board_activation_and_first_binding_allow_same_profile_for_both_roles(policy_file):
+def test_board_activation_and_first_binding_allow_same_profile_for_both_roles(policy_file, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda path: path == "/work")
     state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "impl", "tasks": {}, "boards": {}})
 
     policy = state.activate_board("board-a", activation_id="same-profile", native_run_watermark=8)
@@ -49,7 +50,8 @@ def test_board_activation_and_first_binding_allow_same_profile_for_both_roles(po
     assert binding["implementation_profile"] == binding["reviewer_profile"] == "impl"
 
 
-def test_activation_migrates_legacy_state_and_first_future_run_is_bound(policy_file):
+def test_activation_migrates_legacy_state_and_first_future_run_is_bound(policy_file, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda path: path == "/work")
     policy_file.write_text(json.dumps({"version": 1, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {
         "old:legacy": {"board": "old", "task_id": "legacy", "implementation_profile": "impl", "reviewer_profile": "review", "workspace_path": "/legacy"}}}))
 
@@ -75,7 +77,8 @@ def test_activation_migrates_legacy_state_and_first_future_run_is_bound(policy_f
     (native_task(workspace="relative"), [native_run()], 9, "impl"),
     (native_task(), [native_run(profile="other")], 9, "other"),
 ])
-def test_first_binding_refuses_attention_or_mismatch(policy_file, task, runs, run_id, profile):
+def test_first_binding_refuses_attention_or_mismatch(policy_file, task, runs, run_id, profile, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda path: path == "/work")
     state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
     state.activate_board("board-a", activation_id="activation-a", native_run_watermark=8)
 
@@ -85,7 +88,8 @@ def test_first_binding_refuses_attention_or_mismatch(policy_file, task, runs, ru
     assert state.load_state()["tasks"] == {}
 
 
-def test_first_binding_rejects_a_workspace_already_bound_to_another_task(policy_file):
+def test_first_binding_rejects_a_workspace_already_bound_to_another_task(policy_file, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda path: path == "/work")
     state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
     state.activate_board("board-a", activation_id="activation-a", native_run_watermark=8)
     state.bind_first_owned_run("board-a", native_task(task_id="one"), [native_run()], run_id=9, profile="impl")
@@ -96,7 +100,8 @@ def test_first_binding_rejects_a_workspace_already_bound_to_another_task(policy_
     assert state.task_binding("two", "board-a") is None
 
 
-def test_first_binding_rejects_workspace_reuse_across_boards(policy_file):
+def test_first_binding_rejects_workspace_reuse_across_boards(policy_file, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda path: path == "/work")
     state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
     state.activate_board("board-a", activation_id="activation-a", native_run_watermark=8)
     state.activate_board("board-b", activation_id="activation-b", native_run_watermark=8)
@@ -125,6 +130,24 @@ def test_enrollment_rejects_repo_root_before_worktree_materialization(policy_fil
         state.enroll_task(board="board-a", task=task, runs=[])
 
     assert state.task_binding("unmaterialized", "board-a") is None
+
+
+def test_first_binding_rejects_unmaterialized_repository_root(policy_file, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    (repo / "tracked.txt").write_text("fixture\\n")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("board-a", activation_id="activation-a", native_run_watermark=8)
+
+    with pytest.raises(ValueError, match="materialized task-scoped linked worktree"):
+        state.bind_first_owned_run("board-a", native_task(workspace=str(repo)), [native_run()], run_id=9, profile="impl")
+
+    assert state.task_binding("future", "board-a") is None
 
 
 def test_malformed_board_policy_fails_closed(policy_file):
