@@ -172,9 +172,9 @@ def _activation_preview(board: str, *, policy: dict[str, Any], legacy_bound_ids:
             legacy_bound.append(task_id)
             continue
         workspace = task.get("workspace_path")
-        if task.get("workspace_kind") != "dir" or not isinstance(workspace, str) or not Path(workspace).is_absolute():
-            attention.append(_attention(task_id, "workspace is not an absolute dir: workspace",
-                                        "Set an absolute dir: workspace before native dispatch."))
+        if task.get("workspace_kind") != "worktree" or not isinstance(workspace, str) or not Path(workspace).is_absolute():
+            attention.append(_attention(task_id, "workspace is not an absolute task-scoped Git worktree",
+                                        "Set --workspace worktree:<absolute-repo-path> before native dispatch."))
             continue
         assignee = task.get("assignee")
         if not isinstance(assignee, str) or not assignee:

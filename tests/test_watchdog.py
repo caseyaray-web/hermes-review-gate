@@ -386,7 +386,7 @@ def test_lost_native_handoff_response_still_terminalizes_exact_recovery(monkeypa
 
 
 def _unbound_rm02_show(task_id: str, run_id: int, *, workspace: str = "/work") -> dict:
-    return {"task": {"id": task_id, "status": "blocked", "workspace_kind": "dir",
+    return {"task": {"id": task_id, "status": "blocked", "workspace_kind": "worktree",
                      "workspace_path": workspace, "assignee": "impl"},
             "runs": [{"id": run_id, "profile": "impl", "outcome": "gave_up"}],
             "events": []}

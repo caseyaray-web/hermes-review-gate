@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import subprocess
 from typing import Any, Iterator
 
 CONFIG_NAME = "local-first-review.json"
@@ -491,11 +492,40 @@ def activate_board(board: str, *, activation_id: str, native_run_watermark: int 
         policy = {"activation_id": activation_id, "native_run_watermark": native_run_watermark, "implementation_profile": implementation, "reviewer_profile": reviewer, "recovery": {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}, "escalation": {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}}
         data["boards"][board] = policy; return json.loads(json.dumps(policy))
 
+def _workspace_binding_conflict(data: dict[str, Any], board: str, task_id: str, workspace: str) -> bool:
+    target = Path(workspace).resolve()
+    for binding in data["tasks"].values():
+        if binding.get("board") == board and binding.get("task_id") == task_id:
+            continue
+        other = Path(str(binding.get("workspace_path"))).resolve()
+        if target == other:
+            return True
+    return False
+
+
+def _is_materialized_linked_worktree(workspace: str) -> bool:
+    try:
+        path = Path(workspace).resolve()
+    except (OSError, RuntimeError):
+        return False
+    try:
+        top = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                             check=True, capture_output=True, text=True, timeout=5).stdout.strip()
+        git_dir = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir"],
+                                 check=True, capture_output=True, text=True, timeout=5).stdout.strip()
+        common_dir = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                    check=True, capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(top and git_dir and common_dir and Path(top).resolve() == path
+                and Path(git_dir).resolve() != Path(common_dir).resolve())
+
+
 def _validate_first_run(policy: dict[str, Any], task: dict[str, Any], runs: list[dict[str, Any]], *, run_id: int, profile: str) -> tuple[str, str]:
     if not isinstance(task, dict) or not isinstance(runs, list) or type(run_id) is not int or not _text(profile): raise ValueError("native task/run observation is incomplete")
     task_id, workspace = task.get("id"), task.get("workspace_path")
     if not _text(task_id) or task.get("status") != "running": raise ValueError("board policy cannot adopt a non-running task")
-    if task.get("workspace_kind") != "dir" or not _text(workspace) or not Path(workspace).is_absolute(): raise ValueError("board policy requires an absolute dir: Git workspace")
+    if task.get("workspace_kind") != "worktree" or not _text(workspace) or not Path(workspace).is_absolute(): raise ValueError("board policy requires an absolute task-scoped worktree: Git workspace")
     if task.get("assignee") != policy["implementation_profile"] or profile != policy["implementation_profile"]: raise ValueError("board policy task/profile does not match its pinned implementation profile")
     if len(runs) != 1: raise ValueError("board policy will not adopt a task with prior or ambiguous native runs")
     run = runs[0]
@@ -511,6 +541,8 @@ def bind_first_owned_run(board: str, task: dict[str, Any], runs: list[dict[str, 
         key = binding_key(board, task_id); existing = data["tasks"].get(key)
         if existing is not None: return json.loads(json.dumps(existing))
         task_id, workspace = _validate_first_run(policy, task, runs, run_id=run_id, profile=profile)
+        if _workspace_binding_conflict(data, board, str(task_id), str(workspace)):
+            raise ValueError("task-scoped worktree is already bound to another managed task")
         binding = {"board": board, "task_id": task_id, "implementation_profile": policy["implementation_profile"], "reviewer_profile": policy["reviewer_profile"], "workspace_path": workspace, "policy_activation_id": policy["activation_id"], "policy_native_run_watermark": policy["native_run_watermark"], "native_run_id": run_id}
         data["tasks"][key] = binding; return json.loads(json.dumps(binding))
 
@@ -520,13 +552,17 @@ def enroll_task(*, board: str, task: dict[str, Any], runs: list[dict[str, Any]])
     if not _text(task_id) or not _text(workspace): raise ValueError("native task id and workspace_path are required")
     if task.get("status") != "blocked" or task.get("block_kind") != "needs_input": raise ValueError("enrollment requires an operator-parked blocked needs_input task")
     if runs: raise ValueError("enrollment is unsafe after any native run; create a new blocked card")
-    if task.get("workspace_kind") != "dir" or not Path(workspace).is_absolute(): raise ValueError("managed work requires an absolute dir: Git workspace")
+    if task.get("workspace_kind") != "worktree" or not Path(str(workspace)).is_absolute(): raise ValueError("managed work requires an absolute task-scoped worktree: Git workspace")
+    if not _is_materialized_linked_worktree(str(workspace)):
+        raise ValueError("enrollment requires a materialized linked worktree; use worktree:<repo-root> and native dispatch to resolve one first")
     with locked_state(write=True) as data:
         implementation, reviewer = data.get("implementation_profile"), data.get("reviewer_profile")
         if not _text(implementation) or not _text(reviewer) or not profile_exists(implementation) or not profile_exists(reviewer): raise ValueError("configured worker profiles are invalid; save valid Hermes profiles before enrollment")
         if task.get("assignee") != implementation: raise ValueError("parked task must be assigned to the configured implementation profile")
         key = binding_key(board, task_id)
         if key in data["tasks"]: raise ValueError("task is already enrolled")
+        if _workspace_binding_conflict(data, board, str(task_id), str(workspace)):
+            raise ValueError("task-scoped worktree is already bound to another managed task")
         binding = {"board": board, "task_id": task_id, "implementation_profile": implementation, "reviewer_profile": reviewer, "workspace_path": workspace}
         data["tasks"][key] = binding; return json.loads(json.dumps(binding))
 

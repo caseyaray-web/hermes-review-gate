@@ -927,7 +927,7 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
                 if exact is None: continue
                 failed, phase = exact; adopted = True
                 workspace = task.get("workspace_path")
-                if not isinstance(workspace, str) or task.get("workspace_kind") != "dir" or not Path(workspace).is_absolute(): continue
+                if not isinstance(workspace, str) or task.get("workspace_kind") != "worktree" or not Path(workspace).is_absolute(): continue
                 binding = {"board": board, "task_id": task_id, "implementation_profile": policy["implementation_profile"], "reviewer_profile": policy["reviewer_profile"], "workspace_path": workspace, "policy_activation_id": policy["activation_id"], "policy_native_run_watermark": policy["native_run_watermark"], "native_run_id": failed["id"]}
             workspace = task.get("workspace_path")
             route = trusted_routing(task_id, board, binding)

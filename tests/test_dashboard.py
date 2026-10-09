@@ -307,16 +307,17 @@ def test_policy_preview_classifies_only_runtime_admissible_cards(monkeypatch):
     policy = {"activation_id": "a", "native_run_watermark": 4,
               "implementation_profile": "impl", "reviewer_profile": "review"}
     monkeypatch.setattr(plugin_api, "_observe_board", lambda board: [
-        {"id": "eligible-no-run", "status": "todo", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
-        {"id": "eligible-current", "status": "running", "current_run_id": 5, "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
-        {"id": "wrong-assignee", "status": "todo", "assignee": "other", "workspace_kind": "dir", "workspace_path": "/work"},
-        {"id": "unassigned", "status": "todo", "assignee": None, "workspace_kind": "dir", "workspace_path": "/work"},
-        {"id": "bad-workspace", "status": "todo", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "relative"},
-        {"id": "prior-run", "status": "todo", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
-        {"id": "preactivation", "status": "running", "current_run_id": 4, "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
-        {"id": "blocked", "status": "blocked", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
-        {"id": "done", "status": "done", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
-        {"id": "legacy", "status": "todo", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
+        {"id": "eligible-no-run", "status": "todo", "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"},
+        {"id": "eligible-current", "status": "running", "current_run_id": 5, "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"},
+        {"id": "wrong-assignee", "status": "todo", "assignee": "other", "workspace_kind": "worktree", "workspace_path": "/work"},
+        {"id": "unassigned", "status": "todo", "assignee": None, "workspace_kind": "worktree", "workspace_path": "/work"},
+        {"id": "bad-workspace", "status": "todo", "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "relative"},
+        {"id": "shared-dir", "status": "todo", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
+        {"id": "prior-run", "status": "todo", "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"},
+        {"id": "preactivation", "status": "running", "current_run_id": 4, "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"},
+        {"id": "blocked", "status": "blocked", "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"},
+        {"id": "done", "status": "done", "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"},
+        {"id": "legacy", "status": "todo", "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"},
     ])
     monkeypatch.setattr(plugin_api, "_board_runs", lambda board, task_id: {
         "eligible-current": [{"id": 5, "profile": "impl", "status": "running", "ended_at": None}],
@@ -331,7 +332,8 @@ def test_policy_preview_classifies_only_runtime_admissible_cards(monkeypatch):
     assert preview["history"] == ["done"]
     assert preview["legacy_bound"] == ["legacy"]
     assert {item["task_id"]: item["reason"] for item in preview["attention"]} == {
-        "bad-workspace": "workspace is not an absolute dir: workspace",
+        "bad-workspace": "workspace is not an absolute task-scoped Git worktree",
+        "shared-dir": "workspace is not an absolute task-scoped Git worktree",
         "blocked": "native status blocked is not eligible for dispatch",
         "preactivation": "current run predates this policy activation",
         "prior-run": "task already has native run history",
@@ -342,7 +344,7 @@ def test_policy_preview_classifies_only_runtime_admissible_cards(monkeypatch):
 
 def test_board_activation_publishes_policy_and_only_classifies_existing_history(monkeypatch):
     monkeypatch.setattr(plugin_api, "_observe_board", lambda board: [
-        {"id": "future", "status": "ready", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
+        {"id": "future", "status": "ready", "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"},
         {"id": "ran", "status": "ready", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
         {"id": "done", "status": "done", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"},
     ])
@@ -370,7 +372,7 @@ def test_status_shows_persistent_board_scope_and_current_classification_without_
     monkeypatch.setattr(plugin_api, "load_state", lambda: state)
     monkeypatch.setattr(plugin_api, "locked_state", lambda **kwargs: (_ for _ in ()).throw(AssertionError("GET wrote state")))
     monkeypatch.setattr(plugin_api, "_observe_board", lambda board: [
-        {"id": "future", "status": "ready", "assignee": "impl", "workspace_kind": "dir", "workspace_path": "/work"}, {"id": "old", "status": "running"},
+        {"id": "future", "status": "ready", "assignee": "impl", "workspace_kind": "worktree", "workspace_path": "/work"}, {"id": "old", "status": "running"},
         {"id": "completed", "status": "done"}, {"id": "reviewing", "status": "review"},
     ])
     monkeypatch.setattr(plugin_api, "_board_runs", lambda board, task_id: [] if task_id == "future" else [{"id": 1}])

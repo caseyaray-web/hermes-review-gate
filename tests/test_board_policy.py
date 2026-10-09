@@ -1,4 +1,5 @@
 import json
+import subprocess
 
 import pytest
 
@@ -29,9 +30,9 @@ def policy_file(tmp_path, monkeypatch):
     return path
 
 
-def native_task(*, task_id="future", status="running", assignee="impl", workspace="/work"):
+def native_task(*, task_id="future", status="running", assignee="impl", workspace="/work", workspace_kind="worktree"):
     return {"id": task_id, "status": status, "assignee": assignee,
-            "workspace_kind": "dir", "workspace_path": workspace}
+            "workspace_kind": workspace_kind, "workspace_path": workspace}
 
 
 def native_run(*, run_id=9, profile="impl", started_at=101, ended_at=None):
@@ -66,6 +67,7 @@ def test_activation_migrates_legacy_state_and_first_future_run_is_bound(policy_f
 
 
 @pytest.mark.parametrize("task,runs,run_id,profile", [
+    (native_task(workspace_kind="dir"), [native_run()], 9, "impl"),
     (native_task(status="review"), [native_run()], 9, "impl"),
     (native_task(), [native_run(run_id=8)], 8, "impl"),
     (native_task(), [native_run(), native_run(run_id=10, ended_at=102)], 9, "impl"),
@@ -81,6 +83,48 @@ def test_first_binding_refuses_attention_or_mismatch(policy_file, task, runs, ru
         state.bind_first_owned_run("board-a", task, runs, run_id=run_id, profile=profile)
 
     assert state.load_state()["tasks"] == {}
+
+
+def test_first_binding_rejects_a_workspace_already_bound_to_another_task(policy_file):
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("board-a", activation_id="activation-a", native_run_watermark=8)
+    state.bind_first_owned_run("board-a", native_task(task_id="one"), [native_run()], run_id=9, profile="impl")
+
+    with pytest.raises(ValueError, match="already bound"):
+        state.bind_first_owned_run("board-a", native_task(task_id="two"), [native_run(run_id=10)], run_id=10, profile="impl")
+
+    assert state.task_binding("two", "board-a") is None
+
+
+def test_first_binding_rejects_workspace_reuse_across_boards(policy_file):
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("board-a", activation_id="activation-a", native_run_watermark=8)
+    state.activate_board("board-b", activation_id="activation-b", native_run_watermark=8)
+    state.bind_first_owned_run("board-a", native_task(task_id="one"), [native_run()], run_id=9, profile="impl")
+
+    with pytest.raises(ValueError, match="already bound"):
+        state.bind_first_owned_run("board-b", native_task(task_id="two"), [native_run(run_id=10)], run_id=10, profile="impl")
+
+    assert state.task_binding("two", "board-b") is None
+
+
+def test_enrollment_rejects_repo_root_before_worktree_materialization(policy_file, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    (repo / "tracked.txt").write_text("fixture\n")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    task = {"id": "unmaterialized", "status": "blocked", "block_kind": "needs_input", "assignee": "impl",
+            "workspace_kind": "worktree", "workspace_path": str(repo)}
+
+    with pytest.raises(ValueError, match="materialized linked worktree"):
+        state.enroll_task(board="board-a", task=task, runs=[])
+
+    assert state.task_binding("unmaterialized", "board-a") is None
 
 
 def test_malformed_board_policy_fails_closed(policy_file):
