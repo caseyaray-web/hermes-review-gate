@@ -43,3 +43,20 @@ def board_snapshot(board: str) -> list[dict[str, Any]]:
     try:
         return [asdict(task) for task in kb.list_tasks(connection, include_archived=True)]
     finally: connection.close()
+
+
+def reassign_ready_task(board: str, task_id: str, profile: str) -> bool:
+    """Use Hermes' supported reassignment API only after a durable intent.
+
+    This is not plugin SQL: ``reassign_task`` owns native validation, event
+    recording, notifications, and failure-counter semantics. It refuses a live
+    claim rather than reclaiming a worker.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    connection = kbc.connect(board=board)
+    try:
+        return kb.reassign_task(connection, task_id, profile, reclaim_first=False,
+                                reason="review-correction escalation")
+    finally:
+        connection.close()

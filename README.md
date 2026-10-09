@@ -60,7 +60,17 @@ The ordinary dispatcher handles claims. Enrollment rejects any previous native r
 5. Call `submit_review(verdict, rationale)` with `approved` or `changes_requested` and substantive findings. Code owns task/run identity, routing, and native transition arguments.
 6. Changes return ownership through native `kanban_request_changes`. Approval of the unchanged candidate/artifacts permits native completion and ordinary dependency promotion.
 
-Two changes-requested cycles are allowed. A third negative verdict creates a `needs_input` operator hold. Native repeated-hold policy may route it to `triage` instead of `blocked`. Unblocking does not reset native correction history. There is no automatic escalation or retry tree.
+By default, two changes-requested cycles are allowed and a third negative verdict creates a `needs_input` operator hold. Native repeated-hold policy may route it to `triage` instead of `blocked`. Unblocking does not reset native correction history.
+
+## Optional bounded review-correction escalation
+
+Review-correction escalation is **off by default** and is separate from failed-run recovery. Per board, the dashboard can persist a normal substantive-correction limit (1–2), one to three escalation attempts, an implementation-capable escalation profile, and a distinct post-escalation reviewer. Saving or enabling this policy changes no native task: it applies only when a **future** reviewer exhausts the configured normal correction budget. Existing held cards are never swept, unblocked, or rerouted; recover one only through deliberate native/operator action.
+
+At exhaustion, the current reviewer’s exact run, candidate, immutable original binding, configured routing, correction count, and attempt number are written to the plugin ledger before any native effect. The plugin then uses native `kanban_request_changes`, reads it back, uses Hermes' supported `reassign_task` operation to route the same ready card to the escalation implementation profile, reads that back, and only then publishes separate effective routing. If the exact target claims the card between reassignment and readback, its task/run/profile/phase, workspace, candidate handoff, immutable binding, and preceding review transition are reconciled as the same route; old, wrong-profile, or unproven claims remain fenced. Original binding/provenance is never rewritten. A lost response is reconciled from exact native events/readback without a blind resend; a mismatch or missing profile fails closed for operator inspection.
+
+Disabling escalation pauses a **pending** intent before watchdog reassignment, routing publication, or worker admission. The consumed attempt and durable intent remain visible as held and are not refunded or discarded; re-enabling can reconcile that exact intent. It does not revoke an already published/active native route.
+
+The escalation implementation worker produces a new candidate through the normal handoff. The configured post-escalation reviewer must be different from that implementer and submit a fresh independent verdict; the original reviewer may be the escalation implementer only when the configured post-escalation reviewer is different. A negative post-escalation review consumes the bounded attempt. Once attempts are exhausted, or routing/verification is uncertain, the card is held for an operator—there is no fallback to ordinary correction cycles and no escalation chain. This policy does not react to crashes, provider failures, or runtime watchdog budgets.
 
 Duplicate finishing after handoff is refused. A lost transition response triggers native task/run/event readback without resending. An unproven outcome returns a visible error; inspect native history before retrying. Missing profiles, changed workspace/candidate, or changed artifacts prevent approval.
 
@@ -90,7 +100,7 @@ Counts describe scoped native states, not throughput or OS process counts: imple
 - **Enrollment refused:** create an initially blocked card, classify it `needs_input`, and enroll before any run. Executed work is not normally adopted; the sole exception is the narrowly evidenced RM02 started-worker iteration-exhaustion class above. A `needs_input` hold is always an operator decision and is never auto-retried.
 - **Stale candidate/evidence:** inspect changed files and native history; do not approve a candidate different from the handoff.
 - **Worker failure/ordinary exit:** inspect `hermes kanban --board BOARD show TASK_ID`, `hermes kanban --board BOARD runs TASK_ID`, and `hermes kanban --board BOARD log TASK_ID`. Recover through native operations without forcing completion.
-- **Review limit:** inspect the latest findings/hold reason; no further automatic correction is granted.
+- **Review limit/escalation:** inspect the latest findings and persisted routing. With escalation disabled or its attempt budget exhausted, no further automatic correction is granted; resolve the hold deliberately through native Kanban.
 - **Telemetry unavailable:** check board/task identity, profiles, configuration, and filesystem access. A retained snapshot is not current activity.
 
 ## Development
@@ -105,4 +115,4 @@ Tests need Hermes importability plus pytest/FastAPI/httpx. Native fixtures use d
 
 For standalone probes, pin **HOME, HERMES_HOME, and HERMES_KANBAN_HOME** outside production and disable gateway dispatch. Temporary HERMES_HOME beneath the real home alone does not isolate profile discovery.
 
-Controlled native tests, installed-artifact checks, actual dashboard/browser proof, independent exact-source review, and provider-backed worker rehearsal are separate verification levels. Keep raw logs and acceptance evidence outside the product tree. Controlled callback dispatch is not model-generated review or real-worker rehearsal.
+Controlled native tests, installed-artifact checks, actual dashboard/browser proof, independent exact-source review, and provider-backed worker rehearsal are separate verification levels. Keep raw logs and acceptance evidence outside the product tree. Controlled callback dispatch is not model-generated review or real-worker rehearsal. The escalation fixtures are synthetic disposable-native evidence only; they do not activate the policy on any production board.

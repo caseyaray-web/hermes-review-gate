@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
+import subprocess
+import json
 
 from dashboard import plugin_api
 
@@ -67,6 +69,45 @@ def test_done_without_approved_completion_metadata_stays_unknown(monkeypatch):
 
     assert observed is True
     assert task["phase"] == "unknown"
+
+
+def test_escalated_completion_uses_trusted_effective_route_not_original_binding(monkeypatch):
+    binding = {"board": "default", "task_id": "one", "implementation_profile": "impl",
+               "reviewer_profile": "review", "workspace_path": "/work"}
+    route = {"board": "default", "task_id": "one", "implementation_profile": "strong",
+             "reviewer_profile": "post-review"}
+    monkeypatch.setattr(plugin_api, "trusted_routing", lambda *_args, **_kwargs: route)
+    candidate = {"head": "a"}
+    runs = [
+        {"id": 11, "profile": "strong", "status": "review", "outcome": "review_requested", "ended_at": 6,
+         "metadata": {"local_first_review": {"implementation_run_id": 11, "implementation_profile": "strong",
+                                                "reviewer_profile": "post-review", "candidate": candidate}}},
+        {"id": 12, "profile": "post-review", "status": "done", "outcome": "completed", "ended_at": 7,
+         "metadata": {"local_first_review": {"verdict": "approved", "reviewer_run_id": 12,
+                                                "reviewer_profile": "post-review", "implementation_run_id": 11,
+                                                "candidate": candidate}}},
+    ]
+
+    assert plugin_api._completion_is_approved({"status": "done"}, runs, binding)
+    runs[0]["metadata"]["local_first_review"]["implementation_profile"] = "impl"
+    assert not plugin_api._completion_is_approved({"status": "done"}, runs, binding)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_task_status_exposes_its_own_board_escalation_policy(monkeypatch, enabled):
+    binding = {"board": "board-a", "task_id": "one", "implementation_profile": "impl",
+               "reviewer_profile": "review", "workspace_path": "/work"}
+    pending = {"current_attempt": 1, "attempts": [{"attempt": 1, "intent": {"status": "changes_requested_pending"}}]}
+    monkeypatch.setattr(plugin_api, "effective_routing", lambda *_: None)
+    monkeypatch.setattr(plugin_api, "trusted_routing", lambda *_: binding)
+    monkeypatch.setattr(plugin_api, "escalation_entry", lambda *_: pending)
+    monkeypatch.setattr(plugin_api, "load_state", lambda: {"boards": {"board-a": {"escalation": {"enabled": enabled}}}})
+    monkeypatch.setattr(plugin_api, "_observe_task", lambda *_: ({"title": "Task", "status": "ready"}, [], []))
+
+    task, _ = plugin_api._task_view(binding)
+
+    assert task["escalation_status"] == "changes_requested_pending"
+    assert task["escalation_enabled"] is enabled
 
 
 def test_configuration_validates_and_updates_only_defaults(monkeypatch):
@@ -162,6 +203,46 @@ def test_shipped_dashboard_exposes_recovery_limit_not_zero_as_pause():
     assert "max_per_phase" in bundle
     assert "Maximum failed-run recoveries per phase" in bundle
     assert "Use Pause failed-run recovery to stop automatic recovery." in bundle
+
+
+def test_escalation_control_persists_future_only_routing_and_shipped_controls(monkeypatch):
+    calls = []
+    monkeypatch.setattr(plugin_api, "set_escalation_policy", lambda board, **kwargs:
+                        calls.append((board, kwargs)) or {"escalation": kwargs})
+
+    response = client().put("/escalation", json={"board": "board-a", "enabled": True,
+                                                   "normal_correction_limit": 1, "max_attempts": 1,
+                                                   "implementation_profile": "strong", "reviewer_profile": "post-review"})
+
+    assert response.status_code == 200
+    assert calls == [("board-a", {"enabled": True, "normal_correction_limit": 1, "max_attempts": 1,
+                                   "implementation_profile": "strong", "reviewer_profile": "post-review"})]
+    assert "future exhaustion" in response.json()["message"]
+    assert client().put("/escalation", json={"board": "board-a", "enabled": True,
+                                               "normal_correction_limit": 0, "max_attempts": 1,
+                                               "implementation_profile": "strong", "reviewer_profile": "post-review"}).status_code == 422
+    bundle = (plugin_api.Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js").read_text()
+    assert "Enable correction escalation" in bundle
+    assert "held cards are never swept or rerouted" in bundle
+
+
+@pytest.mark.parametrize(("enabled", "expected"), [(True, "Reconciling"), (False, "Held (disabled)")])
+def test_shipped_dashboard_renders_per_board_escalation_authority(enabled, expected):
+    """Execute the shipped bundle: /status has no global escalation setting."""
+    bundle = plugin_api.Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js"
+    status = {"configuration": {"implementation_profile": "impl", "reviewer_profile": "review"},
+              "board_policies": [], "counts": {}, "tasks": [{"board": "board-a", "task_id": "one", "phase": "changes_requested",
+              "native_status": "ready", "run_status": "ended", "implementation_profile": "impl", "reviewer_profile": "review",
+              "escalation_status": "changes_requested_pending", "escalation_enabled": enabled}]}
+    script = f'''const fs=require("fs"),vm=require("vm");
+let states=[], cursor=0, page; const h=(type,props,...children)=>({{type,props:props||{{}},children}});
+const hooks={{useState:(initial)=>{{const i=cursor++; if(!(i in states)) states[i]=initial; return [states[i],v=>states[i]=v];}},useEffect:(fn)=>fn()}};
+global.setInterval=()=>0; global.clearInterval=()=>{{}};
+global.window={{__HERMES_PLUGIN_SDK__:{{React:{{createElement:h}},hooks,fetchJSON:(path)=>Promise.resolve(path.endsWith('/status')?{json.dumps(status)}:path.endsWith('/profiles')?{{profiles:[]}}:{{boards:[]}})}},__HERMES_PLUGINS__:{{register:(_,p)=>page=p}}}};
+vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8")); page(); Promise.resolve().then(()=>Promise.resolve()).then(()=>{{cursor=0; const tree=page(); console.log(JSON.stringify(tree));}});'''
+    result = subprocess.run(["node", "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stdout
 
 
 def test_policy_scope_exposes_default_recovery_limit_for_legacy_policy(monkeypatch):

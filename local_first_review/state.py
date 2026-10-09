@@ -14,6 +14,7 @@ from typing import Any, Iterator
 
 CONFIG_NAME = "local-first-review.json"
 MAX_CHANGES = 2
+ESCALATION_MAX_ATTEMPTS_LIMIT = 3
 # A board may grant at most this many failed-run recoveries per task phase.
 # Keep this deliberately small: recovery preserves partial work but does not
 # replace an operator's investigation of recurring worker failures.
@@ -49,8 +50,9 @@ def phase_budget_key(board: str, task_id: str, phase: str) -> str:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 4, "implementation_profile": None, "reviewer_profile": None,
-            "tasks": {}, "boards": {}, "recovery": {}, "recovery_budgets": {}, "workspace_leases": {}}
+    return {"version": 6, "implementation_profile": None, "reviewer_profile": None,
+            "tasks": {}, "boards": {}, "recovery": {}, "recovery_budgets": {}, "workspace_leases": {},
+            "escalations": {}, "effective_routing": {}}
 
 
 def _text(value: Any) -> bool:
@@ -68,6 +70,23 @@ def _recovery_settings(value: Any) -> dict[str, Any]:
     return {"enabled": value["enabled"], "max_per_phase": maximum}
 
 
+def _escalation_settings(value: Any) -> dict[str, Any]:
+    """Validate opt-in substantive-review escalation independently of recovery."""
+    fields = {"enabled", "normal_correction_limit", "max_attempts", "implementation_profile", "reviewer_profile"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("review escalation policy is invalid")
+    enabled, limit, attempts = value["enabled"], value["normal_correction_limit"], value["max_attempts"]
+    implementation, reviewer = value["implementation_profile"], value["reviewer_profile"]
+    if (type(enabled) is not bool or type(limit) is not int or not 1 <= limit <= MAX_CHANGES
+            or type(attempts) is not int or not 1 <= attempts <= ESCALATION_MAX_ATTEMPTS_LIMIT):
+        raise ValueError("review escalation policy is invalid")
+    if enabled and (not _text(implementation) or not _text(reviewer) or implementation == reviewer):
+        raise ValueError("enabled review escalation requires distinct implementation and reviewer profiles")
+    if not enabled and (implementation is not None or reviewer is not None):
+        raise ValueError("disabled review escalation must not retain routing")
+    return dict(value)
+
+
 def _migrate(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict) or not isinstance(data.get("tasks"), dict):
         raise ValueError("review-gate configuration has an invalid shape")
@@ -80,13 +99,24 @@ def _migrate(data: Any) -> dict[str, Any]:
         # records: only a fresh, exact post-watermark native observation can.
         data = dict(data); data["version"] = 4; data["recovery"] = {}
         data["recovery_budgets"] = {}; data["workspace_leases"] = {}
+    if data.get("version") == 4:
+        data = dict(data); data["version"] = 5; data["escalations"] = {}; data["effective_routing"] = {}
+    if data.get("version") == 5:
+        data = dict(data); data["version"] = 6
+        data["escalations"] = {
+            key: ({"board": entry.get("board"), "task_id": entry.get("task_id"), "binding": entry.get("binding"),
+                   "consumed_attempts": entry.get("attempt"), "current_attempt": entry.get("attempt"),
+                   "unavailable_prior_attempts": entry["attempt"] - 1 if type(entry.get("attempt")) is int else -1,
+                   "attempts": [{field: entry.get(field) for field in ("attempt", "implementation_profile", "reviewer_profile", "intent")}]} if isinstance(entry, dict) else entry)
+            for key, entry in data.get("escalations", {}).items()
+        }
     return data
 
 
 def _validate(data: Any) -> dict[str, Any]:
     data = _migrate(data)
-    required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases")
-    if data.get("version") != 4 or any(not isinstance(data.get(k), dict) for k in required_roots):
+    required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases", "escalations", "effective_routing")
+    if data.get("version") != 6 or any(not isinstance(data.get(k), dict) for k in required_roots):
         raise ValueError("review-gate configuration has an invalid shape")
     for key, binding in data["tasks"].items():
         if not isinstance(key, str) or not isinstance(binding, dict):
@@ -111,6 +141,31 @@ def _validate(data: Any) -> dict[str, Any]:
                 or policy["native_run_watermark"] < 0 or policy["implementation_profile"] == policy["reviewer_profile"]):
             raise ValueError("review-gate board policy is invalid")
         _recovery_settings(policy.get("recovery", {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}))
+        _escalation_settings(policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES,
+                                                        "max_attempts": 1, "implementation_profile": None,
+                                                        "reviewer_profile": None}))
+    for key, entry in data["escalations"].items():
+        if (not isinstance(key, str) or not isinstance(entry, dict) or not _text(entry.get("board"))
+                or not _text(entry.get("task_id")) or key != binding_key(entry["board"], entry["task_id"])):
+            raise ValueError("review escalation ledger is invalid")
+        missing = entry.get("unavailable_prior_attempts", 0)
+        if (type(missing) is not int or missing < 0
+                or not isinstance(entry.get("binding"), dict) or type(entry.get("consumed_attempts")) is not int
+                or type(entry.get("current_attempt")) is not int or not isinstance(entry.get("attempts"), list)
+                or not entry["attempts"] or entry["consumed_attempts"] != missing + len(entry["attempts"])
+                or entry["current_attempt"] != entry["consumed_attempts"]):
+            raise ValueError("review escalation ledger is invalid")
+        for number, attempt in enumerate(entry["attempts"], start=missing + 1):
+            if (not isinstance(attempt, dict) or attempt.get("attempt") != number or not isinstance(attempt.get("intent"), dict)
+                    or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))
+                    or attempt["implementation_profile"] == attempt["reviewer_profile"]):
+                raise ValueError("review escalation ledger is invalid")
+    for key, route in data["effective_routing"].items():
+        if (not isinstance(key, str) or not isinstance(route, dict) or not _text(route.get("board"))
+                or not _text(route.get("task_id")) or key != binding_key(route["board"], route["task_id"])):
+            raise ValueError("effective review routing is invalid")
+        if not _text(route.get("implementation_profile")) or not _text(route.get("reviewer_profile")) or route["implementation_profile"] == route["reviewer_profile"]:
+            raise ValueError("effective review routing is invalid")
     for key, entry in data["recovery"].items():
         if not isinstance(key, str) or not isinstance(entry, dict):
             raise ValueError("recovery ledger is invalid")
@@ -167,6 +222,170 @@ def set_recovery_policy(board: str, *, enabled: bool, max_per_phase: int | None 
         maximum = current["max_per_phase"] if max_per_phase is None else max_per_phase
         policy["recovery"] = _recovery_settings({"enabled": enabled, "max_per_phase": maximum})
         return json.loads(json.dumps(policy))
+
+
+def set_escalation_policy(board: str, *, enabled: bool, normal_correction_limit: int | None = None,
+                          max_attempts: int | None = None, implementation_profile: str | None = None,
+                          reviewer_profile: str | None = None) -> dict[str, Any]:
+    with locked_state(write=True) as data:
+        policy = data["boards"].get(board)
+        if policy is None:
+            raise ValueError("board has no active review-gate policy")
+        current = _escalation_settings(policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES,
+                                                                    "max_attempts": 1, "implementation_profile": None,
+                                                                    "reviewer_profile": None}))
+        proposed = {"enabled": enabled, "normal_correction_limit": current["normal_correction_limit"] if normal_correction_limit is None else normal_correction_limit,
+                    "max_attempts": current["max_attempts"] if max_attempts is None else max_attempts,
+                    "implementation_profile": implementation_profile if enabled else None,
+                    "reviewer_profile": reviewer_profile if enabled else None}
+        if enabled and (not profile_exists(implementation_profile or "") or not profile_exists(reviewer_profile or "")):
+            raise ValueError("configured escalation profile is missing")
+        policy["escalation"] = _escalation_settings(proposed)
+        return json.loads(json.dumps(policy))
+
+
+def effective_routing(task_id: str, board: str | None = None) -> dict[str, Any] | None:
+    return load_state()["effective_routing"].get(binding_key(board or board_name(), task_id))
+
+
+def escalation_entry(task_id: str, board: str | None = None) -> dict[str, Any] | None:
+    """Return the durable escalation intent without inferring native progress."""
+    return load_state()["escalations"].get(binding_key(board or board_name(), task_id))
+
+
+def current_escalation_attempt(entry: dict[str, Any]) -> dict[str, Any]:
+    """Return the selected immutable attempt; callers never infer list order."""
+    selector, attempts = entry.get("current_attempt"), entry.get("attempts")
+    if type(selector) is not int or not isinstance(attempts, list):
+        raise ValueError("review escalation current attempt is invalid")
+    matches = [attempt for attempt in attempts if isinstance(attempt, dict) and attempt.get("attempt") == selector]
+    if len(matches) != 1:
+        raise ValueError("review escalation current attempt is invalid")
+    return matches[0]
+
+
+def trusted_routing(task_id: str, board: str, binding: dict[str, Any], *, include_pending: bool = False) -> dict[str, Any]:
+    """Resolve only routing sealed to this immutable enrollment.
+
+    Handoff metadata is worker-authored evidence, not routing authority. A route
+    is trusted only when the ledger retained the exact original binding and its
+    published effective record agrees with that intent. Pending intent is for
+    admission guards only; it never pretends reassignment landed.
+    """
+    data = load_state(); key = binding_key(board, task_id)
+    entry = data.get("escalations", {}).get(key)
+    if not isinstance(entry, dict) or entry.get("binding") != binding:
+        return dict(binding)
+    attempt = current_escalation_attempt(entry)
+    intent = attempt.get("intent")
+    if not isinstance(intent, dict):
+        return dict(binding)
+    route = {"board": board, "task_id": task_id,
+             "implementation_profile": attempt.get("implementation_profile"), "reviewer_profile": attempt.get("reviewer_profile")}
+    if (route["board"] != board or route["task_id"] != task_id
+            or not _text(route["implementation_profile"]) or not _text(route["reviewer_profile"])
+            or route["implementation_profile"] == route["reviewer_profile"]):
+        raise ValueError("review escalation routing is invalid")
+    if intent.get("status") == "routed":
+        published = data["effective_routing"].get(key)
+        if not isinstance(published, dict) or any(published.get(field) != route[field] for field in route):
+            raise ValueError("published escalation routing is inconsistent")
+        return route
+    if include_pending and intent.get("status") == "changes_requested_pending":
+        return route
+    return dict(binding)
+
+
+def reserve_escalation(board: str, task_id: str, *, review_run_id: int, binding: dict[str, Any],
+                       candidate: dict[str, Any], change_count: int) -> dict[str, Any]:
+    """Persist one exact escalation routing intent before native transitions."""
+    key = binding_key(board, task_id)
+    with locked_state(write=True) as data:
+        policy = data["boards"].get(board)
+        if policy is None:
+            raise ValueError("review escalation requires an active board policy")
+        settings = _escalation_settings(policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES,
+                                                                     "max_attempts": 1, "implementation_profile": None,
+                                                                     "reviewer_profile": None}))
+        if not settings["enabled"]:
+            raise ValueError("review escalation is disabled")
+        existing = data["escalations"].get(key)
+        if existing and any(attempt.get("intent", {}).get("review_run_id") == review_run_id
+                            for attempt in existing.get("attempts", [])):
+            return json.loads(json.dumps(existing))
+        prior_attempt = existing.get("consumed_attempts", 0) if existing else 0
+        if prior_attempt >= settings["max_attempts"]:
+            raise ValueError("review escalation attempts exhausted; operator action is required")
+        if change_count < settings["normal_correction_limit"]:
+            raise ValueError("normal review correction budget is not exhausted")
+        prior_route = data["effective_routing"].get(key)
+        origin = dict(binding) if prior_route is None else {**binding,
+            "implementation_profile": prior_route.get("implementation_profile"),
+            "reviewer_profile": prior_route.get("reviewer_profile")}
+        if (not _text(origin.get("implementation_profile")) or not _text(origin.get("reviewer_profile"))
+                or origin["implementation_profile"] == origin["reviewer_profile"]):
+            raise ValueError("review escalation origin routing is invalid")
+        attempt = {"attempt": prior_attempt + 1, "implementation_profile": settings["implementation_profile"],
+                   "reviewer_profile": settings["reviewer_profile"], "origin": origin,
+                   "intent": {"status": "changes_requested_pending", "review_run_id": review_run_id,
+                              "candidate": dict(candidate), "change_count": change_count}}
+        entry = ({"board": board, "task_id": task_id, "binding": dict(binding), "consumed_attempts": 1,
+                  "current_attempt": 1, "attempts": [attempt]} if existing is None else
+                 {**existing, "consumed_attempts": prior_attempt + 1, "current_attempt": prior_attempt + 1,
+                  "attempts": [*existing["attempts"], attempt]})
+        data["escalations"][key] = entry
+        return json.loads(json.dumps(entry))
+
+
+def reconcile_pending_escalation(board: str, task_id: str, *, binding: dict[str, Any], review_run_id: int,
+                                 reconcile: Any) -> str:
+    """Run one native read/reassign reconciliation under escalation policy lock.
+
+    Disabling escalation preserves a pending intent and its consumed attempt, but
+    holds it before any native effect or route publication.  A route already
+    published is deliberately not revoked: it is an active native lifecycle.
+    """
+    key = binding_key(board, task_id)
+    with locked_state(write=True) as data:
+        policy = data["boards"].get(board)
+        if policy is None:
+            raise ValueError("review escalation requires an active board policy")
+        settings = _escalation_settings(policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES,
+                                                                     "max_attempts": 1, "implementation_profile": None,
+                                                                     "reviewer_profile": None}))
+        entry = data["escalations"].get(key)
+        if (not isinstance(entry, dict) or entry.get("binding") != binding
+                or current_escalation_attempt(entry).get("intent", {}).get("review_run_id") != review_run_id):
+            raise ValueError("review escalation intent is absent or mismatched")
+        attempt = current_escalation_attempt(entry)
+        if attempt.get("intent", {}).get("status") == "routed":
+            return "routed"
+        if attempt.get("intent", {}).get("status") != "changes_requested_pending":
+            raise ValueError("review escalation intent has invalid status")
+        if not settings["enabled"]:
+            return "held"
+        if not reconcile(json.loads(json.dumps(entry))):
+            return "pending"
+        route = {"board": board, "task_id": task_id, "attempt": attempt["attempt"],
+                 "implementation_profile": attempt["implementation_profile"], "reviewer_profile": attempt["reviewer_profile"]}
+        data["effective_routing"][key] = route
+        attempt["intent"] = dict(attempt["intent"], status="routed")
+        return "routed"
+
+
+def finalize_escalation_routing(board: str, task_id: str, *, review_run_id: int) -> dict[str, Any]:
+    """Compatibility finalizer for callers with already-proven native routing."""
+    key = binding_key(board, task_id)
+    with locked_state(write=True) as data:
+        entry = data["escalations"].get(key)
+        if not entry or current_escalation_attempt(entry).get("intent", {}).get("review_run_id") != review_run_id:
+            raise ValueError("review escalation intent is absent or mismatched")
+        attempt = current_escalation_attempt(entry)
+        route = {"board": board, "task_id": task_id, "attempt": attempt["attempt"],
+                 "implementation_profile": attempt["implementation_profile"], "reviewer_profile": attempt["reviewer_profile"]}
+        data["effective_routing"][key] = route
+        attempt["intent"] = dict(attempt["intent"], status="routed")
+        return json.loads(json.dumps(route))
 
 def recovery_entry(task_id: str, board: str | None = None, *, failed_run_id: int | None = None, phase: str | None = None) -> dict[str, Any] | None:
     data = load_state(); board = board or board_name()
@@ -272,7 +491,7 @@ def activate_board(board: str, *, activation_id: str, native_run_watermark: int 
         implementation, reviewer = data.get("implementation_profile"), data.get("reviewer_profile")
         if not _text(implementation) or not _text(reviewer) or implementation == reviewer: raise ValueError("save distinct implementation and reviewer profiles before board activation")
         if not profile_exists(implementation) or not profile_exists(reviewer): raise ValueError("configured worker profile is missing; save valid Hermes profiles before board activation")
-        policy = {"activation_id": activation_id, "native_run_watermark": native_run_watermark, "implementation_profile": implementation, "reviewer_profile": reviewer, "recovery": {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}}
+        policy = {"activation_id": activation_id, "native_run_watermark": native_run_watermark, "implementation_profile": implementation, "reviewer_profile": reviewer, "recovery": {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}, "escalation": {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}}
         data["boards"][board] = policy; return json.loads(json.dumps(policy))
 
 def _validate_first_run(policy: dict[str, Any], task: dict[str, Any], runs: list[dict[str, Any]], *, run_id: int, profile: str) -> tuple[str, str]:

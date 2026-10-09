@@ -6,18 +6,41 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from .state import (MAX_CHANGES, authorize_recovery_run, bind_first_owned_run, board_name, board_policy,
-                    is_managed, pin_recovery_receipt, profile_exists, recovery_entry,
-                    reserve_recovery, task_binding, terminalize_implementation_handoff_recovery,
-                    terminalize_recovery, update_recovery_identity, worker_profile)
+                    current_escalation_attempt, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, reconcile_pending_escalation, recovery_entry,
+                    reserve_escalation, reserve_recovery, task_binding, terminalize_implementation_handoff_recovery,
+                    terminalize_recovery, trusted_routing, update_recovery_identity, worker_profile)
 
 _CONTEXT: Any | None = None
+# Native reassignment can synchronously run the dispatch-tick hook before its
+# API call returns. The outer reconciler holds the policy lock across that
+# effect so policy disable cannot interleave with route publication. A nested
+# reconciler would take a new flock descriptor and wait on the outer lock.
+# This ContextVar fences only that synchronous call chain; it does not make the
+# state lock reentrant or suppress another worker's later reconciliation.
+_ACTIVE_ESCALATION_RECONCILIATION: ContextVar[tuple[str, str] | None] = ContextVar(
+    "active_escalation_reconciliation", default=None)
+
+
+@contextmanager
+def _escalation_reconciliation_scope(board: str, task_id: str):
+    token = _ACTIVE_ESCALATION_RECONCILIATION.set((board, task_id))
+    try:
+        yield
+    finally:
+        _ACTIVE_ESCALATION_RECONCILIATION.reset(token)
 
 
 class GateError(ValueError):
     """A policy refusal that leaves native Kanban untouched."""
+
+
+class EscalationPending(GateError):
+    """A native effect may have landed; never send a second terminal effect."""
 
 
 def _task_id() -> str:
@@ -204,7 +227,9 @@ def _implementation_context() -> tuple[str, dict[str, Any], dict[str, Any], int,
     show = _show(task_id)
     task_id, binding = _binding(show)
     profile = worker_profile()
-    if not profile or profile != binding["implementation_profile"]:
+    route = trusted_routing(task_id, board_name(), binding, include_pending=True)
+    expected_implementation = route["implementation_profile"]
+    if not profile or profile != expected_implementation:
         raise GateError("only the bound implementation profile may finish this task")
     task = show["task"]
     if task.get("status") != "running" or task.get("assignee") != profile:
@@ -222,8 +247,10 @@ def _review_context() -> tuple[str, dict[str, Any], dict[str, Any], int, str, di
     show = _show(task_id)
     task_id, binding = _binding(show)
     profile = worker_profile()
-    if not profile or profile != binding["reviewer_profile"]:
+    route = trusted_routing(task_id, board_name(), binding)
+    if not profile or profile != route["reviewer_profile"]:
         raise GateError("only the bound reviewer may submit this verdict")
+
     task = show["task"]
     if task.get("status") != "running" or task.get("assignee") != profile:
         raise GateError("task is not a running review assigned to this worker")
@@ -239,13 +266,20 @@ def _review_context() -> tuple[str, dict[str, Any], dict[str, Any], int, str, di
     implementation_run = next((run for run in show["runs"] if isinstance(run, dict) and run.get("id") == implementation_run_id), None)
     metadata = implementation_run.get("metadata") if implementation_run else None
     review = metadata.get("local_first_review") if isinstance(metadata, dict) else None
-    if (type(implementation_run_id) is not int or not implementation_run or implementation_run.get("profile") != binding["implementation_profile"]
+    implementation_profile = review.get("implementation_profile") if isinstance(review, dict) else None
+    reviewer_profile = review.get("reviewer_profile") if isinstance(review, dict) else None
+    if (type(implementation_run_id) is not int or not implementation_run or implementation_run.get("profile") != implementation_profile
             or implementation_run.get("status") != "review" or implementation_run.get("outcome") != "review_requested"
             or implementation_run.get("ended_at") is None or implementation_run_id >= reviewer_run_id):
         raise GateError("review handoff is not an ended implementation run preceding this reviewer")
     if not isinstance(review, dict) or review.get("implementation_run_id") != implementation_run_id:
         raise GateError("review handoff lacks a bound implementation candidate")
-    if review.get("implementation_profile") != binding["implementation_profile"] or review.get("reviewer_profile") != profile:
+    implementation_profile = review.get("implementation_profile") if isinstance(review, dict) else None
+    reviewer_profile = review.get("reviewer_profile") if isinstance(review, dict) else None
+    if (not isinstance(implementation_profile, str) or not isinstance(reviewer_profile, str)
+            or implementation_profile != route["implementation_profile"]
+            or reviewer_profile != route["reviewer_profile"]
+            or implementation_profile == reviewer_profile or reviewer_profile != profile):
         raise GateError("review handoff routing does not match this enrollment")
     if not metadata.get("worker_session_id") or metadata["worker_session_id"] == _session():
         raise GateError("review requires a distinct native worker session")
@@ -302,7 +336,8 @@ def _reconcile_ended_implementation_handoff_for_reviewer(task_id: str, board: st
         raise GateError("implementation recovery handoff receipt is incomplete")
     show = _show(task_id)
     binding = task_binding(task_id, board)
-    if not binding or profile != binding.get("reviewer_profile"):
+    route = trusted_routing(task_id, board, binding) if binding else None
+    if not binding or not route or profile != route.get("reviewer_profile"):
         raise GateError("implementation recovery cannot yield to an unbound reviewer")
     if run_id == implementation_run_id:
         return False
@@ -310,10 +345,11 @@ def _reconcile_ended_implementation_handoff_for_reviewer(task_id: str, board: st
     implementation = next((run for run in show["runs"] if isinstance(run, dict) and run.get("id") == implementation_run_id), None)
     metadata = implementation.get("metadata") if isinstance(implementation, dict) else None
     handoff = metadata.get("local_first_review") if isinstance(metadata, dict) else None
-    if (not isinstance(implementation, dict) or implementation.get("profile") != binding.get("implementation_profile")
+    if (not isinstance(implementation, dict) or implementation.get("profile") != route.get("implementation_profile")
             or implementation.get("status") != "review" or implementation.get("outcome") != "review_requested"
             or implementation.get("ended_at") is None or not _event(show["events"], "review_requested", implementation_run_id)
             or not isinstance(handoff, dict) or handoff.get("implementation_run_id") != implementation_run_id
+            or handoff.get("implementation_profile") != route.get("implementation_profile")
             or handoff.get("reviewer_profile") != profile):
         raise GateError("implementation recovery handoff provenance is not the exact native review transition")
     try:
@@ -341,13 +377,13 @@ def finish_implementation(args: dict[str, Any], **_: Any) -> str:
     if not candidate["clean_tracked"]:
         raise GateError("implementation must have a clean tracked Git candidate before review")
     metadata = {"local_first_review": {
-        "implementation_profile": binding["implementation_profile"], "reviewer_profile": binding["reviewer_profile"],
+        "implementation_profile": worker_profile(), "reviewer_profile": trusted_routing(task_id, board_name(), binding)["reviewer_profile"],
         "implementation_run_id": run_id, "candidate": candidate, "artifacts": artifacts,
         "artifact_evidence": _artifacts(workspace, artifacts),
         "binding": {field: binding[field] for field in ("board", "task_id", "implementation_profile", "reviewer_profile", "workspace_path", "policy_activation_id", "policy_native_run_watermark", "native_run_id") if field in binding},
     }}
     try:
-        value = _dispatch("kanban_request_review", {"summary": summary, "reviewer": binding["reviewer_profile"],
+        value = _dispatch("kanban_request_review", {"summary": summary, "reviewer": metadata["local_first_review"]["reviewer_profile"],
                                                       "metadata": metadata, "artifacts": artifacts})
     except Exception as exc:
         landed = _reconcile_handoff(task_id, run_id)
@@ -366,6 +402,98 @@ def _changes_count(runs: list[dict[str, Any]]) -> int:
     return sum(1 for run in runs if isinstance(run, dict) and run.get("outcome") == "changes_requested")
 
 
+def _pending_escalation_proof(task_id: str, board: str, entry: dict[str, Any], *,
+                              required_run_id: int | None = None, required_profile: str | None = None) -> bool:
+    """Accept only the exact target's first post-intent native claim.
+
+    This is intentionally shared by synchronous submission, watchdog recovery,
+    and pre-tool admission.  A running task is never sufficient on its own.
+    """
+    binding = task_binding(task_id, board)
+    attempt = current_escalation_attempt(entry)
+    intent = attempt.get("intent", {})
+    target = attempt.get("implementation_profile")
+    target_reviewer = attempt.get("reviewer_profile")
+    origin = attempt.get("origin")
+    review_run_id = intent.get("review_run_id")
+    if (not isinstance(binding, dict) or entry.get("binding") != binding or not isinstance(target, str)
+            or not isinstance(target_reviewer, str) or not isinstance(origin, dict)
+            or not isinstance(review_run_id, int) or target == target_reviewer):
+        return False
+    observed = _show(task_id); task = observed["task"]
+    reviewer = next((run for run in observed["runs"] if run.get("id") == review_run_id), None)
+    if (task.get("id") != task_id or not _event(observed["events"], "changes_requested", review_run_id)
+            or not isinstance(reviewer, dict) or reviewer.get("profile") != origin.get("reviewer_profile")
+            or reviewer.get("outcome") != "changes_requested" or reviewer.get("ended_at") is None):
+        return False
+    handoff_event = next((event for event in reversed(observed["events"])
+                          if event.get("kind") == "review_requested" and isinstance(event.get("run_id"), int)
+                          and event.get("run_id") < review_run_id), None)
+    handoff = next((run for run in observed["runs"] if handoff_event and run.get("id") == handoff_event.get("run_id")), None)
+    metadata = handoff.get("metadata") if isinstance(handoff, dict) else None
+    packet = metadata.get("local_first_review") if isinstance(metadata, dict) else None
+    expected_binding = {field: binding[field] for field in ("board", "task_id", "implementation_profile", "reviewer_profile", "workspace_path", "policy_activation_id", "policy_native_run_watermark", "native_run_id") if field in binding}
+    if (not isinstance(packet, dict) or packet.get("candidate") != intent.get("candidate")
+            or packet.get("implementation_profile") != origin.get("implementation_profile")
+            or packet.get("reviewer_profile") != origin.get("reviewer_profile")
+            or packet.get("binding") != expected_binding):
+        return False
+    if task.get("status") in {"ready", "todo"}:
+        if task.get("assignee") != target:
+            try:
+                from .native import reassign_ready_task
+                if not reassign_ready_task(board, task_id, target):
+                    return False
+            except Exception:
+                return False
+            observed = _show(task_id); task = observed["task"]
+        return task.get("assignee") == target and task.get("status") in {"ready", "todo"}
+    if task.get("status") != "running" or task.get("assignee") != target:
+        return False
+    run_id = task.get("current_run_id")
+    active = next((run for run in observed["runs"] if run.get("id") == run_id), None)
+    claimed = _event(observed["events"], "claimed", run_id) if isinstance(run_id, int) else None
+    payload = claimed.get("payload") if isinstance(claimed, dict) else None
+    source = payload.get("source_status") if isinstance(payload, dict) else None
+    if (not isinstance(active, dict) or active.get("profile") != target or active.get("status") != "running"
+            or active.get("ended_at") is not None or claimed is None or source == "review"):
+        return False
+    return ((required_run_id is None or run_id == required_run_id)
+            and (required_profile is None or required_profile == target))
+
+
+def _reconcile_pending_escalation(task_id: str, board: str, *, required_run_id: int | None = None,
+                                  required_profile: str | None = None) -> str:
+    entry = escalation_entry(task_id, board)
+    binding = task_binding(task_id, board)
+    if not entry or not binding:
+        return "pending"
+    attempt = current_escalation_attempt(entry)
+    if not isinstance(attempt.get("intent", {}).get("review_run_id"), int):
+        return "pending"
+    with _escalation_reconciliation_scope(board, task_id):
+        return reconcile_pending_escalation(board, task_id, binding=binding,
+            review_run_id=attempt["intent"]["review_run_id"],
+            reconcile=lambda sealed: _pending_escalation_proof(task_id, board, sealed,
+                required_run_id=required_run_id, required_profile=required_profile))
+
+
+def _escalate_after_exhaustion(task_id: str, binding: dict[str, Any], show: dict[str, Any], reviewer_run_id: int,
+                               review: dict[str, Any], rationale: str) -> dict[str, Any]:
+    reserve_escalation(board_name(), task_id, review_run_id=reviewer_run_id, binding=binding,
+                       candidate=review["candidate"], change_count=_changes_count(show["runs"]))
+    try:
+        value = _dispatch("kanban_request_changes", {"reason": rationale})
+    except Exception as exc:
+        if not _event(_show(task_id)["events"], "changes_requested", reviewer_run_id):
+            raise EscalationPending(f"escalation changes outcome is unknown; no retry was sent: {exc}") from exc
+        value = {"ok": True, "task_id": task_id, "reconciled": True}
+    status = _reconcile_pending_escalation(task_id, board_name())
+    if status != "routed":
+        raise EscalationPending("escalation routing remains pending or held; no retry was sent")
+    return value
+
+
 def submit_review(args: dict[str, Any], **_: Any) -> str:
     _arguments(args, {"verdict", "rationale"})
     _session()
@@ -381,12 +509,28 @@ def submit_review(args: dict[str, Any], **_: Any) -> str:
         tool, native_args = "kanban_complete", {"summary": rationale, "metadata": {"local_first_review": {
             "verdict": "approved", "rationale": rationale, "candidate": _review["candidate"],
             "implementation_run_id": _review["implementation_run_id"],
-            "reviewer_run_id": reviewer_run_id, "reviewer_profile": _binding_value["reviewer_profile"],
+            "reviewer_run_id": reviewer_run_id, "reviewer_profile": worker_profile(),
         }}}
         expected_status, expected_event = "done", "completed"
-    elif _changes_count(show["runs"]) >= MAX_CHANGES:
-        tool, native_args = "kanban_block", {"reason": "Review changes exhausted; operator attention required. Latest findings: " + rationale, "kind": "needs_input"}
-        expected_status, expected_event = "blocked", None
+    elif _changes_count(show["runs"]) >= (board_policy(board_name()) or {}).get("escalation", {}).get("normal_correction_limit", MAX_CHANGES):
+        policy = board_policy(board_name()) or {}
+        escalation = policy.get("escalation", {})
+        if escalation.get("enabled") is True:
+            try:
+                value = _escalate_after_exhaustion(task_id, _binding_value, show, reviewer_run_id, _review, rationale)
+            except EscalationPending:
+                # request_changes may already have ended this reviewer. Never
+                # issue kanban_block from a stale run; retain the durable intent
+                # for exact native/operator reconciliation instead.
+                raise
+            except (ValueError, GateError) as exc:
+                tool, native_args = "kanban_block", {"reason": "Review escalation exhausted or refused; operator attention required. Latest findings: " + rationale, "kind": "needs_input"}
+                expected_status, expected_event = "blocked", None
+            else:
+                return _result(value, verdict=verdict, escalated=True)
+        else:
+            tool, native_args = "kanban_block", {"reason": "Review changes exhausted; operator attention required. Latest findings: " + rationale, "kind": "needs_input"}
+            expected_status, expected_event = "blocked", None
     else:
         tool, native_args = "kanban_request_changes", {"reason": rationale}
         expected_status, expected_event = "ready", "changes_requested"
@@ -493,12 +637,14 @@ def _persisted_review_handoff(show: dict[str, Any], run_id: int, binding: dict[s
     implementation = next((item for item in show["runs"] if item.get("id") == implementation_run_id), None)
     metadata = implementation.get("metadata") if isinstance(implementation, dict) else None
     handoff = metadata.get("local_first_review") if isinstance(metadata, dict) else None
+    route = trusted_routing(binding["task_id"], binding["board"], binding)
     if (type(implementation_run_id) is not int or implementation_run_id >= run_id
-            or not isinstance(implementation, dict) or implementation.get("profile") != binding["implementation_profile"]
+            or not isinstance(implementation, dict) or implementation.get("profile") != route["implementation_profile"]
             or implementation.get("outcome") != "review_requested" or implementation.get("status") != "review"
             or implementation.get("ended_at") is None or not isinstance(handoff, dict)
             or handoff.get("implementation_run_id") != implementation_run_id
-            or handoff.get("reviewer_profile") != binding["reviewer_profile"]):
+            or handoff.get("implementation_profile") != route["implementation_profile"]
+            or handoff.get("reviewer_profile") != route["reviewer_profile"]):
         raise GateError("recovered reviewer handoff provenance is invalid")
 
 
@@ -520,10 +666,9 @@ def _reconcile_recovery_claim(task_id: str, board: str, entry: dict[str, Any], *
     if type(observed_run_id) is not int or task.get("status") != "running":
         raise GateError("native recovery replacement is not running")
     run = next((item for item in show["runs"] if item.get("id") == observed_run_id), None)
-    expected_profile = entry.get("binding", {}).get("reviewer_profile") if entry.get("phase") == "review" else entry.get("binding", {}).get("implementation_profile")
-    if not isinstance(expected_profile, str):
-        binding = task_binding(task_id, board)
-        expected_profile = binding.get("reviewer_profile") if entry.get("phase") == "review" and binding else binding.get("implementation_profile") if binding else None
+    binding = task_binding(task_id, board)
+    route = trusted_routing(task_id, board, binding) if binding else None
+    expected_profile = route.get("reviewer_profile") if entry.get("phase") == "review" and route else route.get("implementation_profile") if route else None
     if (not isinstance(run, dict) or not isinstance(expected_profile, str) or task.get("assignee") != expected_profile
             or run.get("profile") != expected_profile or run.get("status") != "running" or run.get("ended_at") is not None
             or profile is not None and profile != expected_profile):
@@ -581,7 +726,8 @@ def _reserve_claimed_recovery(task_id: str, board: str, *, run_id: int, profile:
     phase = _failed_phase(show, failed)
     binding = task_binding(task_id, board)
     workspace = task.get("workspace_path")
-    expected_profile = binding.get("reviewer_profile") if phase == "review" and binding else binding.get("implementation_profile") if binding else None
+    route = trusted_routing(task_id, board, binding) if binding else None
+    expected_profile = route.get("reviewer_profile") if phase == "review" and route else route.get("implementation_profile") if route else None
     if (phase not in {"implementation", "review"} or not binding or profile != expected_profile
             or task.get("assignee") != expected_profile or not isinstance(workspace, str)
             or not _same_path(workspace, binding["workspace_path"]) or not profile_exists(profile)
@@ -621,7 +767,8 @@ def _terminal_unadmitted_replacement(show: dict[str, Any], entry: dict[str, Any]
     board = entry.get("board")
     task_id = entry.get("task_id")
     binding = task_binding(task_id, board) if isinstance(board, str) and isinstance(task_id, str) else None
-    expected_profile = binding.get("reviewer_profile") if phase == "review" and binding else binding.get("implementation_profile") if binding else None
+    route = trusted_routing(task_id, board, binding) if binding and isinstance(board, str) and isinstance(task_id, str) else None
+    expected_profile = route.get("reviewer_profile") if phase == "review" and route else route.get("implementation_profile") if route else None
     if (not isinstance(expected_profile, str) or task.get("current_run_id") != replacement.get("id")
             or task.get("assignee") != expected_profile or replacement.get("profile") != expected_profile
             or replacement.get("status") == "running" or replacement.get("ended_at") is None):
@@ -701,10 +848,31 @@ def watchdog_claimed(*, task_id: str, board: str, assignee: str | None = None, r
 def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) -> None:
     """Autonomous post-dispatch recovery; all uncertain observations fail closed."""
     if dry_run or not board: return
+    # A native reassignment may synchronously emit this hook while the outer
+    # reconciler owns the escalation policy lock. Do not recurse into another
+    # autonomous reconciliation in that same call chain; the outer readback
+    # decides the pending/routed outcome after native returns.
+    active = _ACTIVE_ESCALATION_RECONCILIATION.get()
+    if active is not None and active[0] == board:
+        return
     try:
+        # Reconcile only a durable correction-escalation intent whose exact
+        # reviewer transition is already visible. This is separate from runtime
+        # recovery policy and never scans/revives old operator holds.
+        from .state import load_state
+        for entry in load_state().get("escalations", {}).values():
+            attempt = current_escalation_attempt(entry)
+            if entry.get("board") != board or attempt.get("intent", {}).get("status") != "changes_requested_pending":
+                continue
+            task_id = entry.get("task_id")
+            review_run_id = attempt.get("intent", {}).get("review_run_id")
+            if not isinstance(task_id, str) or type(review_run_id) is not int:
+                continue
+            status = _reconcile_pending_escalation(task_id, board)
+            if status == "held":
+                continue
         policy = board_policy(board)
         if not policy or policy.get("recovery", {}).get("enabled") is not True: return
-        from .state import load_state
         candidates = list(load_state()["tasks"].values())
         # Historical adoption is an ambiguity-refusal boundary, not a per-tick
         # throttle.  Read every blocked unbound card completely before choosing:
@@ -763,7 +931,9 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
                 workspace = task.get("workspace_path")
                 if not isinstance(workspace, str) or task.get("workspace_kind") != "dir" or not Path(workspace).is_absolute(): continue
                 binding = {"board": board, "task_id": task_id, "implementation_profile": policy["implementation_profile"], "reviewer_profile": policy["reviewer_profile"], "workspace_path": workspace, "policy_activation_id": policy["activation_id"], "policy_native_run_watermark": policy["native_run_watermark"], "native_run_id": failed["id"]}
-            workspace = task.get("workspace_path"); profile = binding["reviewer_profile"] if phase == "review" else binding["implementation_profile"]
+            workspace = task.get("workspace_path")
+            route = trusted_routing(task_id, board, binding)
+            profile = route["reviewer_profile"] if phase == "review" else route["implementation_profile"]
             if not isinstance(workspace, str) or not _same_path(workspace, binding["workspace_path"]) or task.get("assignee") != profile or not profile_exists(profile) or not _workspace_is_exclusive(board, task_id, workspace): continue
             checkpoint = _workspace_checkpoint(workspace)
             entry = reserve_recovery(board, task_id, failed_run_id=failed["id"], phase=phase, workspace_path=workspace, checkpoint=checkpoint, binding=binding, adopted=adopted)
@@ -776,8 +946,72 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
             continue
 
 
+def _routed_escalation_guard(task_id: str, board: str, entry: dict[str, Any]) -> dict[str, str] | None:
+    """Admit only the exact live native worker on an already-published route.
+
+    Reconciliation can be completed by the dispatch watchdog before a worker
+    reaches its first tool.  Publication is not itself worker authority: each
+    normal tool must still prove that this process owns the current native run
+    in the route's implementation or review phase.
+    """
+    try:
+        run_id, profile = _run_id(), worker_profile()
+        binding = task_binding(task_id, board)
+        if not binding or entry.get("binding") != binding:
+            raise GateError("escalation binding is absent or changed")
+        route = trusted_routing(task_id, board, binding)
+        show = _show(task_id)
+        task = show["task"]
+        active = next((run for run in show["runs"] if run.get("id") == run_id), None)
+        claimed = _event(show["events"], "claimed", run_id)
+        payload = claimed.get("payload") if isinstance(claimed, dict) else None
+        source = payload.get("source_status") if isinstance(payload, dict) else None
+        # Native ready claims intentionally omit source_status.  That omission
+        # is unambiguous only for the implementation side of an effective route.
+        expected = (route["reviewer_profile"] if source == "review"
+                    else route["implementation_profile"] if source in {None, "ready", "todo"}
+                    else None)
+        if (not isinstance(profile, str) or not profile or expected is None
+                or task.get("status") != "running" or task.get("current_run_id") != run_id
+                or task.get("assignee") != expected or profile != expected
+                or not isinstance(active, dict) or active.get("profile") != expected
+                or active.get("status") != "running" or active.get("ended_at") is not None
+                or claimed is None):
+            raise GateError("worker does not own the current effective escalation route")
+    except Exception as exc:
+        return {"action": "block", "message": f"Effective escalation route is not owned by this worker; refusing tool: {exc}"}
+    return None
+
+
 def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | None:
     """Protect only normal model tool calls; environment owns the worker task id."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if task_id:
+        try:
+            pending = escalation_entry(task_id, board_name())
+            if pending and current_escalation_attempt(pending).get("intent", {}).get("status") == "changes_requested_pending":
+                # Only the exact newly assigned target claim may turn a pending
+                # intent into an active route. Old/wrong claims stay fenced.
+                try:
+                    run_id = _run_id()
+                    profile = worker_profile()
+                    status = _reconcile_pending_escalation(task_id, board_name(), required_run_id=run_id,
+                                                           required_profile=profile)
+                except Exception as exc:
+                    return {"action": "block", "message": f"Escalation reconciliation is unreadable; refusing tool: {exc}"}
+                if status != "routed":
+                    held = "held" if status == "held" else "pending native reconciliation"
+                    return {"action": "block", "message": f"Escalation routing is {held}; no worker tool is authorized. Stop work and wait for the exact routing readback or operator action."}
+                # Do not return here: a just-reconciled route still has to pass
+                # current-run admission and direct lifecycle calls still have
+                # to reach their ordinary board-policy refusal below.
+                pending = escalation_entry(task_id, board_name())
+            if pending and current_escalation_attempt(pending).get("intent", {}).get("status") == "routed":
+                admission = _routed_escalation_guard(task_id, board_name(), pending)
+                if admission:
+                    return admission
+        except Exception as exc:
+            return {"action": "block", "message": f"Escalation state is unreadable; refusing tool: {exc}"}
     recovery = _recovery_guard(tool_name)
     if recovery:
         return recovery

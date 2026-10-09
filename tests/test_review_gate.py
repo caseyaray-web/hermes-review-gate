@@ -27,7 +27,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(home))
     monkeypatch.setenv('HERMES_DISABLE_LAZY_INSTALLS', '1')
     (home / 'config.yaml').write_text('plugins:\n  enabled: [local-first-review]\nkanban:\n  dispatch_in_gateway: false\n')
-    for name in ('impl', 'review', 'other'):
+    for name in ('impl', 'review', 'other', 'strong', 'post-review'):
         profile = home / 'profiles' / name
         profile.mkdir(parents=True)
         (profile / 'config.yaml').write_text('model:\n  default: unused-controlled-fixture\n')
@@ -39,7 +39,7 @@ def board(tmp_path, monkeypatch):
     import tools.kanban_tools
     from model_tools import handle_function_call
     assert kb.kanban_db_path().is_relative_to(home)
-    assert state.profiles() == ['default', 'impl', 'other', 'review']
+    assert state.profiles() == ['default', 'impl', 'other', 'post-review', 'review', 'strong']
     get_plugin_manager().discover_and_load()
     kb.init_db()
     conn = kbc.connect()
@@ -228,6 +228,230 @@ def test_correction_limit_from_native_runs(board):
     assert show['task']['block_kind']=='needs_input'
     assert len([r for r in show['runs'] if r['outcome']=='changes_requested'])==2
     assert 'Missing required behavior 2' in show['runs'][-1]['summary']
+
+
+def test_joined_review_correction_exhaustion_escalates_then_distinct_reviewer_approves(board):
+    """Full native lifecycle: normal correction -> routed stronger impl -> independent approval."""
+    b = board
+    state.activate_board('default', activation_id='escalate-corrections')
+    state.set_escalation_policy('default', enabled=True, normal_correction_limit=1, max_attempts=1,
+                                implementation_profile='strong', reviewer_profile='post-review')
+    assert b.dispatch().assignee == 'impl'
+    assert b.call('finish_implementation', summary='Initial candidate is ready for normal review.')['ok']
+    assert b.dispatch().assignee == 'review'
+    assert b.call('submit_review', verdict='changes_requested', rationale='Normal correction required.')['ok']
+    assert b.dispatch().assignee == 'impl'
+    (b.repo / 'implementation.txt').write_text('normal correction\n')
+    b.git('add', '.'); b.git('commit', '-qm', 'normal correction')
+    assert b.call('finish_implementation', summary='Normal correction candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    escalated = b.call('submit_review', verdict='changes_requested', rationale='Escalate this remaining substantive finding.')
+    assert escalated['ok'] and escalated['escalated'], escalated
+    routed = b.show()
+    assert routed['task']['status'] in {'ready', 'todo'} and routed['task']['assignee'] == 'strong'
+    stored = state.load_state()
+    assert stored['tasks']['default:' + b.pred]['implementation_profile'] == 'impl'  # immutable provenance
+    assert stored['effective_routing']['default:' + b.pred]['implementation_profile'] == 'strong'
+    assert stored['effective_routing']['default:' + b.pred]['reviewer_profile'] == 'post-review'
+    assert b.dispatch().assignee == 'strong'
+    (b.repo / 'implementation.txt').write_text('strong correction\n')
+    b.git('add', '.'); b.git('commit', '-qm', 'strong correction')
+    assert b.call('finish_implementation', summary='Escalated implementation candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'post-review'
+    import os
+    os.environ['HERMES_PROFILE'] = 'review'
+    assert b.call('submit_review', verdict='approved', rationale='Original reviewer cannot self-approve escalation.')['error']
+    os.environ['HERMES_PROFILE'] = 'post-review'
+    assert b.call('submit_review', verdict='approved', rationale='Independent post-escalation reviewer approved the candidate.')['ok']
+    assert b.show()['task']['status'] == 'done'
+
+
+def test_two_escalation_attempts_allow_original_reviewer_to_implement_then_postreview_approves(board):
+    """Attempt two consumes retained history; no reviewer approves a revision it implemented."""
+    b = board
+    state.activate_board('default', activation_id='two-escalation-attempts')
+    state.set_escalation_policy('default', enabled=True, normal_correction_limit=1, max_attempts=2,
+                                implementation_profile='review', reviewer_profile='post-review')
+    assert b.dispatch().assignee == 'impl'
+    assert b.call('finish_implementation', summary='Initial candidate ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    assert b.call('submit_review', verdict='changes_requested', rationale='Normal correction required.')['ok']
+    assert b.dispatch().assignee == 'impl'
+    (b.repo / 'implementation.txt').write_text('normal correction\n'); b.git('add', '.'); b.git('commit', '-qm', 'normal correction')
+    assert b.call('finish_implementation', summary='Normal correction ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    assert b.call('submit_review', verdict='changes_requested', rationale='Escalation attempt one required.')['escalated']
+    assert b.dispatch().assignee == 'review'  # original reviewer is now the escalated implementer
+    (b.repo / 'implementation.txt').write_text('escalation one\n'); b.git('add', '.'); b.git('commit', '-qm', 'escalation one')
+    assert b.call('finish_implementation', summary='Escalation attempt one candidate ready.')['ok']
+    assert b.dispatch().assignee == 'post-review'
+    assert b.call('submit_review', verdict='changes_requested', rationale='Escalation attempt two required.')['escalated']
+    assert b.dispatch().assignee == 'review'
+    (b.repo / 'implementation.txt').write_text('escalation two\n'); b.git('add', '.'); b.git('commit', '-qm', 'escalation two')
+    assert b.call('finish_implementation', summary='Escalation attempt two candidate ready.')['ok']
+    assert b.dispatch().assignee == 'post-review'
+    assert b.call('submit_review', verdict='approved', rationale='Independent post-review approved attempt two.')['ok']
+    ledger = state.load_state()['escalations']['default:' + b.pred]
+    assert ledger['consumed_attempts'] == ledger['current_attempt'] == 2
+    assert [attempt['implementation_profile'] for attempt in ledger['attempts']] == ['review', 'review']
+    assert b.show()['task']['status'] == 'done'
+
+
+def test_joined_escalation_old_claim_is_admission_held_without_stale_reviewer_block(board, monkeypatch):
+    """A forced native claim in the reassign window cannot edit or finish old work."""
+    b = board
+    state.activate_board('default', activation_id='escalation-claim-race')
+    state.set_escalation_policy('default', enabled=True, normal_correction_limit=1, max_attempts=1,
+                                implementation_profile='strong', reviewer_profile='post-review')
+    assert b.dispatch().assignee == 'impl'
+    assert b.call('finish_implementation', summary='Initial candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    assert b.call('submit_review', verdict='changes_requested', rationale='Normal correction required.')['ok']
+    assert b.dispatch().assignee == 'impl'
+    (b.repo / 'implementation.txt').write_text('normal correction\n')
+    b.git('add', '.'); b.git('commit', '-qm', 'normal correction')
+    assert b.call('finish_implementation', summary='Corrected candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    before_blocks = sum(event['kind'] == 'blocked' for event in b.show()['events'])
+    calls = []
+
+    def force_old_claim_then_refuse(board_name, task_id, profile):
+        calls.append((board_name, task_id, profile))
+        assert b.dispatch(expected=task_id).assignee == 'impl'
+        return False  # native refuses reassignment of the now-running old claim
+
+    import local_first_review.native as native
+    monkeypatch.setattr(native, 'reassign_ready_task', force_old_claim_then_refuse)
+    result = b.call('submit_review', verdict='changes_requested', rationale='Escalate remaining finding.')
+    assert result['error'] and 'pending' in result['error'].lower(), result
+    assert calls == [('default', b.pred, 'strong')]
+    observed = b.show()
+    assert observed['task']['status'] == 'running' and observed['task']['assignee'] == 'impl'
+    pending = state.load_state()['escalations']['default:' + b.pred]
+    assert state.current_escalation_attempt(pending)['intent']['status'] == 'changes_requested_pending'
+    assert 'pending native reconciliation' in plugin.guard('terminal', {})['message']
+    assert b.call('finish_implementation', summary='Old worker must not finish this held route.')['error']
+    plugin.watchdog_tick(board='default')
+    assert b.show()['task']['status'] == 'running'  # no reclaim/revive or second reassignment
+    assert sum(event['kind'] == 'blocked' for event in b.show()['events']) == before_blocks
+
+
+
+def test_joined_escalation_target_claim_race_reconciles_then_independent_reviewer_approves(board, monkeypatch):
+    """Watchdog-first publication still fences a contradictory worker identity."""
+    b = board
+    state.activate_board('default', activation_id='target-claim-race')
+    state.set_escalation_policy('default', enabled=True, normal_correction_limit=1, max_attempts=1,
+                                implementation_profile='strong', reviewer_profile='post-review')
+    assert b.dispatch().assignee == 'impl'
+    assert b.call('finish_implementation', summary='Initial candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    assert b.call('submit_review', verdict='changes_requested', rationale='Normal correction required.')['ok']
+    assert b.dispatch().assignee == 'impl'
+    (b.repo / 'implementation.txt').write_text('normal correction\n')
+    b.git('add', '.'); b.git('commit', '-qm', 'normal correction')
+    assert b.call('finish_implementation', summary='Corrected candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    import local_first_review.native as native
+    actual = native.reassign_ready_task
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *_: False)
+    escalated = b.call('submit_review', verdict='changes_requested', rationale='Escalate remaining finding.')
+    assert escalated['error'] and 'pending' in escalated['error'].lower(), escalated
+    assert actual('default', b.pred, 'strong')
+    claimed = b.dispatch(expected=b.pred)
+    assert claimed.assignee == 'strong'
+    # The synchronous native reassignment/dispatch watchdog may already publish
+    # this exact route. Publication is not process authority: a contradictory
+    # worker identity remains unable to run ordinary tools.
+    assert state.current_escalation_attempt(state.load_state()['escalations']['default:' + b.pred])['intent']['status'] == 'routed'
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(claimed.current_run_id + 1000))
+    assert 'Effective escalation route' in plugin.guard('terminal', {})['message']
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(claimed.current_run_id))
+    assert plugin.guard('terminal', {}) is None
+    assert state.current_escalation_attempt(state.load_state()['escalations']['default:' + b.pred])['intent']['status'] == 'routed'
+    (b.repo / 'implementation.txt').write_text('strong correction\n')
+    b.git('add', '.'); b.git('commit', '-qm', 'strong correction')
+    assert b.call('finish_implementation', summary='Strong correction candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'post-review'
+    assert b.call('submit_review', verdict='approved', rationale='Independent reviewer approved the exact target claim.')['ok']
+    assert b.show()['task']['status'] == 'done'
+
+
+def test_joined_escalation_pending_first_tool_reconciles_exact_claim_then_blocks_lifecycle_bypass(board, monkeypatch):
+    """A real claimed target remains pending until its first guarded tool admits it."""
+    b = board
+    state.activate_board('default', activation_id='pending-first-tool')
+    state.set_escalation_policy('default', enabled=True, normal_correction_limit=1, max_attempts=1,
+                                implementation_profile='strong', reviewer_profile='post-review')
+    assert b.dispatch().assignee == 'impl'
+    assert b.call('finish_implementation', summary='Initial candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    assert b.call('submit_review', verdict='changes_requested', rationale='Normal correction required.')['ok']
+    assert b.dispatch().assignee == 'impl'
+    (b.repo / 'implementation.txt').write_text('normal correction\n')
+    b.git('add', '.'); b.git('commit', '-qm', 'normal correction')
+    assert b.call('finish_implementation', summary='Corrected candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    import local_first_review.native as native
+    actual = native.reassign_ready_task
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *_: False)
+    assert b.call('submit_review', verdict='changes_requested', rationale='Escalate remaining finding.')['error']
+    # Suppress only the synchronous nested tick to exercise the supported
+    # pre-tool admission boundary with a real native assignment and claim.
+    with plugin._escalation_reconciliation_scope('default', b.pred):
+        assert actual('default', b.pred, 'strong')
+        claimed = b.dispatch(expected=b.pred)
+    assert claimed.assignee == 'strong'
+    assert state.current_escalation_attempt(state.load_state()['escalations']['default:' + b.pred])['intent']['status'] == 'changes_requested_pending'
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(claimed.current_run_id + 1000))
+    assert 'pending native reconciliation' in plugin.guard('terminal', {})['message']
+    assert state.current_escalation_attempt(state.load_state()['escalations']['default:' + b.pred])['intent']['status'] == 'changes_requested_pending'
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(claimed.current_run_id))
+    assert plugin.guard('terminal', {}) is None
+    assert state.current_escalation_attempt(state.load_state()['escalations']['default:' + b.pred])['intent']['status'] == 'routed'
+    refused = plugin.guard('kanban_complete', {'summary': 'direct bypass after reconciliation'})
+    assert refused and 'finish_implementation' in refused['message']
+
+
+def test_joined_disable_pending_escalation_holds_without_reassign_or_finalize(board, monkeypatch):
+    """Disable pauses a pending intent; it neither refunds it nor touches native work."""
+    b = board
+    state.activate_board('default', activation_id='disable-pending')
+    state.set_escalation_policy('default', enabled=True, normal_correction_limit=1, max_attempts=1,
+                                implementation_profile='strong', reviewer_profile='post-review')
+    assert b.dispatch().assignee == 'impl'
+    assert b.call('finish_implementation', summary='Initial candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    assert b.call('submit_review', verdict='changes_requested', rationale='Normal correction required.')['ok']
+    assert b.dispatch().assignee == 'impl'
+    (b.repo / 'implementation.txt').write_text('normal correction\n')
+    b.git('add', '.'); b.git('commit', '-qm', 'normal correction')
+    assert b.call('finish_implementation', summary='Corrected candidate is ready.')['ok']
+    assert b.dispatch().assignee == 'review'
+    import local_first_review.native as native
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *_: False)
+    assert b.call('submit_review', verdict='changes_requested', rationale='Escalate remaining finding.')['error']
+    before = b.show(); intent = state.current_escalation_attempt(state.load_state()['escalations']['default:' + b.pred])
+    state.set_escalation_policy('default', enabled=False)
+    plugin.watchdog_tick(board='default')
+    assert b.show() == before
+    assert state.current_escalation_attempt(state.load_state()['escalations']['default:' + b.pred])['intent'] == intent['intent']
+    assert 'held' in plugin.guard('terminal', {})['message']
+
+
+def test_escalation_disabled_and_exhausted_attempt_hold_operator(board):
+    b = board
+    state.activate_board('default', activation_id='disabled-escalation')
+    for cycle in range(3):
+        assert b.dispatch().assignee == 'impl'
+        assert b.call('finish_implementation', summary=f'Candidate {cycle} is ready.')['ok']
+        assert b.dispatch().assignee == 'review'
+        result = b.call('submit_review', verdict='changes_requested', rationale=f'Finding {cycle}.')
+        assert result['ok'], result
+        if cycle < 2:
+            (b.repo / 'implementation.txt').write_text(f'correction {cycle}\n')
+            b.git('add', '.'); b.git('commit', '-qm', f'correction {cycle}')
+    assert b.show()['task']['status'] in {'blocked', 'triage'}
 
 
 def test_ambiguous_handoff_native_readback_and_restart(board,monkeypatch):

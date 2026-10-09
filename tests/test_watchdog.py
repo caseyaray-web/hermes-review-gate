@@ -1,5 +1,7 @@
 import hashlib
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -31,7 +33,7 @@ def test_checkpoint_hashes_untracked_names_not_contents(tmp_path):
 
 def test_recovery_admission_accepts_native_ready_claim_omission_and_pins_first_normal_tool(monkeypatch):
     entry = {"failed_run_id": 1, "phase": "implementation", "workspace_path": "/work", "expected_source_status": "ready", "checkpoint": {"head": "a" * 40, "dirty": []}, "intent": {"status": "unblock_verified", "native_status": "ready"}, "authorized_run_id": 2, "authorized_profile": "impl"}
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "task"); monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "2"); monkeypatch.setenv("HERMES_PROFILE", "impl")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task"); monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "2"); monkeypatch.setenv("HERMES_KANBAN_BOARD", "default"); monkeypatch.setenv("HERMES_PROFILE", "impl")
     monkeypatch.setattr(plugin, "task_binding", lambda *_: _binding()); monkeypatch.setattr(plugin, "worker_profile", lambda: "impl")
     monkeypatch.setattr(plugin, "profile_exists", lambda _: True); monkeypatch.setattr(plugin, "recovery_entry", lambda *_, **__: entry)
     monkeypatch.setattr(plugin, "_show", lambda _: {"task": {"id": "task", "status": "running", "assignee": "impl", "workspace_path": "/work", "current_run_id": 2}, "runs": [{"id": 2, "profile": "impl", "status": "running", "ended_at": None}], "events": [{"kind": "claimed", "run_id": 2, "payload": {"lock": "native"}}]})
@@ -49,6 +51,56 @@ def test_recovery_read_error_fails_closed(monkeypatch):
     monkeypatch.setattr(plugin, "recovery_entry", lambda *_: (_ for _ in ()).throw(OSError("locked")))
     result = plugin.guard("terminal", {})
     assert result and result["action"] == "block" and "unreadable" in result["message"]
+
+
+def test_effective_escalation_route_requires_exact_current_run_and_profile(monkeypatch):
+    """A watchdog-published route is not authority for an arbitrary process."""
+    binding = _binding()
+    entry = {"binding": binding, "current_attempt": 1, "attempts": [{"attempt": 1, "intent": {"status": "routed"}}]}
+    show = {"task": {"id": "task", "status": "running", "assignee": "strong", "current_run_id": 22},
+            "runs": [{"id": 22, "profile": "strong", "status": "running", "ended_at": None}],
+            "events": [{"kind": "claimed", "run_id": 22, "payload": {"source_status": "ready"}}]}
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "23")
+    monkeypatch.setenv("HERMES_PROFILE", "strong")
+    monkeypatch.setattr(plugin, "escalation_entry", lambda *_: entry)
+    monkeypatch.setattr(plugin, "task_binding", lambda *_: binding)
+    monkeypatch.setattr(plugin, "trusted_routing", lambda *_: {"implementation_profile": "strong", "reviewer_profile": "post-review"})
+    monkeypatch.setattr(plugin, "_show", lambda *_: show)
+    monkeypatch.setattr(plugin, "worker_profile", lambda: "strong")
+    monkeypatch.setattr(plugin, "recovery_entry", lambda *_: None)
+
+    refused = plugin.guard("terminal", {})
+    assert refused and refused["action"] == "block" and "Effective escalation route" in refused["message"]
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "22")
+    assert plugin.guard("terminal", {}) is None
+    monkeypatch.setattr(plugin, "worker_profile", lambda: "other")
+    refused = plugin.guard("terminal", {})
+    assert refused and refused["action"] == "block" and "Effective escalation route" in refused["message"]
+
+
+def test_reconciled_escalation_still_refuses_direct_lifecycle_bypass(monkeypatch):
+    """First-tool reconciliation must flow into the normal lifecycle fence."""
+    binding = _binding()
+    entry = {"binding": binding, "current_attempt": 1, "attempts": [{"attempt": 1, "intent": {"status": "changes_requested_pending", "review_run_id": 9}}]}
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "22")
+    monkeypatch.setenv("HERMES_PROFILE", "strong")
+    routed = {"binding": binding, "current_attempt": 1, "attempts": [{"attempt": 1, "intent": {"status": "routed"}}]}
+    reads = [entry, routed]
+    monkeypatch.setattr(plugin, "escalation_entry", lambda *_: reads.pop(0) if reads else routed)
+    monkeypatch.setattr(plugin, "_reconcile_pending_escalation", lambda *_, **__: "routed")
+    monkeypatch.setattr(plugin, "_routed_escalation_guard", lambda *_: None)
+    monkeypatch.setattr(plugin, "recovery_entry", lambda *_: None)
+    monkeypatch.setattr(plugin, "is_managed", lambda *_: True)
+    monkeypatch.setattr(plugin, "_show", lambda *_: {"task": {"id": "task"}, "runs": []})
+    monkeypatch.setattr(plugin, "_binding", lambda *_: ("task", binding))
+
+    refused = plugin.guard("kanban_complete", {"summary": "bypass"})
+    assert refused and refused["action"] == "block"
+    assert "finish_implementation" in refused["message"]
 
 
 def test_exact_unbound_rm02_requires_one_postwatermark_gave_up_with_max_one():
@@ -95,6 +147,46 @@ def test_recovery_accepts_only_started_worker_iteration_exhaustion():
     # dispatcher event and therefore cannot be recovered as a retry.
     assert not plugin._allowed_terminal_failure({"events": [{"kind": "blocked", "run_id": 5,
         "payload": {"kind": "needs_input"}}]}, failed)
+
+
+def test_escalation_reconciliation_scope_skips_reentrant_dispatch_tick(tmp_path):
+    """A synchronous native hook cannot take a second flock and deadlock."""
+    state_file = tmp_path / "local-first-review.json"
+    # Run the exact same-thread recursion in a child so a regression is bounded
+    # by a process timeout instead of wedging the parent test session.
+    code = r'''
+from pathlib import Path
+import sys
+from local_first_review import plugin, state
+
+state.state_path = lambda: Path(sys.argv[1])
+binding = {"board": "default", "task_id": "task", "implementation_profile": "impl", "reviewer_profile": "review", "workspace_path": "/work"}
+data = state._empty_state()
+data["tasks"]["default:task"] = binding
+data["boards"]["default"] = {
+    "activation_id": "a", "native_run_watermark": 0,
+    "implementation_profile": "impl", "reviewer_profile": "review",
+    "recovery": {"enabled": False, "max_per_phase": 1},
+    "escalation": {"enabled": True, "normal_correction_limit": 1, "max_attempts": 1,
+                   "implementation_profile": "strong", "reviewer_profile": "post-review"},
+}
+data["escalations"]["default:task"] = {
+    "board": "default", "task_id": "task", "binding": binding,
+    "consumed_attempts": 1, "current_attempt": 1,
+    "attempts": [{"attempt": 1, "implementation_profile": "strong", "reviewer_profile": "post-review",
+                  "origin": binding, "intent": {"status": "changes_requested_pending", "review_run_id": 7,
+                  "candidate": {}, "change_count": 1}}],
+}
+state.save_state(data)
+with state.locked_state(write=True):
+    with plugin._escalation_reconciliation_scope("default", "task"):
+        plugin.watchdog_tick(board="default")
+print("reentrant tick fenced")
+'''
+    result = subprocess.run([sys.executable, "-c", code, str(state_file)], cwd=Path(__file__).parents[1],
+                            text=True, capture_output=True, timeout=3, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "reentrant tick fenced"
 
 
 def test_claim_hook_does_not_authorize_without_exact_native_evidence(monkeypatch):
@@ -242,7 +334,7 @@ def test_reviewer_pretool_recovers_crash_after_native_handoff_before_ledger_fina
              "receipt": {"run_id": 2, "tool": "finish_implementation"}}
     show = {"task": {"status": "running", "current_run_id": 3, "assignee": "review"}, "runs": [
         {"id": 2, "profile": "impl", "status": "review", "outcome": "review_requested", "ended_at": 10,
-         "metadata": {"local_first_review": {"implementation_run_id": 2, "reviewer_profile": "review"}}},
+         "metadata": {"local_first_review": {"implementation_run_id": 2, "implementation_profile": "impl", "reviewer_profile": "review"}}},
         {"id": 3, "profile": "review", "status": "running", "ended_at": None},
     ], "events": [
         {"kind": "review_requested", "run_id": 2, "payload": {}},
@@ -264,7 +356,7 @@ def test_reviewer_pretool_refuses_impl_recovery_without_verified_native_handoff(
              "receipt": {"run_id": 2, "tool": "finish_implementation"}}
     show = {"task": {"status": "running", "current_run_id": 3, "assignee": "review"}, "runs": [
         {"id": 2, "profile": "impl", "status": "review", "outcome": "review_requested", "ended_at": 10,
-         "metadata": {"local_first_review": {"implementation_run_id": 2, "reviewer_profile": "review"}}},
+         "metadata": {"local_first_review": {"implementation_run_id": 2, "implementation_profile": "impl", "reviewer_profile": "review"}}},
         {"id": 3, "profile": "review", "status": "running", "ended_at": None},
     ], "events": [{"kind": "claimed", "run_id": 3, "payload": {"source_status": "review"}}]}
     monkeypatch.setattr(plugin, "_show", lambda _: show)

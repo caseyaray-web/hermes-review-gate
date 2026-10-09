@@ -18,8 +18,9 @@ if _plugin_root not in sys.path:
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
-from local_first_review.state import (MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT, activate_board, enroll_task,
-                                      load_state, locked_state, profile_exists, profiles, set_recovery_policy)
+from local_first_review.state import (ESCALATION_MAX_ATTEMPTS_LIMIT, MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT,
+                                      activate_board, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
+                                      set_escalation_policy, set_recovery_policy, trusted_routing)
 
 router = APIRouter()
 COUNT_NAMES = (
@@ -56,6 +57,17 @@ class RecoveryControl(BaseModel):
     board: str = Field(min_length=1, max_length=64)
     enabled: StrictBool
     max_per_phase: StrictInt | None = Field(default=None, ge=1, le=RECOVERY_MAX_PER_PHASE_LIMIT)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class EscalationControl(BaseModel):
+    board: str = Field(min_length=1, max_length=64)
+    enabled: StrictBool
+    normal_correction_limit: StrictInt = Field(ge=1, le=MAX_CHANGES)
+    max_attempts: StrictInt = Field(ge=1, le=ESCALATION_MAX_ATTEMPTS_LIMIT)
+    implementation_profile: str | None = Field(default=None, min_length=1, max_length=128)
+    reviewer_profile: str | None = Field(default=None, min_length=1, max_length=128)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -153,8 +165,9 @@ def _activation_preview(board: str, *, policy: dict[str, Any], legacy_bound_ids:
         if status == "done":
             history.append(task_id)
             continue
-        # Explicit legacy enrollment remains visible through its managed-task
-        # telemetry and must not also be advertised as board-policy work.
+        # Already bound work—including a review or exhausted-review hold—has
+        # immutable/effective routing. It must not receive generic first-run
+        # "assign implementation profile" guidance from activation telemetry.
         if task_id in legacy_bound_ids:
             legacy_bound.append(task_id)
             continue
@@ -216,12 +229,13 @@ def _policy_scope_view(board: str, policy: dict[str, Any]) -> dict[str, Any]:
     try:
         state = load_state()
         legacy_bound_ids = {binding["task_id"] for binding in state["tasks"].values()
-                            if binding.get("board") == board and "policy_activation_id" not in binding}
+                            if binding.get("board") == board}
         classification = _activation_preview(board, policy=policy, legacy_bound_ids=legacy_bound_ids)
         return {"board": board, "activation_id": policy["activation_id"],
                 "native_run_watermark": policy["native_run_watermark"],
                 "implementation_profile": policy["implementation_profile"],
                 "reviewer_profile": policy["reviewer_profile"], "recovery": policy.get("recovery", {"enabled": False, "max_per_phase": 1}),
+                "escalation": policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
                 "eligible_no_run": classification["eligible_no_run"],
                 "awaiting_first_gate": classification["awaiting_first_gate"],
                 "attention": classification["attention"], "history": classification["history"],
@@ -232,6 +246,7 @@ def _policy_scope_view(board: str, policy: dict[str, Any]) -> dict[str, Any]:
                 "implementation_profile": policy["implementation_profile"],
                 "reviewer_profile": policy["reviewer_profile"],
                 "recovery": policy.get("recovery", {"enabled": False, "max_per_phase": 1}),
+                "escalation": policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
                 "eligible_no_run": None, "awaiting_first_gate": None, "attention": None,
                 "history": None, "legacy_bound": None, "error": str(exc)}
 
@@ -258,6 +273,10 @@ def _completion_is_approved(task: dict[str, Any], runs: list[dict[str, Any]], bi
     """Only native completion carrying the gate's approval can make this done."""
     if task.get("status") != "done":
         return False
+    try:
+        route = trusted_routing(binding["task_id"], binding["board"], binding)
+    except (KeyError, ValueError):
+        return False
     for run in reversed(runs):
         if run.get("outcome") != "completed" or run.get("ended_at") is None:
             continue
@@ -270,15 +289,17 @@ def _completion_is_approved(task: dict[str, Any], runs: list[dict[str, Any]], bi
         return bool(
             isinstance(review, dict) and review.get("verdict") == "approved"
             and review.get("reviewer_run_id") == run.get("id")
-            and review.get("reviewer_profile") == binding["reviewer_profile"]
-            and run.get("profile") == binding["reviewer_profile"]
+            and review.get("reviewer_profile") == run.get("profile")
+            and isinstance(review.get("reviewer_profile"), str)
             and isinstance(implementation_run_id, int) and isinstance(handoff, dict)
-            and handoff.get("profile") == binding["implementation_profile"]
+            and isinstance(handoff_review, dict)
+            and review.get("reviewer_profile") != handoff_review.get("implementation_profile")
+            and handoff.get("profile") == handoff_review.get("implementation_profile")
             and handoff.get("outcome") == "review_requested"
             and isinstance(handoff_review, dict)
             and handoff_review.get("implementation_run_id") == implementation_run_id
-            and handoff_review.get("implementation_profile") == binding["implementation_profile"]
-            and handoff_review.get("reviewer_profile") == binding["reviewer_profile"]
+            and handoff_review.get("implementation_profile") == route["implementation_profile"]
+            and handoff_review.get("reviewer_profile") == route["reviewer_profile"]
             and review.get("candidate") == handoff_review.get("candidate")
         )
     return False
@@ -341,8 +362,23 @@ def _next_step(phase: str, error: str | None) -> str:
 
 def _task_view(binding: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
     board, task_id = binding["board"], binding["task_id"]
-    base = {"board": board, "task_id": task_id, "implementation_profile": binding["implementation_profile"],
-            "reviewer_profile": binding["reviewer_profile"], "process_liveness": PROCESS_LIVENESS}
+    published_route = effective_routing(task_id, board)
+    try:
+        route = trusted_routing(task_id, board, binding)
+    except ValueError:
+        route = binding
+    if published_route is not None and any(published_route.get(key) != route.get(key)
+                                          for key in ("board", "task_id", "implementation_profile", "reviewer_profile")):
+        published_route = None
+    pending = escalation_entry(task_id, board)
+    escalation_status = current_escalation_attempt(pending).get("intent", {}).get("status") if isinstance(pending, dict) else None
+    policy = load_state().get("boards", {}).get(board, {})
+    escalation_enabled = policy.get("escalation", {}).get("enabled") is True
+    base = {"board": board, "task_id": task_id, "implementation_profile": route["implementation_profile"],
+            "reviewer_profile": route["reviewer_profile"],
+            "original_implementation_profile": binding["implementation_profile"],
+            "original_reviewer_profile": binding["reviewer_profile"], "effective_routing": published_route,
+            "escalation_status": escalation_status, "escalation_enabled": escalation_enabled, "process_liveness": PROCESS_LIVENESS}
     try:
         task, runs, events = _observe_task(board, task_id)
     except TelemetryUnavailable as exc:
@@ -376,8 +412,8 @@ def _task_view(binding: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
     phase = _phase(task, runs, events, approved)
     stale = _active_run_is_stale(active, observed_at)
     try:
-        missing_profiles = [binding[key] for key in ("implementation_profile", "reviewer_profile")
-                            if not profile_exists(binding[key])]
+        missing_profiles = [route[key] for key in ("implementation_profile", "reviewer_profile")
+                            if not profile_exists(route[key])]
     except (OSError, ValueError, RuntimeError, ImportError):
         missing_profiles = None
     has_current_failure = phase == "blocked_failed" or bool(active and active.get("error"))
@@ -499,7 +535,7 @@ def board_activation(body: BoardActivation) -> dict[str, Any]:
         policy = activate_board(body.board, activation_id=str(uuid.uuid4()))
         state = load_state()
         legacy_bound_ids = {binding["task_id"] for binding in state["tasks"].values()
-                            if binding.get("board") == body.board and "policy_activation_id" not in binding}
+                            if binding.get("board") == body.board}
         preview = _activation_preview(body.board, policy=policy, legacy_bound_ids=legacy_bound_ids)
     except TelemetryUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
@@ -516,3 +552,18 @@ def recovery_control(body: RecoveryControl) -> dict[str, Any]:
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"policy": policy, "message": "Recovery is enabled" if body.enabled else "Recovery is disabled"}
+
+
+@router.put("/escalation")
+def escalation_control(body: EscalationControl) -> dict[str, Any]:
+    """Persist only future review-exhaustion routing; native state is untouched."""
+    try:
+        policy = set_escalation_policy(body.board, enabled=body.enabled,
+                                       normal_correction_limit=body.normal_correction_limit,
+                                       max_attempts=body.max_attempts,
+                                       implementation_profile=body.implementation_profile,
+                                       reviewer_profile=body.reviewer_profile)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"policy": policy,
+            "message": "Review-correction escalation is enabled for future exhaustion" if body.enabled else "Review-correction escalation is disabled"}
