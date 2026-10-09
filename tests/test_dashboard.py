@@ -245,11 +245,11 @@ let states=[], cursor=0, page; const h=(type,props,...children)=>({{type,props:p
 const hooks={{useState:(initial)=>{{const i=cursor++; if(!(i in states)) states[i]=initial; return [states[i],v=>states[i]=v];}},useEffect:(fn)=>fn()}};
 global.setInterval=()=>0; global.clearInterval=()=>{{}};
 global.window={{__HERMES_PLUGIN_SDK__:{{React:{{createElement:h}},hooks,fetchJSON:(path)=>Promise.resolve(path.endsWith('/status')?{json.dumps(status)}:path.endsWith('/profiles')?{{profiles:[]}}:{{boards:[]}})}},__HERMES_PLUGINS__:{{register:(_,p)=>page=p}}}};
-vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8")); page(); Promise.resolve().then(()=>Promise.resolve()).then(()=>{{cursor=0; const tree=page(); console.log(JSON.stringify(tree));}});'''
+vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8")); page(); Promise.resolve().then(()=>Promise.resolve()).then(()=>{{cursor=0; const before=page(); function nodes(v){{if(Array.isArray(v))return v.flatMap(nodes);if(v&&typeof v==="object")return [v,...nodes(v.children||[])];return []}} const input=nodes(before).find(x=>x.type==="input"&&x.props["aria-label"]==="Normal review corrections before escalation"); input.props.onChange({{target:{{value:""}}}}); cursor=0; const after=page(); console.log(JSON.stringify({{before,after}}));}});'''
     result = subprocess.run(["node", "-e", script], text=True, capture_output=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert expected in result.stdout
-    tree = json.loads(result.stdout)
+    rendered = json.loads(result.stdout)
     def nodes(value):
         if isinstance(value, dict):
             yield value
@@ -258,10 +258,35 @@ vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8")); page(); Promise.re
         elif isinstance(value, list):
             for child in value:
                 yield from nodes(child)
+    before, after = rendered["before"], rendered["after"]
+    before_nodes, after_nodes = list(nodes(before)), list(nodes(after))
+    numeric = next(node for node in after_nodes if node.get("type") == "input"
+                   and node["props"].get("aria-label") == "Normal review corrections before escalation")
+    assert numeric["props"]["value"] == ""
     for label in ("Save escalation policy", "Enable correction escalation"):
-        matching = [node for node in nodes(tree) if node.get("type") == "button" and label in node.get("children", [])]
+        matching = [node for node in before_nodes if node.get("type") == "button" and label in node.get("children", [])]
         assert len(matching) == 1
         assert matching[0]["props"]["disabled"] is False
+
+
+def test_shipped_dashboard_surfaces_failed_escalation_save_to_mobile_view():
+    bundle = plugin_api.Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js"
+    status = {"configuration": {"implementation_profile": "impl", "reviewer_profile": "review"},
+              "board_policies": [{"board": "default", "implementation_profile": "impl", "reviewer_profile": "review",
+                                  "escalation": {"enabled": False, "normal_correction_limit": 2, "max_attempts": 1,
+                                                 "implementation_profile": "strong", "reviewer_profile": "strong"}}],
+              "counts": {}, "tasks": []}
+    script = f'''const fs=require("fs"),vm=require("vm");
+let states=[],cursor=0,page,scrolls=[];const h=(type,props,...children)=>({{type,props:props||{{}},children}});
+const hooks={{useState:(initial)=>{{const i=cursor++;if(!(i in states))states[i]=initial;return [states[i],v=>states[i]=v];}},useEffect:(fn)=>fn()}};
+global.setInterval=()=>0;global.clearInterval=()=>{{}};
+global.window={{scrollTo:(...args)=>scrolls.push(args),__HERMES_PLUGIN_SDK__:{{React:{{createElement:h}},hooks,fetchJSON:(path)=>path.endsWith('/status')?Promise.resolve({json.dumps(status)}):path.endsWith('/profiles')?Promise.resolve({{profiles:["strong"]}}):path.endsWith('/boards')?Promise.resolve({{boards:["default"]}}):Promise.reject(new Error("policy save refused"))}},__HERMES_PLUGINS__:{{register:(_,p)=>page=p}}}};
+(async()=>{{vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8"));page();await Promise.resolve();await Promise.resolve();cursor=0;let tree=page();function nodes(v){{if(Array.isArray(v))return v.flatMap(nodes);if(v&&typeof v==="object")return [v,...nodes(v.children||[])];return []}}const save=nodes(tree).find(x=>x.type==="button"&&x.children.includes("Save escalation policy"));await save.props.onClick();await new Promise(r=>setTimeout(r,0));cursor=0;tree=page();const alert=nodes(tree).find(x=>x.props&&x.props.role==="alert");console.log(JSON.stringify({{scrolls,alert:alert&&alert.children}}));}})();'''
+    result = subprocess.run(["node", "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    rendered = json.loads(result.stdout)
+    assert rendered["scrolls"], rendered
+    assert "policy save refused" in str(rendered["alert"])
 
 
 def test_policy_scope_exposes_default_recovery_limit_for_legacy_policy(monkeypatch):
