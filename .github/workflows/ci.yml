@@ -17,8 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      HERMES_HOME: ${{ runner.temp }}/hermes-home
-      HERMES_KANBAN_HOME: ${{ runner.temp }}/hermes-home
       HERMES_DISABLE_LAZY_INSTALLS: '1'
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +29,8 @@ jobs:
       - name: Install pinned Hermes host and test dependencies
         run: |
           python -m pip install 'hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@46904a3b467f62616f5b3ee247adce30b1b277a0' pytest fastapi httpx build
-          mkdir -p "$HERMES_HOME"
+          mkdir -p "$RUNNER_TEMP/hermes-home"
+          printf 'HERMES_HOME=%s/hermes-home\nHERMES_KANBAN_HOME=%s/hermes-home\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Run full suite including native fixtures
         run: |
           python -m pytest tests -q -o 'addopts=' --junitxml="$RUNNER_TEMP/results.xml"
