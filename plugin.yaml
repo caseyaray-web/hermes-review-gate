@@ -1,0 +1,9 @@
+name: local-first-review
+version: 1.0.0
+manifest_version: 2
+api_version: 1
+description: "Native Kanban independent-review gate for explicitly enrolled tasks."
+license: MIT
+tags: [kanban, review]
+provides_tools: [finish_implementation, submit_review]
+provides_hooks: [pre_tool_call, kanban_task_claimed, on_kanban_dispatch_tick]

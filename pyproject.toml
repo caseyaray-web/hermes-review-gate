@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-first-review"
+version = "1.0.0"
+description = "Native Hermes Kanban independent-review gate"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.entry-points."hermes_agent.plugins"]
+local-first-review = "local_first_review:register"
+
+[tool.setuptools]
+packages = ["local_first_review"]
+include-package-data = true
+
+[tool.setuptools.data-files]
+"share/hermes/plugins/local-first-review" = ["plugin.yaml", "__init__.py"]
+"share/hermes/plugins/local-first-review/dashboard" = ["dashboard/manifest.json", "dashboard/plugin_api.py"]
+"share/hermes/plugins/local-first-review/dashboard/dist" = ["dashboard/dist/index.js"]

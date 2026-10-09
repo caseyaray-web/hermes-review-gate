@@ -1,0 +1,836 @@
+"""Native Kanban review-gate tools and the normal worker completion guard."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+from typing import Any
+
+from .state import (MAX_CHANGES, authorize_recovery_run, bind_first_owned_run, board_name, board_policy,
+                    is_managed, pin_recovery_receipt, profile_exists, recovery_entry,
+                    reserve_recovery, task_binding, terminalize_implementation_handoff_recovery,
+                    terminalize_recovery, update_recovery_identity, worker_profile)
+
+_CONTEXT: Any | None = None
+
+
+class GateError(ValueError):
+    """A policy refusal that leaves native Kanban untouched."""
+
+
+def _task_id() -> str:
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        raise GateError("review-gate tools are available only to a dispatcher-owned Kanban worker")
+    return task_id
+
+
+def _run_id() -> int:
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        run_id = int(raw or "")
+    except ValueError as exc:
+        raise GateError("worker has no valid HERMES_KANBAN_RUN_ID; refusing lifecycle transition") from exc
+    if run_id <= 0:
+        raise GateError("worker has no valid HERMES_KANBAN_RUN_ID; refusing lifecycle transition")
+    return run_id
+
+
+def _context() -> Any:
+    if _CONTEXT is None:
+        raise GateError("review-gate plugin context is unavailable")
+    return _CONTEXT
+
+
+def _dispatch(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Use the supported PluginContext dispatch path, never the CLI or database."""
+    raw = _context().dispatch_tool(tool_name, args)
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise GateError(f"native {tool_name} returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise GateError(f"native {tool_name} returned an invalid response")
+    if value.get("error"):
+        raise GateError(f"native {tool_name} refused: {value['error']}")
+    return value
+
+
+def _show(task_id: str) -> dict[str, Any]:
+    value = _dispatch("kanban_show", {"task_id": task_id})
+    if not isinstance(value.get("task"), dict) or not isinstance(value.get("runs"), list) or not isinstance(value.get("events"), list):
+        raise GateError("native kanban_show did not return task/runs/events")
+    if len(value["events"]) >= 50:
+        # kanban_show caps events, but phase and retry authority must not expire
+        # after heartbeats/comments. Read the complete native snapshot without writes.
+        from .native import snapshot
+        return snapshot(board_name(), task_id)
+    return value
+
+
+def _binding(show: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+    """Return a legacy binding or atomically pin an eligible board-policy run."""
+    task_id = _task_id()
+    board = board_name()
+    binding = task_binding(task_id, board)
+    if binding is None:
+        profile = worker_profile()
+        if not profile:
+            raise GateError("worker profile is unavailable for board-policy binding")
+        observed = show or _show(task_id)
+        try:
+            binding = bind_first_owned_run(board, observed["task"], observed["runs"], run_id=_run_id(), profile=profile)
+        except ValueError as exc:
+            raise GateError(f"board policy requires operator attention before review gating: {exc}") from exc
+    if binding["implementation_profile"] == binding["reviewer_profile"]:
+        raise GateError("enrollment does not bind independent profiles")
+    if not all(profile_exists(binding[key]) for key in ("implementation_profile", "reviewer_profile")):
+        raise GateError("a bound profile is missing or deleted; restore it before continuing")
+    return task_id, binding
+
+
+def _same_path(left: str, right: str) -> bool:
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return left == right
+
+
+def _candidate(workspace: str) -> dict[str, Any]:
+    """Bind approval to a committed, tracked-clean source candidate."""
+    try:
+        head = subprocess.run(["git", "-C", workspace, "rev-parse", "HEAD"], text=True,
+                              capture_output=True, timeout=15, check=True).stdout.strip()
+        status = subprocess.run(["git", "-C", workspace, "status", "--porcelain", "--untracked-files=all"],
+                                text=True, capture_output=True, timeout=15, check=True).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GateError(f"cannot bind a Git candidate for {workspace}: {exc}") from exc
+    if len(head) != 40 or any(char not in "0123456789abcdef" for char in head.lower()):
+        raise GateError("Git did not return a full HEAD revision")
+    return {"head": head, "clean_tracked": not bool(status.strip())}
+
+
+def _workspace_checkpoint(workspace: str, *, head: str | None = None, porcelain: str | None = None) -> dict[str, Any]:
+    """Bounded failure checkpoint: names and digests only, never file contents."""
+    root = Path(workspace).resolve(strict=True)
+    if head is None:
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], text=True, capture_output=True,
+                              timeout=15, check=True).stdout.strip()
+    if porcelain is None:
+        porcelain = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+                                   text=True, capture_output=True, timeout=15, check=True).stdout
+    if len(head) != 40 or len(porcelain.encode()) > 65536:
+        raise GateError("recovery checkpoint is invalid or too large")
+    dirty: list[dict[str, str]] = []
+    for line in porcelain.splitlines():
+        if len(dirty) >= 128 or len(line) < 4 or line[2] != " ":
+            raise GateError("recovery checkpoint refuses ambiguous or excessive Git status")
+        name = line[3:]
+        if not name or " -> " in name:
+            raise GateError("recovery checkpoint refuses ambiguous Git paths")
+        path = (root / name).resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            raise GateError("recovery checkpoint refuses unsafe dirty paths")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        dirty.append({"path": name, "sha256": digest})
+    return {"head": head, "dirty": dirty}
+
+
+def _artifacts(workspace: str, paths: list[str]) -> list[dict[str, str]]:
+    root = Path(workspace).resolve(strict=True)
+    evidence = []
+    if len(paths) > 20:
+        raise GateError("at most 20 artifacts may accompany a handoff")
+    for name in paths:
+        path = Path(name)
+        path = (root / path).resolve(strict=True) if not path.is_absolute() else path.resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            raise GateError("artifacts must be regular workspace files no larger than 16 MiB")
+        digest = hashlib.sha256()
+        total = 0
+        with path.open('rb') as stream:
+            while chunk := stream.read(65536):
+                total += len(chunk)
+                if total > 16 * 1024 * 1024:
+                    raise GateError("artifact grew beyond 16 MiB while reading")
+                digest.update(chunk)
+        evidence.append({"path": name, "sha256": digest.hexdigest()})
+    return evidence
+
+
+def _session() -> str:
+    value = os.environ.get("HERMES_SESSION_ID")
+    if not value:
+        raise GateError("native worker session identity is unavailable")
+    return value
+
+
+def _arguments(args: dict, keys: set[str]) -> None:
+    if not isinstance(args, dict) or set(args) - keys:
+        raise GateError("unexpected review-gate arguments; identity and routing are code-owned")
+
+
+def _event(events: list[dict[str, Any]], kind: str, run_id: int) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("kind") == kind and event.get("run_id") == run_id:
+            return event
+    return None
+
+
+def _active_run(show: dict[str, Any], run_id: int, profile: str, *, review_claim: bool) -> dict[str, Any]:
+    runs = [run for run in show["runs"] if isinstance(run, dict) and run.get("id") == run_id]
+    if len(runs) != 1:
+        raise GateError("native task has no exact current worker run")
+    run = runs[0]
+    if (show["task"].get("current_run_id") != run_id or run.get("status") != "running"
+            or run.get("profile") != profile or run.get("ended_at") is not None):
+        raise GateError("worker is not the active bound native run")
+    claimed = _event(show["events"], "claimed", run_id)
+    if claimed is None:
+        raise GateError("native claim evidence is unavailable; do not infer phase from task membership")
+    payload = claimed.get("payload")
+    source_status = payload.get("source_status") if isinstance(payload, dict) else None
+    if review_claim and source_status != "review":
+        raise GateError("current native run was not claimed from review")
+    if not review_claim and source_status == "review":
+        raise GateError("reviewer run cannot finish implementation")
+    return run
+
+
+def _implementation_context() -> tuple[str, dict[str, Any], dict[str, Any], int, str]:
+    task_id = _task_id()
+    show = _show(task_id)
+    task_id, binding = _binding(show)
+    profile = worker_profile()
+    if not profile or profile != binding["implementation_profile"]:
+        raise GateError("only the bound implementation profile may finish this task")
+    task = show["task"]
+    if task.get("status") != "running" or task.get("assignee") != profile:
+        raise GateError("task is not a running implementation assigned to this worker")
+    workspace = task.get("workspace_path")
+    if not isinstance(workspace, str) or not _same_path(workspace, binding["workspace_path"]):
+        raise GateError("native task workspace no longer matches its enrollment")
+    run_id = _run_id()
+    _active_run(show, run_id, profile, review_claim=False)
+    return task_id, binding, show, run_id, workspace
+
+
+def _review_context() -> tuple[str, dict[str, Any], dict[str, Any], int, str, dict[str, Any]]:
+    task_id = _task_id()
+    show = _show(task_id)
+    task_id, binding = _binding(show)
+    profile = worker_profile()
+    if not profile or profile != binding["reviewer_profile"]:
+        raise GateError("only the bound reviewer may submit this verdict")
+    task = show["task"]
+    if task.get("status") != "running" or task.get("assignee") != profile:
+        raise GateError("task is not a running review assigned to this worker")
+    workspace = task.get("workspace_path")
+    if not isinstance(workspace, str) or not _same_path(workspace, binding["workspace_path"]):
+        raise GateError("native task workspace no longer matches its enrollment")
+    reviewer_run_id = _run_id()
+    _active_run(show, reviewer_run_id, profile, review_claim=True)
+    review_events = [event for event in show["events"] if isinstance(event, dict) and event.get("kind") == "review_requested"]
+    if not review_events:
+        raise GateError("native task has no review handoff to judge")
+    implementation_run_id = review_events[-1].get("run_id")
+    implementation_run = next((run for run in show["runs"] if isinstance(run, dict) and run.get("id") == implementation_run_id), None)
+    metadata = implementation_run.get("metadata") if implementation_run else None
+    review = metadata.get("local_first_review") if isinstance(metadata, dict) else None
+    if (type(implementation_run_id) is not int or not implementation_run or implementation_run.get("profile") != binding["implementation_profile"]
+            or implementation_run.get("status") != "review" or implementation_run.get("outcome") != "review_requested"
+            or implementation_run.get("ended_at") is None or implementation_run_id >= reviewer_run_id):
+        raise GateError("review handoff is not an ended implementation run preceding this reviewer")
+    if not isinstance(review, dict) or review.get("implementation_run_id") != implementation_run_id:
+        raise GateError("review handoff lacks a bound implementation candidate")
+    if review.get("implementation_profile") != binding["implementation_profile"] or review.get("reviewer_profile") != profile:
+        raise GateError("review handoff routing does not match this enrollment")
+    if not metadata.get("worker_session_id") or metadata["worker_session_id"] == _session():
+        raise GateError("review requires a distinct native worker session")
+    candidate = review.get("candidate")
+    if not isinstance(candidate, dict) or candidate.get("clean_tracked") is not True:
+        raise GateError("review handoff candidate is incomplete or not clean")
+    if _candidate(workspace) != candidate:
+        raise GateError("source candidate changed after implementation; approval is stale")
+    if _artifacts(workspace, review.get("artifacts", [])) != review.get("artifact_evidence", []):
+        raise GateError("implementation artifacts changed after handoff; approval is stale")
+    return task_id, binding, show, reviewer_run_id, workspace, review
+
+
+def _result(value: dict[str, Any], **extra: Any) -> str:
+    return json.dumps({**value, **extra})
+
+
+def _reconcile_handoff(task_id: str, implementation_run_id: int) -> dict[str, Any] | None:
+    show = _show(task_id)
+    task = show["task"]
+    run = next((r for r in show["runs"] if r.get("id") == implementation_run_id), {})
+    if (run.get("outcome") == "review_requested" and run.get("ended_at") is not None
+            and _event(show["events"], "review_requested", implementation_run_id)):
+        return {"ok": True, "task_id": task_id, "status": task.get("status"), "reconciled": True}
+    return None
+
+
+def _terminalize_recovered_implementation_handoff(task_id: str, implementation_run_id: int) -> bool:
+    """Release only the exact recovery lease after native confirms its handoff."""
+    if not _reconcile_handoff(task_id, implementation_run_id):
+        raise GateError("native review handoff could not be verified; recovery lease remains active")
+    try:
+        return terminalize_implementation_handoff_recovery(board_name(), task_id, implementation_run_id)
+    except ValueError as exc:
+        raise GateError(f"native handoff landed but implementation recovery finalization was refused: {exc}") from exc
+
+
+def _reconcile_ended_implementation_handoff_for_reviewer(task_id: str, board: str, entry: dict[str, Any], *,
+                                                          run_id: int, profile: str) -> bool:
+    """Close the exact prior implementation lease when a reviewer won the race.
+
+    This is intentionally narrow: only an active implementation recovery whose
+    authorized and receipted run is the ended native review handoff can yield to
+    a distinct currently-running reviewer claimed from ``review``.  Any other
+    record remains a recovery admission and fails closed through its normal path.
+    """
+    if entry.get("phase") != "implementation":
+        return False
+    implementation_run_id = entry.get("authorized_run_id")
+    if implementation_run_id == run_id:
+        return False
+    receipt = entry.get("receipt")
+    if type(implementation_run_id) is not int or not isinstance(receipt, dict) or receipt.get("run_id") != implementation_run_id:
+        raise GateError("implementation recovery handoff receipt is incomplete")
+    show = _show(task_id)
+    binding = task_binding(task_id, board)
+    if not binding or profile != binding.get("reviewer_profile"):
+        raise GateError("implementation recovery cannot yield to an unbound reviewer")
+    if run_id == implementation_run_id:
+        return False
+    _active_run(show, run_id, profile, review_claim=True)
+    implementation = next((run for run in show["runs"] if isinstance(run, dict) and run.get("id") == implementation_run_id), None)
+    metadata = implementation.get("metadata") if isinstance(implementation, dict) else None
+    handoff = metadata.get("local_first_review") if isinstance(metadata, dict) else None
+    if (not isinstance(implementation, dict) or implementation.get("profile") != binding.get("implementation_profile")
+            or implementation.get("status") != "review" or implementation.get("outcome") != "review_requested"
+            or implementation.get("ended_at") is None or not _event(show["events"], "review_requested", implementation_run_id)
+            or not isinstance(handoff, dict) or handoff.get("implementation_run_id") != implementation_run_id
+            or handoff.get("reviewer_profile") != profile):
+        raise GateError("implementation recovery handoff provenance is not the exact native review transition")
+    try:
+        if not terminalize_implementation_handoff_recovery(board, task_id, implementation_run_id):
+            raise GateError("implementation recovery disappeared before reviewer reconciliation")
+    except ValueError as exc:
+        raise GateError(f"implementation recovery reviewer reconciliation was refused: {exc}") from exc
+    return True
+
+
+def finish_implementation(args: dict[str, Any], **_: Any) -> str:
+    _arguments(args, {"summary", "artifacts"})
+    _session()
+    task_id, binding, _show_before, run_id, workspace = _implementation_context()
+    summary = args.get("summary")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > 16000:
+        raise GateError("summary must be substantive text of at most 16000 characters")
+    summary = summary.strip()
+    artifacts = args.get("artifacts") or []
+    if not summary:
+        raise GateError("summary is required")
+    if not isinstance(artifacts, list) or not all(isinstance(item, str) and item.strip() for item in artifacts):
+        raise GateError("artifacts must be a list of non-empty paths")
+    candidate = _candidate(workspace)
+    if not candidate["clean_tracked"]:
+        raise GateError("implementation must have a clean tracked Git candidate before review")
+    metadata = {"local_first_review": {
+        "implementation_profile": binding["implementation_profile"], "reviewer_profile": binding["reviewer_profile"],
+        "implementation_run_id": run_id, "candidate": candidate, "artifacts": artifacts,
+        "artifact_evidence": _artifacts(workspace, artifacts),
+        "binding": {field: binding[field] for field in ("board", "task_id", "implementation_profile", "reviewer_profile", "workspace_path", "policy_activation_id", "policy_native_run_watermark", "native_run_id") if field in binding},
+    }}
+    try:
+        value = _dispatch("kanban_request_review", {"summary": summary, "reviewer": binding["reviewer_profile"],
+                                                      "metadata": metadata, "artifacts": artifacts})
+    except Exception as exc:
+        landed = _reconcile_handoff(task_id, run_id)
+        if landed:
+            _terminalize_recovered_implementation_handoff(task_id, run_id)
+            return _result(landed, message="Review handoff already landed; stop implementation work.")
+        raise GateError(f"review handoff outcome is unknown; no automatic retry was sent; inspect the native task/run before retrying: {exc}") from exc
+    observed = _reconcile_handoff(task_id, run_id)
+    if not observed:
+        raise GateError("native handoff could not be verified; inspect the native run before retrying")
+    _terminalize_recovered_implementation_handoff(task_id, run_id)
+    return _result(value, message="Review requested. Stop work; the configured reviewer owns the next transition.")
+
+
+def _changes_count(runs: list[dict[str, Any]]) -> int:
+    return sum(1 for run in runs if isinstance(run, dict) and run.get("outcome") == "changes_requested")
+
+
+def submit_review(args: dict[str, Any], **_: Any) -> str:
+    _arguments(args, {"verdict", "rationale"})
+    _session()
+    verdict = args.get("verdict")
+    rationale = args.get("rationale")
+    if not isinstance(rationale, str) or not rationale.strip() or len(rationale) > 16000:
+        raise GateError("rationale must be substantive text of at most 16000 characters")
+    rationale = rationale.strip()
+    if verdict not in {"approved", "changes_requested"} or not rationale:
+        raise GateError("verdict must be approved or changes_requested and rationale is required")
+    task_id, _binding_value, show, reviewer_run_id, _workspace, _review = _review_context()
+    if verdict == "approved":
+        tool, native_args = "kanban_complete", {"summary": rationale, "metadata": {"local_first_review": {
+            "verdict": "approved", "rationale": rationale, "candidate": _review["candidate"],
+            "implementation_run_id": _review["implementation_run_id"],
+            "reviewer_run_id": reviewer_run_id, "reviewer_profile": _binding_value["reviewer_profile"],
+        }}}
+        expected_status, expected_event = "done", "completed"
+    elif _changes_count(show["runs"]) >= MAX_CHANGES:
+        tool, native_args = "kanban_block", {"reason": "Review changes exhausted; operator attention required. Latest findings: " + rationale, "kind": "needs_input"}
+        expected_status, expected_event = "blocked", None
+    else:
+        tool, native_args = "kanban_request_changes", {"reason": rationale}
+        expected_status, expected_event = "ready", "changes_requested"
+    try:
+        value = _dispatch(tool, native_args)
+    except Exception as exc:
+        observed = _show(task_id)
+        task = observed["task"]
+        landed = task.get("status") == expected_status and (expected_event is None or _event(observed["events"], expected_event, reviewer_run_id))
+        if landed:
+            return _result({"ok": True, "task_id": task_id, "status": expected_status}, verdict=verdict, reconciled=True)
+        raise GateError(f"review verdict outcome is unknown; no automatic retry was sent; inspect the native task/run before retrying: {exc}") from exc
+    observed = _show(task_id)
+    ended = next((r for r in observed["runs"] if r.get("id") == reviewer_run_id), {})
+    if ended.get("ended_at") is None or (expected_event and not _event(observed["events"], expected_event, reviewer_run_id)):
+        raise GateError("verdict native run could not be verified; inspect before retrying")
+    return _result(value, verdict=verdict)
+
+
+def _failed_phase(show: dict[str, Any], failed: dict[str, Any]) -> str | None:
+    """Resolve failure phase from exact native claim or terminal retry evidence."""
+    run_id = failed.get("id")
+    if type(run_id) is not int:
+        return None
+    claimed = _event(show["events"], "claimed", run_id)
+    payload = claimed.get("payload") if claimed else None
+    source = payload.get("source_status") if isinstance(payload, dict) else None
+    if source == "review":
+        return "review"
+    if source in {"ready", "todo"}:
+        return "implementation"
+    # Native ready claims deliberately omit source_status.  A terminal
+    # dispatcher event for the *same run* persists retry_status after resolving
+    # the claim provenance; use that exact producer evidence rather than
+    # inferring phase from the currently blocked task.
+    outcome = failed.get("outcome")
+    terminal = _event(show["events"], outcome, run_id) if isinstance(outcome, str) else None
+    retry_payload = terminal.get("payload") if terminal else None
+    retry_status = retry_payload.get("retry_status") if isinstance(retry_payload, dict) else None
+    return "review" if retry_status == "review" else "implementation" if retry_status in {"ready", "todo"} else None
+
+
+def _allowed_terminal_failure(show: dict[str, Any], failed: dict[str, Any]) -> bool:
+    """Only recover the exact started-worker iteration-exhaustion failure.
+
+    A ``needs_input`` hold is an operator decision, not failure evidence.  In
+    particular, native repeated-hold policy may surface it as ``triage`` rather
+    than ``blocked``.  A ``spawn_failed`` record proves no worker ran, so it is
+    deliberately not a substitute for the RM02-class exhausted worker.
+    """
+    run_id = failed.get("id")
+    if failed.get("outcome") != "gave_up" or type(run_id) is not int:
+        return False
+    event = _event(show["events"], "gave_up", run_id)
+    payload = event.get("payload") if event else None
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    started = _event(show["events"], "spawned", run_id)
+    return (isinstance(started, dict)
+            and payload.get("trigger_outcome") == "timed_out"
+            and type(payload.get("effective_limit")) is int
+            and payload.get("effective_limit") == 1
+            and payload.get("retry_status") in {"ready", "review"}
+            and type(payload.get("budget_used")) is int
+            and type(payload.get("budget_max")) is int
+            and payload.get("budget_used") == payload.get("budget_max")
+            and payload["budget_used"] > 0
+            and isinstance(error, str)
+            and error.startswith("Iteration budget exhausted ("))
+
+
+def _first_unbound_gave_up(policy: dict[str, Any], show: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
+    """The sole historical adoption rule: exact first post-watermark gave_up."""
+    task, runs = show["task"], show["runs"]
+    if task.get("status") != "blocked" or len(runs) != 1:
+        return None
+    failed = runs[0]
+    if (not _allowed_terminal_failure(show, failed) or type(failed.get("id")) is not int
+            or failed["id"] <= policy["native_run_watermark"] or failed.get("profile") != policy["implementation_profile"]):
+        return None
+    event = _event(show["events"], "gave_up", failed["id"])
+    payload = event.get("payload") if event else None
+    if not isinstance(payload, dict) or payload.get("effective_limit") != 1:
+        return None
+    phase = _failed_phase(show, failed)
+    return (failed, phase) if phase == "implementation" else None
+
+
+def _workspace_is_exclusive(board: str, task_id: str, workspace: str) -> bool:
+    from .native import board_snapshot
+    for other in board_snapshot(board):
+        if other.get("id") != task_id and other.get("status") in {"running", "review"} and isinstance(other.get("workspace_path"), str) and _same_path(other["workspace_path"], workspace):
+            return False
+    return True
+
+
+def _persisted_review_handoff(show: dict[str, Any], run_id: int, binding: dict[str, Any]) -> None:
+    """Require the original ended implementation handoff for a recovered reviewer."""
+    events = [event for event in show["events"] if isinstance(event, dict) and event.get("kind") == "review_requested"]
+    if not events:
+        raise GateError("recovered reviewer has no persisted original handoff")
+    implementation_run_id = events[-1].get("run_id")
+    implementation = next((item for item in show["runs"] if item.get("id") == implementation_run_id), None)
+    metadata = implementation.get("metadata") if isinstance(implementation, dict) else None
+    handoff = metadata.get("local_first_review") if isinstance(metadata, dict) else None
+    if (type(implementation_run_id) is not int or implementation_run_id >= run_id
+            or not isinstance(implementation, dict) or implementation.get("profile") != binding["implementation_profile"]
+            or implementation.get("outcome") != "review_requested" or implementation.get("status") != "review"
+            or implementation.get("ended_at") is None or not isinstance(handoff, dict)
+            or handoff.get("implementation_run_id") != implementation_run_id
+            or handoff.get("reviewer_profile") != binding["reviewer_profile"]):
+        raise GateError("recovered reviewer handoff provenance is invalid")
+
+
+def _reconcile_recovery_claim(task_id: str, board: str, entry: dict[str, Any], *, run_id: int | None = None,
+                              profile: str | None = None) -> dict[str, Any]:
+    """One exact native admission path for hooks, ticks, and first model tools.
+
+    ``claim_review_task`` has no claimed hook.  Therefore the pre-tool path is
+    authoritative: it reads the current native run and pins authorization only
+    after phase and original-handoff provenance agree with the durable intent.
+    """
+    if entry.get("intent", {}).get("status") not in {"unblock_requested", "unblock_verified", "native_resume_observed"}:
+        raise GateError("recovery has no resumable unblock intent")
+    show = _show(task_id)
+    task = show["task"]
+    observed_run_id = task.get("current_run_id")
+    if run_id is not None and observed_run_id != run_id:
+        raise GateError("claimed hook run is no longer the native current run")
+    if type(observed_run_id) is not int or task.get("status") != "running":
+        raise GateError("native recovery replacement is not running")
+    run = next((item for item in show["runs"] if item.get("id") == observed_run_id), None)
+    expected_profile = entry.get("binding", {}).get("reviewer_profile") if entry.get("phase") == "review" else entry.get("binding", {}).get("implementation_profile")
+    if not isinstance(expected_profile, str):
+        binding = task_binding(task_id, board)
+        expected_profile = binding.get("reviewer_profile") if entry.get("phase") == "review" and binding else binding.get("implementation_profile") if binding else None
+    if (not isinstance(run, dict) or not isinstance(expected_profile, str) or task.get("assignee") != expected_profile
+            or run.get("profile") != expected_profile or run.get("status") != "running" or run.get("ended_at") is not None
+            or profile is not None and profile != expected_profile):
+        raise GateError("native recovery replacement profile is not the intended assignee")
+    claim = _event(show["events"], "claimed", observed_run_id)
+    payload = claim.get("payload") if claim else None
+    source = payload.get("source_status") if isinstance(payload, dict) else None
+    # Native ready claims omit source_status; that omission is admissible only
+    # for implementation and only after the durable unblock intent names ready.
+    if source is None and entry.get("phase") == "implementation":
+        source = "ready"
+    if source != entry.get("expected_source_status") or source not in {"ready", "review"}:
+        raise GateError("replacement claim phase does not match recovery intent")
+    binding = task_binding(task_id, board)
+    if not binding or not profile_exists(expected_profile):
+        raise GateError("bound recovery profile is unavailable or drifted")
+    if entry.get("phase") == "review":
+        _persisted_review_handoff(show, observed_run_id, binding)
+    workspace = task.get("workspace_path")
+    if (not isinstance(workspace, str) or not _same_path(workspace, binding["workspace_path"])
+            or not _same_path(workspace, entry["workspace_path"])):
+        raise GateError("native recovery workspace drifted")
+    # Once an exact running claim is observed, recover from a lost unblock
+    # response without sending another unblock.  This write is idempotent.
+    if entry.get("intent", {}).get("status") == "unblock_requested":
+        entry = update_recovery_identity(board, task_id, entry["failed_run_id"], entry["phase"],
+                                         intent={"status": "unblock_verified", "native_status": source})
+    if entry.get("authorized_run_id") not in {None, observed_run_id}:
+        raise GateError("a different recovery run is already authorized")
+    authorize_recovery_run(board, task_id, entry["failed_run_id"], entry["phase"], observed_run_id, expected_profile)
+    refreshed = recovery_entry(task_id, board, failed_run_id=entry["failed_run_id"], phase=entry["phase"])
+    if not refreshed or refreshed.get("authorized_run_id") != observed_run_id or refreshed.get("authorized_profile") != expected_profile:
+        raise GateError("recovery authorization was not durably bound to this run")
+    return refreshed
+
+
+def _reserve_claimed_recovery(task_id: str, board: str, *, run_id: int, profile: str) -> dict[str, Any] | None:
+    """Reserve the exact exhausted predecessor for a claim native already resumed.
+
+    Native dispatch invokes its tick observer only after it has promoted and
+    claimed a tripped review task.  Review claims deliberately have no claimed
+    hook, so this is the first supported, pre-model-tool observation point.  It
+    records that native resumed the task; it never fabricates an unblock call.
+    """
+    policy = board_policy(board)
+    if not policy or policy.get("recovery", {}).get("enabled") is not True:
+        return None
+    show = _show(task_id)
+    task, runs = show["task"], show["runs"]
+    if task.get("status") != "running" or task.get("current_run_id") != run_id or len(runs) < 2:
+        return None
+    failed = runs[-2]
+    if not isinstance(failed, dict) or not _allowed_terminal_failure(show, failed):
+        return None
+    phase = _failed_phase(show, failed)
+    binding = task_binding(task_id, board)
+    workspace = task.get("workspace_path")
+    expected_profile = binding.get("reviewer_profile") if phase == "review" and binding else binding.get("implementation_profile") if binding else None
+    if (phase not in {"implementation", "review"} or not binding or profile != expected_profile
+            or task.get("assignee") != expected_profile or not isinstance(workspace, str)
+            or not _same_path(workspace, binding["workspace_path"]) or not profile_exists(profile)
+            or not _workspace_is_exclusive(board, task_id, workspace)):
+        return None
+    entry = reserve_recovery(board, task_id, failed_run_id=failed["id"], phase=phase,
+                             workspace_path=workspace, checkpoint=_workspace_checkpoint(workspace),
+                             binding=binding, adopted=False)
+    return update_recovery_identity(board, task_id, failed["id"], phase,
+                                    intent={"status": "native_resume_observed", "native_status": "review" if phase == "review" else "ready"})
+
+
+def _terminal_unadmitted_replacement(show: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """Recognize one ended direct successor without admitting a model tool.
+
+    A recovery reservation may survive long enough for native to claim and end
+    its replacement before the worker invokes a first tool.  That replacement
+    never has an ``authorized_run_id`` or receipt, but it can still be tied to
+    this recovery by one newer run, its exact claim phase, bound profile, and a
+    terminal task with no live runs.  Anything less is ambiguous and retains
+    the lease for operator inspection.
+    """
+    if entry.get("authorized_run_id") is not None or entry.get("receipt") is not None:
+        return False
+    failed_run_id = entry.get("failed_run_id")
+    phase = entry.get("phase")
+    if type(failed_run_id) is not int or phase not in {"implementation", "review"}:
+        return False
+    task = show.get("task")
+    runs = show.get("runs")
+    if not isinstance(task, dict) or not isinstance(runs, list) or task.get("status") not in {"done", "blocked", "triage", "failed"}:
+        return False
+    successors = [run for run in runs if isinstance(run, dict) and type(run.get("id")) is int and run["id"] > failed_run_id]
+    if len(successors) != 1 or any(isinstance(run, dict) and run.get("status") == "running" for run in runs):
+        return False
+    replacement = successors[0]
+    board = entry.get("board")
+    task_id = entry.get("task_id")
+    binding = task_binding(task_id, board) if isinstance(board, str) and isinstance(task_id, str) else None
+    expected_profile = binding.get("reviewer_profile") if phase == "review" and binding else binding.get("implementation_profile") if binding else None
+    if (not isinstance(expected_profile, str) or task.get("current_run_id") != replacement.get("id")
+            or task.get("assignee") != expected_profile or replacement.get("profile") != expected_profile
+            or replacement.get("status") == "running" or replacement.get("ended_at") is None):
+        return False
+    claim = _event(show["events"], "claimed", replacement["id"])
+    payload = claim.get("payload") if claim else None
+    source = payload.get("source_status") if isinstance(payload, dict) else None
+    if source is None and phase == "implementation":
+        source = "ready"
+    return source == entry.get("expected_source_status") == ("review" if phase == "review" else "ready")
+
+
+def _recovery_guard(tool_name: str) -> dict[str, str] | None:
+    """Fail closed and pin one receipt before a recovered worker's first tool."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return None
+    try:
+        entry = recovery_entry(task_id, board_name())
+    except Exception as exc:
+        return {"action": "block", "message": f"Recovery state is unreadable; refusing tool: {exc}"}
+    if entry is None:
+        # Direct lifecycle calls remain on their ordinary board-policy path.  A
+        # recovered worker is admitted by its first normal tool; lifecycle calls
+        # are independently refused below and therefore cannot bypass recovery.
+        if tool_name in {"kanban_complete", "kanban_request_review", "kanban_request_changes"}:
+            return None
+        # Ordinary tool tests can carry a task id without an actual worker run.
+        # They are not recovery candidates; preserve normal handling instead of
+        # converting malformed context into a recovery-state error.
+        try:
+            run_id, profile = _run_id(), worker_profile()
+        except GateError:
+            return None
+        try:
+            if profile:
+                entry = _reserve_claimed_recovery(task_id, board_name(), run_id=run_id, profile=profile)
+        except Exception as exc:
+            return {"action": "block", "message": f"Recovery state is unreadable; refusing tool: {exc}"}
+        if entry is None:
+            return None
+    if not entry:
+        return None
+    try:
+        run_id, profile = _run_id(), worker_profile()
+        if entry.get("receipt", {}).get("run_id") == run_id:
+            return None
+        if not profile:
+            raise GateError("recovery worker profile is unavailable")
+        if _reconcile_ended_implementation_handoff_for_reviewer(task_id, board_name(), entry,
+                                                                run_id=run_id, profile=profile):
+            return None
+        entry = _reconcile_recovery_claim(task_id, board_name(), entry, run_id=run_id, profile=profile)
+        if _workspace_checkpoint(entry["workspace_path"]) != entry.get("checkpoint"):
+            raise GateError("recovery workspace changed before admission")
+        pin_recovery_receipt(board_name(), task_id, entry["failed_run_id"], entry["phase"], run_id,
+                            {"tool": tool_name, "profile": profile})
+    except Exception as exc:
+        return {"action": "block", "message": f"Recovery admission refused: {exc}"}
+    return None
+
+
+def watchdog_claimed(*, task_id: str, board: str, assignee: str | None = None, run_id: int | None = None,
+                     profile_name: str | None = None, **_: Any) -> None:
+    # This hook is only an optimization for ready claims.  Native review claims
+    # do not fire it, so pre-tool admission below is authoritative for review.
+    if type(run_id) is not int or not isinstance(assignee, str) or not assignee:
+        return
+    try:
+        entry = recovery_entry(task_id, board)
+        if entry and entry.get("receipt", {}).get("run_id") != run_id:
+            _reconcile_recovery_claim(task_id, board, entry, run_id=run_id, profile=assignee)
+    except Exception:
+        return
+
+
+def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) -> None:
+    """Autonomous post-dispatch recovery; all uncertain observations fail closed."""
+    if dry_run or not board: return
+    try:
+        policy = board_policy(board)
+        if not policy or policy.get("recovery", {}).get("enabled") is not True: return
+        from .state import load_state
+        candidates = list(load_state()["tasks"].values())
+        # Historical adoption is an ambiguity-refusal boundary, not a per-tick
+        # throttle.  Read every blocked unbound card completely before choosing:
+        # if two exact RM02 shapes remain, neither is safe to adopt and an
+        # operator must resolve the history.  Bound recovery candidates stay in
+        # ``candidates`` and continue through their ordinary reconciliation.
+        from .native import board_snapshot
+        known = {b["task_id"] for b in candidates if b.get("board") == board}
+        unbound_matches: list[str] = []
+        unbound_uncertain = False
+        for native_task in board_snapshot(board):
+            task_id = native_task.get("id")
+            if task_id in known or native_task.get("status") != "blocked":
+                continue
+            if not isinstance(task_id, str) or not task_id:
+                unbound_uncertain = True
+                continue
+            try:
+                if _first_unbound_gave_up(policy, _show(task_id)) is not None:
+                    unbound_matches.append(task_id)
+            except Exception:
+                unbound_uncertain = True
+        if not unbound_uncertain and len(unbound_matches) == 1:
+            candidates.append({"board": board, "task_id": unbound_matches[0], "_unbound": True})
+    except Exception:
+        return
+    for candidate in candidates:
+        if candidate.get("board") != board or not isinstance(candidate.get("task_id"), str): continue
+        task_id = candidate["task_id"]
+        try:
+            show = _show(task_id); task, runs = show["task"], show["runs"]
+            existing = recovery_entry(task_id, board)
+            if existing:
+                # A claim can commit after our unblock write but before its
+                # response/readback returns.  Reconcile exact claim evidence
+                # first; never resend unblock for a durable intent.
+                if task.get("status") == "running":
+                    _reconcile_recovery_claim(task_id, board, existing)
+                elif existing.get("intent", {}).get("status") == "unblock_requested" and task.get("status") in {"ready", "todo", "review"}:
+                    update_recovery_identity(board, task_id, existing["failed_run_id"], existing["phase"], intent={"status": "unblock_verified", "native_status": task.get("status")})
+                elif existing.get("authorized_run_id") and task.get("status") in {"done", "blocked", "triage", "failed"}:
+                    terminalize_recovery(board, task_id, existing["failed_run_id"], existing["phase"], "native_terminal")
+                elif _terminal_unadmitted_replacement(show, existing):
+                    terminalize_recovery(board, task_id, existing["failed_run_id"], existing["phase"],
+                                         "replacement_terminal_before_admission")
+                continue
+            if task.get("status") != "blocked" or not runs: continue
+            failed = runs[-1]; phase = _failed_phase(show, failed)
+            if not _allowed_terminal_failure(show, failed) or phase is None: continue
+            binding = task_binding(task_id, board)
+            adopted = False
+            if binding is None:
+                exact = _first_unbound_gave_up(policy, show)
+                if exact is None: continue
+                failed, phase = exact; adopted = True
+                workspace = task.get("workspace_path")
+                if not isinstance(workspace, str) or task.get("workspace_kind") != "dir" or not Path(workspace).is_absolute(): continue
+                binding = {"board": board, "task_id": task_id, "implementation_profile": policy["implementation_profile"], "reviewer_profile": policy["reviewer_profile"], "workspace_path": workspace, "policy_activation_id": policy["activation_id"], "policy_native_run_watermark": policy["native_run_watermark"], "native_run_id": failed["id"]}
+            workspace = task.get("workspace_path"); profile = binding["reviewer_profile"] if phase == "review" else binding["implementation_profile"]
+            if not isinstance(workspace, str) or not _same_path(workspace, binding["workspace_path"]) or task.get("assignee") != profile or not profile_exists(profile) or not _workspace_is_exclusive(board, task_id, workspace): continue
+            checkpoint = _workspace_checkpoint(workspace)
+            entry = reserve_recovery(board, task_id, failed_run_id=failed["id"], phase=phase, workspace_path=workspace, checkpoint=checkpoint, binding=binding, adopted=adopted)
+            # Exact task evidence remains blocked after the durable reservation.
+            if _show(task_id)["task"].get("status") != "blocked": continue
+            value = _dispatch("kanban_unblock", {"task_id": task_id})
+            if value.get("status") not in {"ready", "todo", "review"}: raise GateError("native unblock readback did not return a resumable status")
+            update_recovery_identity(board, task_id, entry["failed_run_id"], entry["phase"], intent={"status": "unblock_verified", "native_status": value["status"]})
+        except Exception:
+            continue
+
+
+def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | None:
+    """Protect only normal model tool calls; environment owns the worker task id."""
+    recovery = _recovery_guard(tool_name)
+    if recovery:
+        return recovery
+    if tool_name not in {"kanban_complete", "kanban_request_review", "kanban_request_changes"}:
+        return None
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return None
+    try:
+        managed = is_managed(task_id, board_name())
+    except Exception as exc:
+        # model_tools intentionally isolates hook failures; turn every local
+        # configuration/locking failure into a visible fail-closed directive.
+        return {"action": "block", "message": f"Managed review configuration is unavailable; refusing {tool_name}: {exc}"}
+    if not managed:
+        return None
+    attention = ""
+    try:
+        # Direct lifecycle calls on an activated board must first establish the
+        # same immutable first-run binding as finish_implementation.  The call
+        # is still refused below; this only records policy provenance before a
+        # later supported handoff, never changes native Kanban.
+        _binding(_show(task_id))
+    except Exception as exc:
+        attention = f" Board-policy task needs operator attention: {exc}"
+    message = {
+        "kanban_complete": "Managed task: use finish_implementation during implementation or submit_review for the reviewer verdict; direct completion is refused before Kanban mutates.",
+        "kanban_request_review": "Managed task: use finish_implementation; it binds the configured reviewer and Git candidate.",
+        "kanban_request_changes": "Managed review: use submit_review with a substantive rationale; it enforces reviewer identity and the change limit.",
+    }[tool_name]
+    return {"action": "block", "message": message + attention}
+
+
+def _safe(handler):
+    def call(args, **kwargs):
+        try:
+            return handler(args, **kwargs)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return json.dumps({"error": str(exc), "ok": False})
+    return call
+
+
+def register(ctx: Any) -> None:
+    global _CONTEXT
+    _CONTEXT = ctx
+    ctx.register_tool(name="finish_implementation", toolset="local_first_review",
+        schema={"name": "finish_implementation", "description": "Hand the current managed implementation to its configured independent reviewer.",
+                "parameters": {"type": "object", "properties": {"summary": {"type": "string"}, "artifacts": {"type": "array", "items": {"type": "string"}}}, "required": ["summary"], "additionalProperties": False}},
+        handler=_safe(finish_implementation), description="Finish managed implementation through native review")
+    ctx.register_tool(name="submit_review", toolset="local_first_review",
+        schema={"name": "submit_review", "description": "Submit the configured reviewer's approval or required changes for the current managed task.",
+                "parameters": {"type": "object", "properties": {"verdict": {"type": "string", "enum": ["approved", "changes_requested"]}, "rationale": {"type": "string"}}, "required": ["verdict", "rationale"], "additionalProperties": False}},
+        handler=_safe(submit_review), description="Submit a managed review verdict")
+    ctx.register_hook("pre_tool_call", guard)
+    ctx.register_hook("kanban_task_claimed", watchdog_claimed)
+    ctx.register_hook("on_kanban_dispatch_tick", watchdog_tick)

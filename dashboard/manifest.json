@@ -1,0 +1,10 @@
+{
+  "name": "local-first-review",
+  "label": "Review Gate",
+  "description": "Native Kanban implementation-review gate configuration and telemetry.",
+  "icon": "ShieldCheck",
+  "version": "1.0.0",
+  "tab": { "path": "/local-first-review", "position": "after:kanban" },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
