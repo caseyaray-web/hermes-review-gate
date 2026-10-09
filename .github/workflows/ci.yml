@@ -22,13 +22,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.14'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Install pinned Hermes host and test dependencies
         run: |
-          python -m pip install 'hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@46904a3b467f62616f5b3ee247adce30b1b277a0' pytest fastapi httpx build
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-source"
+          git -C "$RUNNER_TEMP/hermes-source" checkout 46904a3b467f62616f5b3ee247adce30b1b277a0
+          python -m pip install -e "$RUNNER_TEMP/hermes-source" pytest fastapi httpx build
           mkdir -p "$RUNNER_TEMP/hermes-home"
           printf 'HERMES_HOME=%s/hermes-home\nHERMES_KANBAN_HOME=%s/hermes-home\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Run full suite including native fixtures
