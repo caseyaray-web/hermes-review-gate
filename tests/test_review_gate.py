@@ -230,12 +230,12 @@ def test_correction_limit_from_native_runs(board):
     assert 'Missing required behavior 2' in show['runs'][-1]['summary']
 
 
-def test_joined_review_correction_exhaustion_escalates_then_distinct_reviewer_approves(board):
-    """Full native lifecycle: normal correction -> routed stronger impl -> independent approval."""
+def test_joined_review_correction_escalates_with_same_profile_for_both_roles(board):
+    """A profile may implement and review escalation in distinct native sessions."""
     b = board
     state.activate_board('default', activation_id='escalate-corrections')
     state.set_escalation_policy('default', enabled=True, normal_correction_limit=1, max_attempts=1,
-                                implementation_profile='strong', reviewer_profile='post-review')
+                                implementation_profile='strong', reviewer_profile='strong')
     assert b.dispatch().assignee == 'impl'
     assert b.call('finish_implementation', summary='Initial candidate is ready for normal review.')['ok']
     assert b.dispatch().assignee == 'review'
@@ -252,17 +252,15 @@ def test_joined_review_correction_exhaustion_escalates_then_distinct_reviewer_ap
     stored = state.load_state()
     assert stored['tasks']['default:' + b.pred]['implementation_profile'] == 'impl'  # immutable provenance
     assert stored['effective_routing']['default:' + b.pred]['implementation_profile'] == 'strong'
-    assert stored['effective_routing']['default:' + b.pred]['reviewer_profile'] == 'post-review'
+    assert stored['effective_routing']['default:' + b.pred]['reviewer_profile'] == 'strong'
     assert b.dispatch().assignee == 'strong'
     (b.repo / 'implementation.txt').write_text('strong correction\n')
     b.git('add', '.'); b.git('commit', '-qm', 'strong correction')
     assert b.call('finish_implementation', summary='Escalated implementation candidate is ready.')['ok']
-    assert b.dispatch().assignee == 'post-review'
+    assert b.dispatch().assignee == 'strong'
     import os
-    os.environ['HERMES_PROFILE'] = 'review'
-    assert b.call('submit_review', verdict='approved', rationale='Original reviewer cannot self-approve escalation.')['error']
-    os.environ['HERMES_PROFILE'] = 'post-review'
-    assert b.call('submit_review', verdict='approved', rationale='Independent post-escalation reviewer approved the candidate.')['ok']
+    os.environ['HERMES_PROFILE'] = 'strong'
+    assert b.call('submit_review', verdict='approved', rationale='Separate native reviewer session approved the escalated candidate.')['ok']
     assert b.show()['task']['status'] == 'done'
 
 
@@ -871,9 +869,13 @@ def test_native_dashboard_phases_configuration_and_readonly(board, monkeypatch):
     assert client.put(base+'/configuration', json={'implementation_profile':'impl','reviewer_profile':'other'}).status_code == 200
     assert state.task_binding(b.pred)['reviewer_profile'] == 'review'
     saved = state.state_path().read_bytes()
-    for reviewer in ('impl', 'missing'):
-        assert client.put(base+'/configuration', json={'implementation_profile':'impl','reviewer_profile':reviewer}).status_code == 409
-        assert state.state_path().read_bytes() == saved
+    same_profile = client.put(base+'/configuration', json={'implementation_profile':'impl','reviewer_profile':'impl'})
+    assert same_profile.status_code == 200
+    assert same_profile.json()['configuration']['implementation_profile'] == same_profile.json()['configuration']['reviewer_profile'] == 'impl'
+    assert state.state_path().read_bytes() != saved
+    saved = state.state_path().read_bytes()
+    assert client.put(base+'/configuration', json={'implementation_profile':'impl','reviewer_profile':'missing'}).status_code == 409
+    assert state.state_path().read_bytes() == saved
     assert b.call('finish_implementation', summary='Native API integration candidate, committed source and checks inspected.')['ok']
     view('awaiting_review', 'awaiting_or_under_review')
     b.dispatch()

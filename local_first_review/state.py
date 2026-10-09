@@ -80,8 +80,8 @@ def _escalation_settings(value: Any) -> dict[str, Any]:
     if (type(enabled) is not bool or type(limit) is not int or not 1 <= limit <= MAX_CHANGES
             or type(attempts) is not int or not 1 <= attempts <= ESCALATION_MAX_ATTEMPTS_LIMIT):
         raise ValueError("review escalation policy is invalid")
-    if enabled and (not _text(implementation) or not _text(reviewer) or implementation == reviewer):
-        raise ValueError("enabled review escalation requires distinct implementation and reviewer profiles")
+    if enabled and (not _text(implementation) or not _text(reviewer)):
+        raise ValueError("enabled review escalation requires implementation and reviewer profiles")
     if not enabled and (implementation is not None or reviewer is not None):
         raise ValueError("disabled review escalation must not retain routing")
     return dict(value)
@@ -138,7 +138,7 @@ def _validate(data: Any) -> dict[str, Any]:
             raise ValueError("review-gate board policy has an invalid shape")
         fields = ("activation_id", "implementation_profile", "reviewer_profile")
         if (any(not _text(policy.get(x)) for x in fields) or type(policy.get("native_run_watermark")) is not int
-                or policy["native_run_watermark"] < 0 or policy["implementation_profile"] == policy["reviewer_profile"]):
+                or policy["native_run_watermark"] < 0):
             raise ValueError("review-gate board policy is invalid")
         _recovery_settings(policy.get("recovery", {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}))
         _escalation_settings(policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES,
@@ -157,14 +157,13 @@ def _validate(data: Any) -> dict[str, Any]:
             raise ValueError("review escalation ledger is invalid")
         for number, attempt in enumerate(entry["attempts"], start=missing + 1):
             if (not isinstance(attempt, dict) or attempt.get("attempt") != number or not isinstance(attempt.get("intent"), dict)
-                    or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))
-                    or attempt["implementation_profile"] == attempt["reviewer_profile"]):
+                    or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))):
                 raise ValueError("review escalation ledger is invalid")
     for key, route in data["effective_routing"].items():
         if (not isinstance(key, str) or not isinstance(route, dict) or not _text(route.get("board"))
                 or not _text(route.get("task_id")) or key != binding_key(route["board"], route["task_id"])):
             raise ValueError("effective review routing is invalid")
-        if not _text(route.get("implementation_profile")) or not _text(route.get("reviewer_profile")) or route["implementation_profile"] == route["reviewer_profile"]:
+        if not _text(route.get("implementation_profile")) or not _text(route.get("reviewer_profile")):
             raise ValueError("effective review routing is invalid")
     for key, entry in data["recovery"].items():
         if not isinstance(key, str) or not isinstance(entry, dict):
@@ -283,8 +282,7 @@ def trusted_routing(task_id: str, board: str, binding: dict[str, Any], *, includ
     route = {"board": board, "task_id": task_id,
              "implementation_profile": attempt.get("implementation_profile"), "reviewer_profile": attempt.get("reviewer_profile")}
     if (route["board"] != board or route["task_id"] != task_id
-            or not _text(route["implementation_profile"]) or not _text(route["reviewer_profile"])
-            or route["implementation_profile"] == route["reviewer_profile"]):
+            or not _text(route["implementation_profile"]) or not _text(route["reviewer_profile"])):
         raise ValueError("review escalation routing is invalid")
     if intent.get("status") == "routed":
         published = data["effective_routing"].get(key)
@@ -322,8 +320,7 @@ def reserve_escalation(board: str, task_id: str, *, review_run_id: int, binding:
         origin = dict(binding) if prior_route is None else {**binding,
             "implementation_profile": prior_route.get("implementation_profile"),
             "reviewer_profile": prior_route.get("reviewer_profile")}
-        if (not _text(origin.get("implementation_profile")) or not _text(origin.get("reviewer_profile"))
-                or origin["implementation_profile"] == origin["reviewer_profile"]):
+        if not _text(origin.get("implementation_profile")) or not _text(origin.get("reviewer_profile")):
             raise ValueError("review escalation origin routing is invalid")
         attempt = {"attempt": prior_attempt + 1, "implementation_profile": settings["implementation_profile"],
                    "reviewer_profile": settings["reviewer_profile"], "origin": origin,
@@ -489,7 +486,7 @@ def activate_board(board: str, *, activation_id: str, native_run_watermark: int 
             from .native import board_run_watermark
             native_run_watermark = board_run_watermark(board)
         implementation, reviewer = data.get("implementation_profile"), data.get("reviewer_profile")
-        if not _text(implementation) or not _text(reviewer) or implementation == reviewer: raise ValueError("save distinct implementation and reviewer profiles before board activation")
+        if not _text(implementation) or not _text(reviewer): raise ValueError("save implementation and reviewer profiles before board activation")
         if not profile_exists(implementation) or not profile_exists(reviewer): raise ValueError("configured worker profile is missing; save valid Hermes profiles before board activation")
         policy = {"activation_id": activation_id, "native_run_watermark": native_run_watermark, "implementation_profile": implementation, "reviewer_profile": reviewer, "recovery": {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}, "escalation": {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}}
         data["boards"][board] = policy; return json.loads(json.dumps(policy))
@@ -526,7 +523,7 @@ def enroll_task(*, board: str, task: dict[str, Any], runs: list[dict[str, Any]])
     if task.get("workspace_kind") != "dir" or not Path(workspace).is_absolute(): raise ValueError("managed work requires an absolute dir: Git workspace")
     with locked_state(write=True) as data:
         implementation, reviewer = data.get("implementation_profile"), data.get("reviewer_profile")
-        if not _text(implementation) or not _text(reviewer) or implementation == reviewer or not profile_exists(implementation) or not profile_exists(reviewer): raise ValueError("configured worker profiles are invalid; save valid distinct Hermes profiles before enrollment")
+        if not _text(implementation) or not _text(reviewer) or not profile_exists(implementation) or not profile_exists(reviewer): raise ValueError("configured worker profiles are invalid; save valid Hermes profiles before enrollment")
         if task.get("assignee") != implementation: raise ValueError("parked task must be assigned to the configured implementation profile")
         key = binding_key(board, task_id)
         if key in data["tasks"]: raise ValueError("task is already enrolled")

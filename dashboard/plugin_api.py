@@ -293,7 +293,6 @@ def _completion_is_approved(task: dict[str, Any], runs: list[dict[str, Any]], bi
             and isinstance(review.get("reviewer_profile"), str)
             and isinstance(implementation_run_id, int) and isinstance(handoff, dict)
             and isinstance(handoff_review, dict)
-            and review.get("reviewer_profile") != handoff_review.get("implementation_profile")
             and handoff.get("profile") == handoff_review.get("implementation_profile")
             and handoff.get("outcome") == "review_requested"
             and isinstance(handoff_review, dict)
@@ -482,8 +481,6 @@ def put_configuration(update: Configuration) -> dict[str, Any]:
         available = profiles()
     except (OSError, ValueError, RuntimeError, ImportError):
         raise HTTPException(503, "Hermes profiles unavailable; verify the local Hermes profile configuration") from None
-    if update.implementation_profile == update.reviewer_profile:
-        raise HTTPException(409, "implementation and reviewer profiles must be distinct")
     try:
         valid = (update.implementation_profile in available and update.reviewer_profile in available
                  and profile_exists(update.implementation_profile) and profile_exists(update.reviewer_profile))

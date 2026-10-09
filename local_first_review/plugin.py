@@ -107,8 +107,6 @@ def _binding(show: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
             binding = bind_first_owned_run(board, observed["task"], observed["runs"], run_id=_run_id(), profile=profile)
         except ValueError as exc:
             raise GateError(f"board policy requires operator attention before review gating: {exc}") from exc
-    if binding["implementation_profile"] == binding["reviewer_profile"]:
-        raise GateError("enrollment does not bind independent profiles")
     if not all(profile_exists(binding[key]) for key in ("implementation_profile", "reviewer_profile")):
         raise GateError("a bound profile is missing or deleted; restore it before continuing")
     return task_id, binding
@@ -279,7 +277,7 @@ def _review_context() -> tuple[str, dict[str, Any], dict[str, Any], int, str, di
     if (not isinstance(implementation_profile, str) or not isinstance(reviewer_profile, str)
             or implementation_profile != route["implementation_profile"]
             or reviewer_profile != route["reviewer_profile"]
-            or implementation_profile == reviewer_profile or reviewer_profile != profile):
+            or reviewer_profile != profile):
         raise GateError("review handoff routing does not match this enrollment")
     if not metadata.get("worker_session_id") or metadata["worker_session_id"] == _session():
         raise GateError("review requires a distinct native worker session")
@@ -418,7 +416,7 @@ def _pending_escalation_proof(task_id: str, board: str, entry: dict[str, Any], *
     review_run_id = intent.get("review_run_id")
     if (not isinstance(binding, dict) or entry.get("binding") != binding or not isinstance(target, str)
             or not isinstance(target_reviewer, str) or not isinstance(origin, dict)
-            or not isinstance(review_run_id, int) or target == target_reviewer):
+            or not isinstance(review_run_id, int)):
         return False
     observed = _show(task_id); task = observed["task"]
     reviewer = next((run for run in observed["runs"] if run.get("id") == review_run_id), None)
@@ -1058,7 +1056,7 @@ def register(ctx: Any) -> None:
     global _CONTEXT
     _CONTEXT = ctx
     ctx.register_tool(name="finish_implementation", toolset="local_first_review",
-        schema={"name": "finish_implementation", "description": "Hand the current managed implementation to its configured independent reviewer.",
+        schema={"name": "finish_implementation", "description": "Hand the current managed implementation to its configured reviewer session.",
                 "parameters": {"type": "object", "properties": {"summary": {"type": "string"}, "artifacts": {"type": "array", "items": {"type": "string"}}}, "required": ["summary"], "additionalProperties": False}},
         handler=_safe(finish_implementation), description="Finish managed implementation through native review")
     ctx.register_tool(name="submit_review", toolset="local_first_review",

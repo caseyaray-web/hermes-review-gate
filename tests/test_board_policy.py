@@ -38,6 +38,16 @@ def native_run(*, run_id=9, profile="impl", started_at=101, ended_at=None):
     return {"id": run_id, "profile": profile, "status": "running", "started_at": started_at, "ended_at": ended_at}
 
 
+def test_board_activation_and_first_binding_allow_same_profile_for_both_roles(policy_file):
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "impl", "tasks": {}, "boards": {}})
+
+    policy = state.activate_board("board-a", activation_id="same-profile", native_run_watermark=8)
+    binding = state.bind_first_owned_run("board-a", native_task(), [native_run()], run_id=9, profile="impl")
+
+    assert policy["implementation_profile"] == policy["reviewer_profile"] == "impl"
+    assert binding["implementation_profile"] == binding["reviewer_profile"] == "impl"
+
+
 def test_activation_migrates_legacy_state_and_first_future_run_is_bound(policy_file):
     policy_file.write_text(json.dumps({"version": 1, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {
         "old:legacy": {"board": "old", "task_id": "legacy", "implementation_profile": "impl", "reviewer_profile": "review", "workspace_path": "/legacy"}}}))
@@ -81,7 +91,7 @@ def test_malformed_board_policy_fails_closed(policy_file):
         state.load_state()
 
 
-def test_escalation_policy_is_opt_in_validates_distinct_profiles_and_persists(policy_file, monkeypatch):
+def test_escalation_policy_allows_same_profile_selection_and_persists(policy_file, monkeypatch):
     monkeypatch.setattr(state, "profile_exists", lambda name: name in {"impl", "review", "strong", "post-review"})
     state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
     state.activate_board("board-a", activation_id="escalation", native_run_watermark=0)
@@ -91,9 +101,9 @@ def test_escalation_policy_is_opt_in_validates_distinct_profiles_and_persists(po
 
     assert policy["escalation"] == {"enabled": True, "normal_correction_limit": 1, "max_attempts": 1,
                                      "implementation_profile": "strong", "reviewer_profile": "post-review"}
-    with pytest.raises(ValueError, match="distinct"):
-        state.set_escalation_policy("board-a", enabled=True, normal_correction_limit=1,
-                                    max_attempts=1, implementation_profile="strong", reviewer_profile="strong")
+    same_profile = state.set_escalation_policy("board-a", enabled=True, normal_correction_limit=1,
+                                               max_attempts=1, implementation_profile="strong", reviewer_profile="strong")
+    assert same_profile["escalation"]["implementation_profile"] == same_profile["escalation"]["reviewer_profile"] == "strong"
     disabled = state.set_escalation_policy("board-a", enabled=False, normal_correction_limit=1, max_attempts=1)
     assert disabled["escalation"]["enabled"] is False
 
@@ -103,7 +113,7 @@ def test_escalation_intent_and_effective_routing_survive_restart_without_rewriti
     state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
     state.activate_board("board-a", activation_id="escalation-intent", native_run_watermark=0)
     state.set_escalation_policy("board-a", enabled=True, normal_correction_limit=1, max_attempts=1,
-                                implementation_profile="strong", reviewer_profile="post-review")
+                                implementation_profile="strong", reviewer_profile="strong")
     binding = {"board": "board-a", "task_id": "task", "implementation_profile": "impl", "reviewer_profile": "review", "workspace_path": "/work"}
     state.save_state({**state.load_state(), "tasks": {"board-a:task": binding}})
 
@@ -116,7 +126,7 @@ def test_escalation_intent_and_effective_routing_survive_restart_without_rewriti
     reloaded = state.load_state()
     assert route["implementation_profile"] == "strong"
     assert reloaded["tasks"]["board-a:task"] == binding
-    assert reloaded["effective_routing"]["board-a:task"]["reviewer_profile"] == "post-review"
+    assert reloaded["effective_routing"]["board-a:task"]["reviewer_profile"] == "strong"
     with pytest.raises(ValueError, match="attempts exhausted"):
         state.reserve_escalation("board-a", "task", review_run_id=8, binding=binding,
                                  candidate={"head": "b" * 40, "clean_tracked": True}, change_count=2)

@@ -75,16 +75,16 @@ def test_escalated_completion_uses_trusted_effective_route_not_original_binding(
     binding = {"board": "default", "task_id": "one", "implementation_profile": "impl",
                "reviewer_profile": "review", "workspace_path": "/work"}
     route = {"board": "default", "task_id": "one", "implementation_profile": "strong",
-             "reviewer_profile": "post-review"}
+             "reviewer_profile": "strong"}
     monkeypatch.setattr(plugin_api, "trusted_routing", lambda *_args, **_kwargs: route)
     candidate = {"head": "a"}
     runs = [
         {"id": 11, "profile": "strong", "status": "review", "outcome": "review_requested", "ended_at": 6,
          "metadata": {"local_first_review": {"implementation_run_id": 11, "implementation_profile": "strong",
-                                                "reviewer_profile": "post-review", "candidate": candidate}}},
-        {"id": 12, "profile": "post-review", "status": "done", "outcome": "completed", "ended_at": 7,
+                                                "reviewer_profile": "strong", "candidate": candidate}}},
+        {"id": 12, "profile": "strong", "status": "done", "outcome": "completed", "ended_at": 7,
          "metadata": {"local_first_review": {"verdict": "approved", "reviewer_run_id": 12,
-                                                "reviewer_profile": "post-review", "implementation_run_id": 11,
+                                                "reviewer_profile": "strong", "implementation_run_id": 11,
                                                 "candidate": candidate}}},
     ]
 
@@ -125,7 +125,9 @@ def test_configuration_validates_and_updates_only_defaults(monkeypatch):
     assert stored["implementation_profile"] == "new-impl"
     assert stored["reviewer_profile"] == "new-review"
     assert stored["tasks"]["default:one"]["implementation_profile"] == "impl"
-    assert client().put("/configuration", json={"implementation_profile": "impl", "reviewer_profile": "impl"}).status_code == 409
+    same_profile = client().put("/configuration", json={"implementation_profile": "impl", "reviewer_profile": "impl"})
+    assert same_profile.status_code == 200
+    assert stored["implementation_profile"] == stored["reviewer_profile"] == "impl"
     assert client().put("/configuration", json={"implementation_profile": "impl", "reviewer_profile": "review", "extra": True}).status_code == 422
 
 
@@ -224,6 +226,7 @@ def test_escalation_control_persists_future_only_routing_and_shipped_controls(mo
     bundle = (plugin_api.Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js").read_text()
     assert "Enable correction escalation" in bundle
     assert "held cards are never swept or rerouted" in bundle
+    assert "targetImpl===targetReviewer" not in bundle
 
 
 @pytest.mark.parametrize(("enabled", "expected"), [(True, "Reconciling"), (False, "Held (disabled)")])
@@ -231,7 +234,10 @@ def test_shipped_dashboard_renders_per_board_escalation_authority(enabled, expec
     """Execute the shipped bundle: /status has no global escalation setting."""
     bundle = plugin_api.Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js"
     status = {"configuration": {"implementation_profile": "impl", "reviewer_profile": "review"},
-              "board_policies": [], "counts": {}, "tasks": [{"board": "board-a", "task_id": "one", "phase": "changes_requested",
+              "board_policies": [{"board": "default", "implementation_profile": "impl", "reviewer_profile": "review",
+                                 "escalation": {"enabled": False, "normal_correction_limit": 1, "max_attempts": 1,
+                                                "implementation_profile": "strong", "reviewer_profile": "strong"}}],
+              "counts": {}, "tasks": [{"board": "board-a", "task_id": "one", "phase": "changes_requested",
               "native_status": "ready", "run_status": "ended", "implementation_profile": "impl", "reviewer_profile": "review",
               "escalation_status": "changes_requested_pending", "escalation_enabled": enabled}]}
     script = f'''const fs=require("fs"),vm=require("vm");
@@ -243,6 +249,19 @@ vm.runInThisContext(fs.readFileSync({str(bundle)!r},"utf8")); page(); Promise.re
     result = subprocess.run(["node", "-e", script], text=True, capture_output=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert expected in result.stdout
+    tree = json.loads(result.stdout)
+    def nodes(value):
+        if isinstance(value, dict):
+            yield value
+            for child in value.get("children", []):
+                yield from nodes(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from nodes(child)
+    for label in ("Save escalation policy", "Enable correction escalation"):
+        matching = [node for node in nodes(tree) if node.get("type") == "button" and label in node.get("children", [])]
+        assert len(matching) == 1
+        assert matching[0]["props"]["disabled"] is False
 
 
 def test_policy_scope_exposes_default_recovery_limit_for_legacy_policy(monkeypatch):
