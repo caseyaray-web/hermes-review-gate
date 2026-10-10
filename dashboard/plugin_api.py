@@ -18,9 +18,11 @@ if _plugin_root not in sys.path:
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
+from local_first_review.review_evidence import approved_completion, changes_requested_verdicts, correction_count
 from local_first_review.state import (ESCALATION_MAX_ATTEMPTS_LIMIT, MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT,
-                                      activate_board, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
-                                      set_escalation_policy, set_recovery_policy, trusted_routing)
+                                      activate_board, adopt_runtime_escalation, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
+                                      recovery_budget_exhausted, runtime_escalation_entry, set_escalation_policy, set_recovery_policy, set_runtime_escalation_policy, task_binding, trusted_routing)
+from local_first_review.runtime_escalation import reauthorize_held
 
 router = APIRouter()
 COUNT_NAMES = (
@@ -68,6 +70,23 @@ class EscalationControl(BaseModel):
     max_attempts: StrictInt = Field(ge=1, le=ESCALATION_MAX_ATTEMPTS_LIMIT)
     implementation_profile: str | None = Field(default=None, min_length=1, max_length=128)
     reviewer_profile: str | None = Field(default=None, min_length=1, max_length=128)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RuntimeEscalationControl(BaseModel):
+    board: str = Field(min_length=1, max_length=64)
+    enabled: StrictBool
+    max_attempts: StrictInt = Field(ge=1, le=ESCALATION_MAX_ATTEMPTS_LIMIT)
+    implementation_profile: str | None = Field(default=None, min_length=1, max_length=128)
+    reviewer_profile: str | None = Field(default=None, min_length=1, max_length=128)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RuntimeCatchupControl(BaseModel):
+    board: str = Field(min_length=1, max_length=64)
+    task_id: str = Field(min_length=1, max_length=128)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -172,9 +191,9 @@ def _activation_preview(board: str, *, policy: dict[str, Any], legacy_bound_ids:
             legacy_bound.append(task_id)
             continue
         workspace = task.get("workspace_path")
-        if task.get("workspace_kind") != "dir" or not isinstance(workspace, str) or not Path(workspace).is_absolute():
-            attention.append(_attention(task_id, "workspace is not an absolute dir: workspace",
-                                        "Set an absolute dir: workspace before native dispatch."))
+        if task.get("workspace_kind") != "worktree" or not isinstance(workspace, str) or not Path(workspace).is_absolute():
+            attention.append(_attention(task_id, "workspace is not an absolute task-scoped Git worktree",
+                                        "Set --workspace worktree:<absolute-repo-path> before native dispatch."))
             continue
         assignee = task.get("assignee")
         if not isinstance(assignee, str) or not assignee:
@@ -236,6 +255,7 @@ def _policy_scope_view(board: str, policy: dict[str, Any]) -> dict[str, Any]:
                 "implementation_profile": policy["implementation_profile"],
                 "reviewer_profile": policy["reviewer_profile"], "recovery": policy.get("recovery", {"enabled": False, "max_per_phase": 1}),
                 "escalation": policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
+                "runtime_escalation": policy.get("runtime_escalation", {"enabled": False, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
                 "eligible_no_run": classification["eligible_no_run"],
                 "awaiting_first_gate": classification["awaiting_first_gate"],
                 "attention": classification["attention"], "history": classification["history"],
@@ -247,6 +267,7 @@ def _policy_scope_view(board: str, policy: dict[str, Any]) -> dict[str, Any]:
                 "reviewer_profile": policy["reviewer_profile"],
                 "recovery": policy.get("recovery", {"enabled": False, "max_per_phase": 1}),
                 "escalation": policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
+                "runtime_escalation": policy.get("runtime_escalation", {"enabled": False, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
                 "eligible_no_run": None, "awaiting_first_gate": None, "attention": None,
                 "history": None, "legacy_bound": None, "error": str(exc)}
 
@@ -269,39 +290,14 @@ def _claimed_source_status(events: list[dict[str, Any]], run_id: Any) -> str | N
     return None
 
 
-def _completion_is_approved(task: dict[str, Any], runs: list[dict[str, Any]], binding: dict[str, Any]) -> bool:
-    """Only native completion carrying the gate's approval can make this done."""
-    if task.get("status") != "done":
-        return False
+def _completion_is_approved(task: dict[str, Any], runs: list[dict[str, Any]], events: list[dict[str, Any]],
+                            binding: dict[str, Any]) -> bool:
+    """Only an exact immutable handoff and native approval can make this done."""
     try:
         route = trusted_routing(binding["task_id"], binding["board"], binding)
     except (KeyError, ValueError):
         return False
-    for run in reversed(runs):
-        if run.get("outcome") != "completed" or run.get("ended_at") is None:
-            continue
-        metadata = run.get("metadata")
-        review = metadata.get("local_first_review") if isinstance(metadata, dict) else None
-        implementation_run_id = review.get("implementation_run_id") if isinstance(review, dict) else None
-        handoff = next((candidate for candidate in runs if candidate.get("id") == implementation_run_id), None)
-        handoff_metadata = handoff.get("metadata") if isinstance(handoff, dict) else None
-        handoff_review = handoff_metadata.get("local_first_review") if isinstance(handoff_metadata, dict) else None
-        return bool(
-            isinstance(review, dict) and review.get("verdict") == "approved"
-            and review.get("reviewer_run_id") == run.get("id")
-            and review.get("reviewer_profile") == run.get("profile")
-            and isinstance(review.get("reviewer_profile"), str)
-            and isinstance(implementation_run_id, int) and isinstance(handoff, dict)
-            and isinstance(handoff_review, dict)
-            and handoff.get("profile") == handoff_review.get("implementation_profile")
-            and handoff.get("outcome") == "review_requested"
-            and isinstance(handoff_review, dict)
-            and handoff_review.get("implementation_run_id") == implementation_run_id
-            and handoff_review.get("implementation_profile") == route["implementation_profile"]
-            and handoff_review.get("reviewer_profile") == route["reviewer_profile"]
-            and review.get("candidate") == handoff_review.get("candidate")
-        )
-    return False
+    return approved_completion(task, runs, events, binding, route)
 
 
 def _phase(task: dict[str, Any], runs: list[dict[str, Any]], events: list[dict[str, Any]], approved: bool) -> str:
@@ -370,14 +366,20 @@ def _task_view(binding: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
                                           for key in ("board", "task_id", "implementation_profile", "reviewer_profile")):
         published_route = None
     pending = escalation_entry(task_id, board)
+    runtime = runtime_escalation_entry(task_id, board)
     escalation_status = current_escalation_attempt(pending).get("intent", {}).get("status") if isinstance(pending, dict) else None
+    runtime_intent = runtime.get("intent") if isinstance(runtime, dict) else None
+    runtime_status = runtime_intent.get("status") if isinstance(runtime_intent, dict) else None
+    runtime_reason = runtime_intent.get("reason") if isinstance(runtime_intent, dict) and isinstance(runtime_intent.get("reason"), str) else None
     policy = load_state().get("boards", {}).get(board, {})
     escalation_enabled = policy.get("escalation", {}).get("enabled") is True
     base = {"board": board, "task_id": task_id, "implementation_profile": route["implementation_profile"],
             "reviewer_profile": route["reviewer_profile"],
             "original_implementation_profile": binding["implementation_profile"],
             "original_reviewer_profile": binding["reviewer_profile"], "effective_routing": published_route,
-            "escalation_status": escalation_status, "escalation_enabled": escalation_enabled, "process_liveness": PROCESS_LIVENESS}
+            "escalation_status": escalation_status, "escalation_enabled": escalation_enabled,
+            "runtime_escalation_status": runtime_status, "runtime_escalation_reason": runtime_reason,
+            "process_liveness": PROCESS_LIVENESS}
     try:
         task, runs, events = _observe_task(board, task_id)
     except TelemetryUnavailable as exc:
@@ -406,8 +408,8 @@ def _task_view(binding: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
             break
     summary = next((run.get("summary") for run in reversed(runs) if run.get("summary")), task.get("result"))
     handoff_summary = next((run.get("summary") for run in reversed(runs) if run.get("outcome") == "review_requested"), None)
-    changes = sum(run.get("outcome") == "changes_requested" for run in runs)
-    approved = _completion_is_approved(task, runs, binding)
+    changes = correction_count(runs, events, binding)
+    approved = _completion_is_approved(task, runs, events, binding)
     phase = _phase(task, runs, events, approved)
     stale = _active_run_is_stale(active, observed_at)
     try:
@@ -564,3 +566,93 @@ def escalation_control(body: EscalationControl) -> dict[str, Any]:
         raise HTTPException(409, str(exc)) from exc
     return {"policy": policy,
             "message": "Review-correction escalation is enabled for future exhaustion" if body.enabled else "Review-correction escalation is disabled"}
+
+
+@router.put("/runtime-escalation")
+def runtime_escalation_control(body: RuntimeEscalationControl) -> dict[str, Any]:
+    """Persist an explicit future runtime-exhaustion route without changing cards."""
+    try:
+        policy = set_runtime_escalation_policy(body.board, enabled=body.enabled, max_attempts=body.max_attempts,
+                                               implementation_profile=body.implementation_profile,
+                                               reviewer_profile=body.reviewer_profile)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"policy": policy,
+            "message": "Runtime-exhaustion escalation is enabled for future exhausted recoveries" if body.enabled else "Runtime-exhaustion escalation is disabled"}
+
+
+def _runtime_catchup_context(task: dict[str, Any], runs: list[dict[str, Any]], events: list[dict[str, Any]],
+                             binding: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Prove one existing RM03 hold and freeze its bounded fresh-coder packet."""
+    from local_first_review import plugin
+    if task.get("status") != "blocked" or task.get("assignee") != binding.get("implementation_profile"):
+        raise ValueError("runtime catch-up requires the original bound implementation hold")
+    if not runs:
+        raise ValueError("runtime catch-up requires native run history")
+    show = {"task": task, "runs": runs, "events": events}
+    failed = runs[-1]
+    run_id = failed.get("id") if isinstance(failed, dict) else None
+    if (not isinstance(failed, dict) or type(run_id) is not int or plugin._failed_phase(show, failed) != "implementation"
+            or not plugin._allowed_terminal_failure(show, failed)):
+        raise ValueError("runtime catch-up requires the latest exact implementation iteration-exhaustion failure")
+    failure = plugin._runtime_failure_record(show, run_id)
+    workspace = task.get("workspace_path")
+    if failure is None or not isinstance(workspace, str) or workspace != binding.get("workspace_path"):
+        raise ValueError("runtime catch-up native failure or workspace evidence is invalid")
+    findings = [
+        {"run_id": verdict["reviewer_run_id"], "summary": verdict["summary"],
+         "candidate": verdict["candidate"], "reviewer_profile": verdict["reviewer_profile"],
+         "reviewer_identity": verdict["reviewer_identity"]}
+        for verdict in changes_requested_verdicts(runs, events, binding)
+    ]
+    if not findings:
+        raise ValueError("runtime catch-up requires one prior genuine reviewer changes-requested verdict")
+    checkpoint = plugin._workspace_checkpoint(workspace)
+    context = {"original_contract": dict(task), "reviewer_findings": findings,
+               "latest_failure": failure, "checkpoint": checkpoint}
+    return failure, checkpoint, context
+
+
+@router.post("/runtime-escalation/reconcile-held")
+def runtime_escalation_reconcile_held(body: RuntimeCatchupControl) -> dict[str, Any]:
+    """Explicitly reauthorize one held intent only after a native no-effect proof."""
+    try:
+        if not reauthorize_held(body.task_id, body.board):
+            raise ValueError("held runtime intent lacks a complete exact no-effect proof; native state remains untouched")
+        entry = runtime_escalation_entry(body.task_id, body.board)
+        if entry is None:
+            raise ValueError("held runtime intent disappeared during reconciliation")
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"runtime_escalation": entry,
+            "message": "No-effect reconciliation is durable; the next real dispatch tick may resume this same intent."}
+
+
+@router.post("/runtime-escalation/catch-up")
+def runtime_escalation_catchup(body: RuntimeCatchupControl) -> dict[str, Any]:
+    """Explicitly adopt one already-bound RM03 hold; native state stays untouched."""
+    try:
+        # A client may lose the successful response after durable adoption.  The
+        # task is allowed exactly one immutable catch-up intent, so replaying
+        # the same scoped request returns that evidence without re-observing a
+        # now-progressed card or recapturing its checkpoint/context.
+        existing = runtime_escalation_entry(body.task_id, body.board)
+        if existing is not None:
+            return {"runtime_escalation": existing,
+                    "message": "Catch-up intent was already durable; no native reconciliation was replayed."}
+        task, runs, events = _observe_task(body.board, body.task_id)
+        binding = task_binding(body.task_id, body.board)
+        if task is None or binding is None:
+            raise ValueError("runtime catch-up requires an existing immutable task binding")
+        if not recovery_budget_exhausted(body.board, body.task_id, "implementation"):
+            raise ValueError("runtime catch-up requires an exhausted implementation recovery budget")
+        failure, checkpoint, context = _runtime_catchup_context(task, runs, events, binding)
+        entry = adopt_runtime_escalation(body.board, body.task_id, failed_run_id=failure["run_id"], phase="implementation",
+                                         binding=binding, checkpoint=checkpoint, failure=failure,
+                                         workspace_path=binding["workspace_path"], coder_context=context)
+    except TelemetryUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"runtime_escalation": entry,
+            "message": "Catch-up intent is durable; the next real dispatch tick must reconcile this exact task."}

@@ -43,23 +43,30 @@ def board(tmp_path, monkeypatch):
     get_plugin_manager().discover_and_load()
     kb.init_db()
     conn = kbc.connect()
-    repo = home / 'repo'
-    repo.mkdir()
+    repo_root = home / 'repo'
+    repo_root.mkdir()
+    repo = repo_root
     def git(*args):
         return subprocess.check_output(['git', '-C', str(repo), *args], text=True).strip()
     git('init', '-q')
     git('config', 'user.name', 'Review fixture')
     git('config', 'user.email', 'fixture@example.invalid')
-    (repo / 'implementation.txt').write_text('version one\n')
-    (repo / '.gitignore').write_text('check.log\n')
+    (repo_root / 'implementation.txt').write_text('version one\n')
+    (repo_root / '.gitignore').write_text('check.log\n')
     git('add', '.')
     git('commit', '-qm', 'fixture candidate')
     state.save_state({'version':1, 'implementation_profile':'impl', 'reviewer_profile':'review', 'tasks':{}})
-    pred = kb.create_task(conn, title='Managed implementation', assignee='impl', initial_status='blocked', workspace_kind='dir', workspace_path=str(repo))
+    pred = kb.create_task(conn, title='Managed implementation', assignee='impl', initial_status='blocked', workspace_kind='worktree', workspace_path=str(repo_root))
     assert kb.block_task(conn, pred, reason='Awaiting explicit review enrollment', kind='needs_input')
+    from hermes_cli.kanban_db_workspace import resolve_workspace, set_workspace_path
+    pred_record = kb.get_task(conn, pred)
+    assert pred_record is not None
+    pred_workspace = resolve_workspace(pred_record, board='default')
+    set_workspace_path(conn, pred, pred_workspace)
     observed = snapshot('default', pred)
     state.enroll_task(board='default', task=observed['task'], runs=observed['runs'])
-    child = kb.create_task(conn, title='Gated successor', assignee='impl', parents=[pred], workspace_kind='dir', workspace_path=str(repo))
+    repo = pred_workspace
+    child = kb.create_task(conn, title='Gated successor', assignee='impl', parents=[pred], workspace_kind='worktree', workspace_path=str(repo_root))
     assert kb.unblock_task(conn, pred)
     class Board:
         def clear(self):
@@ -80,11 +87,17 @@ def board(tmp_path, monkeypatch):
         def call(self, name, **args):
             return json.loads(handle_function_call(name,args,task_id='agent-session-not-card-id'))
         def show(self, task_id=None):return snapshot('default',task_id or pred)
+        def workspace(self, task_id):
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            path = resolve_workspace(task, board='default')
+            set_workspace_path(conn, task_id, path)
+            return path
         def gated(self):
             assert kb.get_task(conn,child).status=='todo'
             assert not any(e.kind=='completed' for e in kb.list_events(conn,pred))
     b=Board()
-    b.kb,b.kbd,b.conn,b.repo,b.pred,b.child,b.git,b.home=kb,kbd,conn,repo,pred,child,git,home
+    b.kb,b.kbd,b.conn,b.repo,b.repo_root,b.pred,b.child,b.git,b.home=kb,kbd,conn,repo,repo_root,pred,child,git,home
     try:
         yield b
     finally:
@@ -96,6 +109,31 @@ def board(tmp_path, monkeypatch):
                 kb.archive_task(conn,task.id)
         assert not any(t.status in ('ready','running','review') for t in kb.list_tasks(conn))
         conn.close()
+
+
+def test_two_tasks_from_same_repo_get_distinct_native_worktrees(board):
+    b = board
+    first = b.kb.create_task(b.conn, title='Isolated task one', assignee='impl', priority=900,
+                             workspace_kind='worktree', workspace_path=str(b.repo_root))
+    second = b.kb.create_task(b.conn, title='Isolated task two', assignee='impl', priority=899,
+                              workspace_kind='worktree', workspace_path=str(b.repo_root))
+
+    result = b.kbd.dispatch_once(b.conn, spawn_fn=lambda *a, **k: os.getpid(), max_spawn=2,
+                                 reconcile_orphans=False)
+
+    spawned = {task_id: workspace for task_id, _profile, workspace in result.spawned}
+    assert set(spawned) == {first, second}
+    assert spawned[first] != spawned[second]
+    assert Path(spawned[first]) == b.repo_root / '.worktrees' / first
+    assert Path(spawned[second]) == b.repo_root / '.worktrees' / second
+    marker = Path(spawned[first]) / 'task-one-only.txt'
+    marker.write_text('isolated\n')
+    assert not (Path(spawned[second]) / marker.name).exists()
+    branches = {
+        subprocess.check_output(['git', '-C', workspace, 'branch', '--show-current'], text=True).strip()
+        for workspace in spawned.values()
+    }
+    assert len(branches) == 2
 
 
 def test_registered_dependency_correction_and_approval(board, monkeypatch):
@@ -144,11 +182,11 @@ def test_native_board_policy_watermark_binds_never_run_and_future_cards(board):
     """Controlled native claims prove the run-ID boundary without a provider."""
     b = board
     old = b.kb.create_task(b.conn, title='Pre-activation history', assignee='impl', priority=300,
-                           workspace_kind='dir', workspace_path=str(b.repo))
+                           workspace_kind='worktree', workspace_path=str(b.repo))
     assert b.dispatch(expected=old).id == old
     old_run = b.kb.get_task(b.conn, old).current_run_id
     existing = b.kb.create_task(b.conn, title='Existing never-run managed card', assignee='impl', priority=200,
-                                workspace_kind='dir', workspace_path=str(b.repo))
+                                workspace_kind='worktree', workspace_path=str(b.repo))
 
     policy = state.activate_board('default', activation_id='native-watermark')
     assert policy['native_run_watermark'] >= old_run
@@ -158,7 +196,7 @@ def test_native_board_policy_watermark_binds_never_run_and_future_cards(board):
     b.clear()
 
     future = b.kb.create_task(b.conn, title='Future managed card', assignee='impl', priority=400,
-                              workspace_kind='dir', workspace_path=str(b.repo))
+                              workspace_kind='worktree', workspace_path=str(b.repo))
     assert b.dispatch(expected=future).id == future
     # The registered pre-tool hook binds the exact future native run, then
     # blocks the bypass before native completion changes state.
@@ -170,7 +208,7 @@ def test_native_board_policy_watermark_binds_never_run_and_future_cards(board):
     b.clear()
 
     dependent = b.kb.create_task(b.conn, title='Policy gated successor', assignee='impl', priority=200,
-                                 parents=[existing], workspace_kind='dir', workspace_path=str(b.repo))
+                                 parents=[existing], workspace_kind='worktree', workspace_path=str(b.repo))
     assert b.dispatch(expected=existing).id == existing
     assert b.call('finish_implementation', summary='Existing never-run card is now a clean candidate.')['ok']
     binding = state.task_binding(existing, 'default')
@@ -197,7 +235,7 @@ def test_native_board_policy_provenance_isolated_by_board(board, monkeypatch):
     try:
         with b.kb.scoped_current_board('other'):
             task_id = b.kb.create_task(other, title='Other board card', assignee='impl', initial_status='blocked',
-                                       workspace_kind='dir', workspace_path=str(b.repo))
+                                       workspace_kind='worktree', workspace_path=str(b.repo))
             assert b.kb.unblock_task(other, task_id)
             other_policy = state.activate_board('other', activation_id='other-policy')
             result = b.kbd.dispatch_once(other, spawn_fn=lambda *a, **k: os.getpid(), max_spawn=1, reconcile_orphans=False)
@@ -218,6 +256,8 @@ def test_correction_limit_from_native_runs(board):
     b=board
     for cycle in range(3):
         assert b.dispatch().assignee=='impl'
+        (b.repo/'implementation.txt').write_text(f'fresh correction candidate {cycle}\n')
+        b.git('add','implementation.txt');b.git('commit','-qm',f'fresh candidate {cycle}')
         assert b.call('finish_implementation',summary=f'Candidate attempt {cycle}: source and checks reviewed.')['ok']
         assert b.dispatch().assignee=='review'
         result=b.call('submit_review',verdict='changes_requested',rationale=f'Missing required behavior {cycle}; implement and verify it.')
@@ -592,7 +632,7 @@ def test_native_spawn_failure_is_not_adopted_as_rm02(board, monkeypatch):
     policy = state.activate_board('default', activation_id='rm02')
     state.set_recovery_policy('default', enabled=True)
     task_id = b.kb.create_task(b.conn, title='RM02 first-run failure', assignee='impl', priority=500,
-                               max_retries=1, workspace_kind='dir', workspace_path=str(b.repo))
+                               max_retries=1, workspace_kind='worktree', workspace_path=str(b.repo))
     # A production dispatcher failure closes the native run as gave_up, but no
     # worker started and it has none of run 2247's iteration-budget evidence.
     b.kbd.dispatch_once(b.conn, spawn_fn=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('controlled RM02 failure')),
@@ -612,13 +652,14 @@ def test_native_rm02_started_iteration_exhaustion_is_adopted_and_admitted(board,
     policy = state.activate_board('default', activation_id='rm02-iteration-exhaustion')
     state.set_recovery_policy('default', enabled=True)
     task_id = b.kb.create_task(b.conn, title='RM02 180-turn exhausted worker', assignee='impl', priority=500,
-                               max_retries=1, workspace_kind='dir', workspace_path=str(b.repo))
-    (b.repo / 'partial.txt').write_text('partial implementation from exhausted worker\n')
+                               max_retries=1, workspace_kind='worktree', workspace_path=str(b.repo))
+    workspace = b.workspace(task_id)
+    (workspace / 'partial.txt').write_text('partial implementation from exhausted worker\n')
     worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
     try:
         spawned = b.kbd.dispatch_once(b.conn, spawn_fn=lambda *a, **k: worker.pid,
                                       max_spawn=1, reconcile_orphans=False)
-        assert spawned.spawned == [(task_id, 'impl', str(b.repo))]
+        assert spawned.spawned == [(task_id, 'impl', str(workspace))]
         active = b.kb.get_task(b.conn, task_id)
         assert active.current_run_id is not None and worker.poll() is None
         # This is the native dispatcher terminal-failure producer used after a
@@ -666,8 +707,8 @@ def test_native_rm02_started_iteration_exhaustion_is_adopted_and_admitted(board,
     receipt = entry_after_refusal['receipt']
     assert receipt['run_id'] == resumed.current_run_id
     assert receipt['tool'] == 'finish_implementation'
-    b.git('add', 'partial.txt')
-    b.git('commit', '-qm', 'recover exhausted worker partial implementation')
+    subprocess.check_call(['git', '-C', str(workspace), 'add', 'partial.txt'])
+    subprocess.check_call(['git', '-C', str(workspace), 'commit', '-qm', 'recover exhausted worker partial implementation'])
     assert b.call('finish_implementation', summary='Recovered implementation committed after guarded dirty refusal.')['ok']
     # The verified native handoff synchronously consumes only this implementation
     # recovery lease. The phase budget remains charged, while the normal reviewer
@@ -696,14 +737,15 @@ def test_joined_configured_recovery_limit_allows_two_failed_run_identities_then_
     state.activate_board('default', activation_id='two-recovery-grants')
     state.set_recovery_policy('default', enabled=True, max_per_phase=2)
     task_id = b.kb.create_task(b.conn, title='two durable watchdog recoveries', assignee='impl', priority=500,
-                               max_retries=1, workspace_kind='dir', workspace_path=str(b.repo))
+                               max_retries=1, workspace_kind='worktree', workspace_path=str(b.repo))
+    workspace = b.workspace(task_id)
 
     def start_current() -> subprocess.Popen:
         """Use a real started native replacement, never a synthetic successful retry."""
         worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
         try:
             assert b.kbd.dispatch_once(b.conn, spawn_fn=lambda *a, **k: worker.pid,
-                                       max_spawn=1, reconcile_orphans=False).spawned == [(task_id, 'impl', str(b.repo))]
+                                       max_spawn=1, reconcile_orphans=False).spawned == [(task_id, 'impl', str(workspace))]
             active = b.kb.get_task(b.conn, task_id)
             assert active.current_run_id is not None and worker.poll() is None
             return worker
@@ -767,11 +809,12 @@ def test_joined_recovery_terminal_before_receipt_releases_only_its_successor(boa
     state.activate_board('default', activation_id='terminal-before-admission')
     state.set_recovery_policy('default', enabled=True)
     task_id = b.kb.create_task(b.conn, title='terminal before first tool', assignee='impl', priority=500,
-                               max_retries=1, workspace_kind='dir', workspace_path=str(b.repo))
+                               max_retries=1, workspace_kind='worktree', workspace_path=str(b.repo))
+    workspace = b.workspace(task_id)
     worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
     try:
         assert b.kbd.dispatch_once(b.conn, spawn_fn=lambda *a, **k: worker.pid,
-                                   max_spawn=1, reconcile_orphans=False).spawned == [(task_id, 'impl', str(b.repo))]
+                                   max_spawn=1, reconcile_orphans=False).spawned == [(task_id, 'impl', str(workspace))]
         worker.terminate(); worker.wait(timeout=10)
         assert b.kbd._record_task_failure(
             b.conn, task_id,
@@ -802,20 +845,23 @@ def test_joined_recovery_terminal_before_receipt_releases_only_its_successor(boa
     key = state.recovery_key('default', task_id, entry['failed_run_id'], entry['phase'])
     stored = state.load_state()
     assert stored['recovery'][key]['terminal'] == 'native_terminal'
-    assert str(b.repo) not in stored['workspace_leases']
+    assert str(workspace) not in stored['workspace_leases']
 
-    # Lease release is not a retry-budget reset: a different task can reserve
-    # this workspace, while the original phase remains exhausted.
+    # A different task resolves to a different task-scoped worktree, so its
+    # recovery can acquire an independent lease without reusing this checkout.
     other = b.kb.create_task(b.conn, title='other workspace recovery', assignee='impl', priority=1,
-                              workspace_kind='dir', workspace_path=str(b.repo))
+                              workspace_kind='worktree', workspace_path=str(b.repo))
+    other_workspace = b.workspace(other)
     original_binding = state.task_binding(task_id, 'default')
     assert original_binding is not None
+    assert other_workspace != workspace
     binding = dict(original_binding)
     binding['task_id'] = other
-    state.reserve_recovery('default', other, failed_run_id=999, phase='implementation', workspace_path=str(b.repo),
+    binding['workspace_path'] = str(other_workspace)
+    state.reserve_recovery('default', other, failed_run_id=999, phase='implementation', workspace_path=str(other_workspace),
                            checkpoint={'head': 'a' * 40, 'dirty': []}, binding=binding, adopted=True)
     with pytest.raises(ValueError, match='budget exhausted'):
-        state.reserve_recovery('default', task_id, failed_run_id=1000, phase='implementation', workspace_path=str(b.repo),
+        state.reserve_recovery('default', task_id, failed_run_id=1000, phase='implementation', workspace_path=str(workspace),
                                checkpoint={'head': 'a' * 40, 'dirty': []}, binding=original_binding, adopted=False)
 
 
@@ -900,3 +946,78 @@ def test_missing_profiles_and_corrupt_config_fail_closed(board):
     state.state_path().write_text('{broken')
     assert b.call('kanban_complete',summary='cannot bypass corrupt policy')['error']
     b.gated()
+
+
+def test_joined_runtime_exhaustion_escalates_same_card_after_two_recoveries(board):
+    """Controlled installed-Hermes proof of RM03: exhausted recovery -> Terra -> independent review."""
+    b = board
+    policy = state.activate_board('default', activation_id='rm03-runtime-escalation')
+    state.set_recovery_policy('default', enabled=True, max_per_phase=2)
+    state.set_runtime_escalation_policy('default', enabled=True, max_attempts=1,
+                                        implementation_profile='strong', reviewer_profile='post-review')
+    task_id = b.kb.create_task(b.conn, title='RM03 exhausted recovery route', assignee='impl', priority=500,
+                               max_retries=1, workspace_kind='worktree', workspace_path=str(b.repo))
+    workspace = b.workspace(task_id)
+    immutable = None
+
+    def exhaust() -> int:
+        worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        try:
+            assert b.kbd.dispatch_once(b.conn, spawn_fn=lambda *a, **k: worker.pid,
+                                       max_spawn=1, reconcile_orphans=False).spawned
+            worker.terminate(); worker.wait(timeout=10)
+            assert b.kbd._record_task_failure(
+                b.conn, task_id,
+                'Iteration budget exhausted (180/180) — task could not complete within the allowed iterations',
+                outcome='timed_out', release_claim=True, end_run=True,
+                event_payload_extra={'budget_used': 180, 'budget_max': 180})
+        finally:
+            if worker.poll() is None:
+                worker.kill(); worker.wait(timeout=10)
+        show = b.show(task_id); failed = show['runs'][-1]
+        assert failed['outcome'] == 'gave_up'
+        assert any(event['kind'] == 'spawned' and event['run_id'] == failed['id'] for event in show['events'])
+        return failed['id']
+
+    # Grants one and two are normal recovery paths; each is charged durably.
+    first = exhaust()
+    plugin.watchdog_tick(board='default'); assert b.show(task_id)['task']['status'] in {'ready', 'todo'}
+    immutable = state.task_binding(task_id, 'default')
+    assert immutable and immutable['native_run_id'] == first > policy['native_run_watermark']
+    second = exhaust()
+    plugin.watchdog_tick(board='default'); plugin.watchdog_tick(board='default')
+    assert b.show(task_id)['task']['status'] in {'ready', 'todo'}
+    third = exhaust()
+    plugin.watchdog_tick(board='default')  # Terminalize the spent recovery lease.
+
+    # Third exact RM03 failure is not another recovery: it reserves auditable
+    # routing before native unblock/reassign and resumes the same worktree.
+    plugin.watchdog_tick(board='default')
+    stored = state.load_state(); runtime = stored['runtime_escalations']['default:' + task_id]
+    assert runtime['failed_run_id'] == third and runtime['failure']['run_id'] == third
+    assert runtime['checkpoint']['head'] == b.git('rev-parse', 'HEAD')
+    assert runtime['intent']['status'] == 'routed'
+    assert runtime['coder_context']['original_contract']['title']=='RM03 exhausted recovery route'
+    assert runtime['coder_context']['reviewer_findings']==[]
+    assert stored['tasks']['default:' + task_id] == immutable
+    assert stored['effective_routing']['default:' + task_id]['implementation_profile'] == 'strong'
+    assert stored['effective_routing']['default:' + task_id]['reviewer_profile'] == 'post-review'
+    assert stored['recovery_budgets']['default:' + task_id + ':implementation'] == 2
+    routed = b.show(task_id)
+    assert routed['task']['status'] in {'ready', 'todo'} and routed['task']['assignee'] == 'strong'
+    assert routed['task']['workspace_path'] == str(workspace)
+
+    assert b.dispatch(expected=task_id).assignee == 'strong'
+    context_notice = plugin.guard('kanban_show', {})
+    assert context_notice and 'RM03 exhausted recovery route' in context_notice['message']
+    assert plugin.guard('kanban_show', {}) is None
+    (workspace / 'implementation.txt').write_text('terra runtime escalation candidate\n')
+    subprocess.check_call(['git', '-C', str(workspace), 'add', 'implementation.txt'])
+    subprocess.check_call(['git', '-C', str(workspace), 'commit', '-qm', 'terra runtime escalation candidate'])
+    handoff = b.call('finish_implementation', summary='Fresh Terra candidate after exhausted recovery.')
+    assert handoff.get('ok'), handoff
+    reviewer = b.dispatch(expected=task_id)
+    assert reviewer.assignee == 'post-review'
+    approved = b.call('submit_review', verdict='approved', rationale='Independent post-escalation reviewer approved the fresh candidate.')
+    assert approved['ok'], approved
+    assert b.show(task_id)['task']['status'] == 'done'

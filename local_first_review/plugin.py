@@ -10,10 +10,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
+from .review_evidence import changes_requested_verdicts, correction_count
 from .state import (MAX_CHANGES, authorize_recovery_run, bind_first_owned_run, board_name, board_policy,
-                    current_escalation_attempt, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, reconcile_pending_escalation, recovery_entry,
+                    current_escalation_attempt, deliver_runtime_coder_context, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, publish_runtime_escalation_routing,
+                    reconcile_pending_escalation, recovery_budget_exhausted, recovery_entry, reserve_runtime_escalation, runtime_escalation_entry,
                     reserve_escalation, reserve_recovery, task_binding, terminalize_implementation_handoff_recovery,
-                    terminalize_recovery, trusted_routing, update_recovery_identity, worker_profile)
+                    terminalize_recovery, trusted_routing, update_recovery_identity, update_runtime_escalation_intent, worker_profile)
 
 _CONTEXT: Any | None = None
 # Native reassignment can synchronously run the dispatch-tick hook before its
@@ -85,9 +87,9 @@ def _show(task_id: str) -> dict[str, Any]:
     value = _dispatch("kanban_show", {"task_id": task_id})
     if not isinstance(value.get("task"), dict) or not isinstance(value.get("runs"), list) or not isinstance(value.get("events"), list):
         raise GateError("native kanban_show did not return task/runs/events")
-    if len(value["events"]) >= 50:
-        # kanban_show caps events, but phase and retry authority must not expire
-        # after heartbeats/comments. Read the complete native snapshot without writes.
+    if len(value["events"]) >= 50 or any("id" not in event for event in value["events"]):
+        # The worker-facing tool omits event IDs and caps history. Durable
+        # intent authority needs the complete native event identity/readback.
         from .native import snapshot
         return snapshot(board_name(), task_id)
     return value
@@ -396,8 +398,9 @@ def finish_implementation(args: dict[str, Any], **_: Any) -> str:
     return _result(value, message="Review requested. Stop work; the configured reviewer owns the next transition.")
 
 
-def _changes_count(runs: list[dict[str, Any]]) -> int:
-    return sum(1 for run in runs if isinstance(run, dict) and run.get("outcome") == "changes_requested")
+def _changes_count(runs: list[dict[str, Any]], events: list[dict[str, Any]], binding: dict[str, Any]) -> int:
+    """Count only distinct, candidate-bound native reviewer verdicts."""
+    return correction_count(runs, events, binding)
 
 
 def _pending_escalation_proof(task_id: str, board: str, entry: dict[str, Any], *,
@@ -479,7 +482,7 @@ def _reconcile_pending_escalation(task_id: str, board: str, *, required_run_id: 
 def _escalate_after_exhaustion(task_id: str, binding: dict[str, Any], show: dict[str, Any], reviewer_run_id: int,
                                review: dict[str, Any], rationale: str) -> dict[str, Any]:
     reserve_escalation(board_name(), task_id, review_run_id=reviewer_run_id, binding=binding,
-                       candidate=review["candidate"], change_count=_changes_count(show["runs"]))
+                       candidate=review["candidate"], change_count=_changes_count(show["runs"], show["events"], binding))
     try:
         value = _dispatch("kanban_request_changes", {"reason": rationale})
     except Exception as exc:
@@ -503,6 +506,7 @@ def submit_review(args: dict[str, Any], **_: Any) -> str:
     if verdict not in {"approved", "changes_requested"} or not rationale:
         raise GateError("verdict must be approved or changes_requested and rationale is required")
     task_id, _binding_value, show, reviewer_run_id, _workspace, _review = _review_context()
+    runtime = runtime_escalation_entry(task_id, board_name())
     if verdict == "approved":
         tool, native_args = "kanban_complete", {"summary": rationale, "metadata": {"local_first_review": {
             "verdict": "approved", "rationale": rationale, "candidate": _review["candidate"],
@@ -510,7 +514,17 @@ def submit_review(args: dict[str, Any], **_: Any) -> str:
             "reviewer_run_id": reviewer_run_id, "reviewer_profile": worker_profile(),
         }}}
         expected_status, expected_event = "done", "completed"
-    elif _changes_count(show["runs"]) >= (board_policy(board_name()) or {}).get("escalation", {}).get("normal_correction_limit", MAX_CHANGES):
+    elif isinstance(runtime, dict) and runtime.get("intent", {}).get("status") == "routed":
+        # A routed runtime escalation has its single recovery replacement already
+        # consumed. Preserve the reviewer finding in the terminal native block;
+        # never turn this negative verdict into another implementation/review loop.
+        tool, native_args = "kanban_block", {"reason": "Runtime escalation is exhausted; independent reviewer requested changes. Latest findings: " + rationale,
+                                              "kind": "needs_input"}
+        expected_status, expected_event = "blocked", None
+    elif any(v['candidate'] == _review['candidate'] for v in changes_requested_verdicts(show['runs'], show['events'], _binding_value)):
+        tool, native_args = 'kanban_block', {'reason': 'Unchanged rejected candidate was retried; no additional correction budget was charged. Latest findings: ' + rationale, 'kind':'needs_input'}
+        expected_status, expected_event = 'blocked', None
+    elif _changes_count(show["runs"], show["events"], _binding_value) >= (board_policy(board_name()) or {}).get("escalation", {}).get("normal_correction_limit", MAX_CHANGES):
         policy = board_policy(board_name()) or {}
         escalation = policy.get("escalation", {})
         if escalation.get("enabled") is True:
@@ -843,6 +857,33 @@ def watchdog_claimed(*, task_id: str, board: str, assignee: str | None = None, r
         return
 
 
+def _runtime_failure_record(show: dict[str, Any], failed_run_id: int) -> dict[str, Any] | None:
+    """Freeze the exact native terminal evidence that authorizes escalation."""
+    if type(failed_run_id) is not int or failed_run_id <= 0:
+        return None
+    runs = [r for r in show.get("runs", []) if r.get("id") == failed_run_id]
+    events = [e for e in show.get("events", []) if e.get("kind") == "gave_up" and e.get("run_id") == failed_run_id]
+    spawns = [e for e in show.get("events", []) if e.get("kind") == "spawned" and e.get("run_id") == failed_run_id]
+    if (len(runs) != 1 or len(events) != 1 or len(spawns) != 1
+            or runs[0].get("started_at") is None or runs[0].get("ended_at") is None
+            or runs[0].get("outcome") != "gave_up" or runs[0].get("status") != "gave_up"):
+        return None
+    event = events[0]
+    payload = event.get("payload") if isinstance(event, dict) else None
+    event_id = event.get("id") if isinstance(event, dict) else None
+    if (not isinstance(payload, dict) or type(event_id) is not int or event_id <= 0
+            or payload.get("trigger_outcome") != "timed_out" or payload.get("effective_limit") != 1
+            or payload.get("budget_used") != payload.get("budget_max")
+            or not _allowed_terminal_failure(show, {"id": failed_run_id, "outcome": "gave_up"})):
+        return None
+    return {"run_id": failed_run_id, "event_id": event_id, "kind": "gave_up", "payload": dict(payload)}
+
+
+def _reconcile_runtime_exhaustion_escalation(task_id: str, board: str, entry: dict[str, Any]) -> bool:
+    from .runtime_escalation import reconcile
+    return reconcile(task_id, board)
+
+
 def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) -> None:
     """Autonomous post-dispatch recovery; all uncertain observations fail closed."""
     if dry_run or not board: return
@@ -869,6 +910,17 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
             status = _reconcile_pending_escalation(task_id, board)
             if status == "held":
                 continue
+        # Runtime exhaustion is separate from review-correction escalation.  It
+        # only revisits a task-scoped intent created from an exact eligible run.
+        for entry in load_state().get("runtime_escalations", {}).values():
+            if entry.get("board") == board:
+                task_id = entry.get("task_id")
+                if isinstance(task_id, str):
+                    if entry.get("intent", {}).get("status") == "routed":
+                        from .runtime_escalation import monitor
+                        monitor(task_id, board)
+                    elif entry.get("intent", {}).get("status") != "held":
+                        _reconcile_runtime_exhaustion_escalation(task_id, board, entry)
         policy = board_policy(board)
         if not policy or policy.get("recovery", {}).get("enabled") is not True: return
         candidates = list(load_state()["tasks"].values())
@@ -902,6 +954,10 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
         task_id = candidate["task_id"]
         try:
             show = _show(task_id); task, runs = show["task"], show["runs"]
+            if runtime_escalation_entry(task_id, board) is not None:
+                # Runtime escalation owns its one attempt; ordinary recovery
+                # must never replenish either implementation or review work.
+                continue
             existing = recovery_entry(task_id, board)
             if existing:
                 # A claim can commit after our unblock write but before its
@@ -927,13 +983,29 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
                 if exact is None: continue
                 failed, phase = exact; adopted = True
                 workspace = task.get("workspace_path")
-                if not isinstance(workspace, str) or task.get("workspace_kind") != "dir" or not Path(workspace).is_absolute(): continue
+                if not isinstance(workspace, str) or task.get("workspace_kind") != "worktree" or not Path(workspace).is_absolute(): continue
                 binding = {"board": board, "task_id": task_id, "implementation_profile": policy["implementation_profile"], "reviewer_profile": policy["reviewer_profile"], "workspace_path": workspace, "policy_activation_id": policy["activation_id"], "policy_native_run_watermark": policy["native_run_watermark"], "native_run_id": failed["id"]}
             workspace = task.get("workspace_path")
             route = trusted_routing(task_id, board, binding)
             profile = route["reviewer_profile"] if phase == "review" else route["implementation_profile"]
             if not isinstance(workspace, str) or not _same_path(workspace, binding["workspace_path"]) or task.get("assignee") != profile or not profile_exists(profile) or not _workspace_is_exclusive(board, task_id, workspace): continue
             checkpoint = _workspace_checkpoint(workspace)
+            runtime_policy = policy.get("runtime_escalation", {})
+            if (phase == "implementation" and runtime_policy.get("enabled") is True
+                    and recovery_budget_exhausted(board, task_id, phase)):
+                runtime = runtime_escalation_entry(task_id, board)
+                if runtime is None:
+                    failure = _runtime_failure_record(show, failed.get("id"))
+                    if failure is None:
+                        continue
+                    context = {"original_contract": dict(task),
+                               "reviewer_findings": [dict(v, run_id=v['reviewer_run_id']) for v in changes_requested_verdicts(runs, show['events'], binding)],
+                               "latest_failure": failure, "checkpoint": checkpoint}
+                    runtime = reserve_runtime_escalation(board, task_id, failed_run_id=failed["id"], phase=phase,
+                                                         binding=binding, checkpoint=checkpoint, failure=failure,
+                                                         workspace_path=workspace, coder_context=context)
+                _reconcile_runtime_exhaustion_escalation(task_id, board, runtime)
+                continue
             entry = reserve_recovery(board, task_id, failed_run_id=failed["id"], phase=phase, workspace_path=workspace, checkpoint=checkpoint, binding=binding, adopted=adopted)
             # Exact task evidence remains blocked after the durable reservation.
             if _show(task_id)["task"].get("status") != "blocked": continue
@@ -983,9 +1055,34 @@ def _routed_escalation_guard(task_id: str, board: str, entry: dict[str, Any]) ->
 
 def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | None:
     """Protect only normal model tool calls; environment owns the worker task id."""
+    runtime = None
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     if task_id:
         try:
+            runtime = runtime_escalation_entry(task_id, board_name())
+            if runtime and runtime.get("intent", {}).get("status") != "routed":
+                # Persisted intent fences every claimant until one dispatch tick
+                # has proven unblock/reassignment and published the route.
+                return {"action": "block", "message": "Runtime escalation routing is pending native reconciliation; no worker tool is authorized."}
+            if runtime and runtime.get("intent", {}).get("status") == "routed":
+                admission = _routed_escalation_guard(task_id, board_name(), runtime)
+                if admission:
+                    return admission
+                from .runtime_escalation import admit
+                admission = admit(task_id, board_name(), _run_id(), worker_profile(), _show(task_id))
+                if admission:
+                    return admission
+                binding = task_binding(task_id, board_name())
+                if not isinstance(binding, dict):
+                    return {"action": "block", "message": "Runtime escalation binding is absent; no worker tool is authorized."}
+                route = trusted_routing(task_id, board_name(), binding)
+                # The packet is implementation handoff context. A post-handoff
+                # reviewer must get its normal review context instead, and may
+                # never consume the single coder delivery receipt.
+                if worker_profile() == route.get("implementation_profile"):
+                    packet = deliver_runtime_coder_context(board_name(), task_id, _run_id())
+                    if packet is not None:
+                        return {"action": "block", "message": "Fresh runtime catch-up coder context (inspect and continue the existing dirty checkpoint; do not accept or clean it): " + json.dumps(packet, sort_keys=True)}
             pending = escalation_entry(task_id, board_name())
             if pending and current_escalation_attempt(pending).get("intent", {}).get("status") == "changes_requested_pending":
                 # Only the exact newly assigned target claim may turn a pending
@@ -1010,7 +1107,7 @@ def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | N
                     return admission
         except Exception as exc:
             return {"action": "block", "message": f"Escalation state is unreadable; refusing tool: {exc}"}
-    recovery = _recovery_guard(tool_name)
+    recovery = None if task_id and runtime and runtime.get("intent", {}).get("status") == "routed" else _recovery_guard(tool_name)
     if recovery:
         return recovery
     if tool_name not in {"kanban_complete", "kanban_request_review", "kanban_request_changes"}:
@@ -1053,6 +1150,11 @@ def _safe(handler):
 
 
 def register(ctx: Any) -> None:
+    # PluginContext dispatches through the host's import-time global registry.
+    # CLI/gateway startup does not promise to preload Kanban tools, so make the
+    # supported native transport dependency explicit before retaining context.
+    import tools.kanban_tools  # noqa: F401
+
     global _CONTEXT
     _CONTEXT = ctx
     ctx.register_tool(name="finish_implementation", toolset="local_first_review",

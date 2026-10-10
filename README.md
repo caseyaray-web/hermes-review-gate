@@ -6,7 +6,7 @@ A small Hermes plugin for native Kanban review gating. Native Kanban owns tasks,
 
 The dashboard discovers native boards and can publish an immutable board policy containing its activation ID, complete per-board native run-ID watermark, and pinned implementation/reviewer profiles. Publishing policy changes no native card. Its read-only policy view separates eligible no-run cards from an exact eligible active first post-watermark run awaiting its first gate, actionable operator-attention cards, done/archive history, and legacy explicit bindings. A no-run card is not yet bound, and blocked cards are never labelled ready.
 
-For a previously unbound task, the first gated lifecycle call binds it only when native evidence shows exactly one current running implementation run, owned by the pinned implementation profile, in an absolute `dir:` workspace, and its native run ID is strictly greater than the activation watermark. The watermark is read in a complete read-only native snapshot immediately before policy publication: runs committed in that snapshot are pre-activation, while later committed runs qualify, including same-second runs. The binding persists native run and policy provenance before the review handoff. Direct completion/review/change lifecycle tools bind an eligible first run then refuse the direct call, so workers must use the gate tools. Pre-activation, ambiguous, prior-run, review, profile/workspace-mismatched, and malformed-policy cases fail closed with operator attention.
+For a previously unbound task, the first gated lifecycle call binds it only when native evidence shows exactly one current running implementation run, owned by the pinned implementation profile, in an absolute task-scoped `worktree:` workspace, and its native run ID is strictly greater than the activation watermark. The watermark is read in a complete read-only native snapshot immediately before policy publication: runs committed in that snapshot are pre-activation, while later committed runs qualify, including same-second runs. The binding persists native run and policy provenance before the review handoff. Direct completion/review/change lifecycle tools bind an eligible first run then refuse the direct call, so workers must use the gate tools. Pre-activation, ambiguous, prior-run, review, profile/workspace-mismatched, and malformed-policy cases fail closed with operator attention.
 
 Policy publication and first-run admission share the plugin state lock. That serializes policy reads/publication within the plugin's supported scope; it does not claim to veto native spawning already admitted by the dispatcher.
 
@@ -32,24 +32,21 @@ Production activation is separate from isolated verification. No migration of hi
 
 Open **Review Gate** in Hermes. Choose existing profiles and save; the same profile may be selected for multiple roles. Defaults apply only to legacy explicit bindings. Existing bindings retain their profiles and workspace. Profile model, provider, credential, and auxiliary settings are never rewritten.
 
-The **Board-wide review gating** selector publishes policy for its selected board and shows its read-only classification. Only a card with the pinned assignee, an absolute `dir:` workspace, exactly one current running implementation run, and a run ID after the watermark is shown as awaiting its first gate. Running/review/prior-run, unassigned, wrong-assignee, workspace-mismatched, and blocked cards carry an actionable attention reason and are never adopted. Legacy explicit bindings remain in managed-task telemetry rather than being counted again in board-policy telemetry.
+The **Board-wide review gating** selector publishes policy for its selected board and shows its read-only classification. Only a card with the pinned assignee, a task-scoped `worktree:` workspace, exactly one current running implementation run, and a run ID after the watermark is shown as awaiting its first gate. Running/review/prior-run, unassigned, wrong-assignee, workspace-mismatched, and blocked cards carry an actionable attention reason and are never adopted. Legacy explicit bindings remain in managed-task telemetry rather than being counted again in board-policy telemetry.
 
-The old explicit workflow remains only for backwards compatibility: an operator-held, never-run task assigned to the implementation profile in an absolute `dir:` Git workspace can be bound before it is released. Start blocked so a concurrent dispatcher cannot claim it before binding:
+## Create isolated managed tasks
+
+For new board-policy-managed work, create the task with a repository-root `worktree:` workspace. Native Kanban materializes a linked Git worktree at `<repo>/.worktrees/<task-id>` and persists that resolved path before spawning the worker. The first gated model-tool call binds the exact post-activation native run to that task-specific path; no pre-run enrollment or manual workspace binding is needed.
 
 ```sh
 hermes kanban --board default create 'Implement the feature' \
-  --assignee impl --workspace dir:/absolute/project --initial-status blocked \
+  --assignee impl --workspace worktree:/absolute/project \
   --body 'Acceptance criteria and required checks. Finish through finish_implementation; reviewers use submit_review.' --json
-hermes kanban --board default block TASK_ID --kind needs_input 'Awaiting review-gate enrollment'
 ```
 
-Replace `impl`, the workspace, body, and `TASK_ID` with the intended existing profile and returned identifier. Enter that board/task in the dashboard and **Enroll task**. After successful enrollment:
+Replace `impl`, the repository, and the body with the intended profile and acceptance criteria. Verify in `hermes kanban show TASK_ID` that `workspace_kind` is `worktree` and, after native dispatch, `workspace_path` resolves under `.worktrees/TASK_ID`. The dashboard's explicit **Enroll task** action is reserved for already-materialized linked worktrees; it refuses repository roots and shared `dir:` paths. Do not use it as a substitute for native worktree resolution. Existing bindings retain their original profiles and paths; there is no automatic migration.
 
-```sh
-hermes kanban --board default unblock TASK_ID
-```
-
-The ordinary dispatcher handles claims. Enrollment rejects any previous native run, and rejects ready, running, review, or completed cards. Do not release/change a card concurrently with enrollment. Configuration is stored in `local-first-review.json` in the shared native Kanban home (`HERMES_KANBAN_HOME` for dispatcher workers). It contains defaults and bindings, not phases or verdicts.
+Configuration is stored in `local-first-review.json` in the shared native Kanban home (`HERMES_KANBAN_HOME` for dispatcher workers). It contains defaults and bindings, not phases or verdicts.
 
 ## Worker and reviewer flow
 
@@ -78,6 +75,24 @@ Duplicate finishing after handoff is refused. A lost transition response trigger
 
 The pre-tool hook refuses managed direct `kanban_complete`, `kanban_request_review`, and `kanban_request_changes` before their handlers. Unmanaged cards retain native behavior. Normal worker exit without a valid transition is a native protocol violation/retry/hold, not completion.
 
+## Optional runtime-exhaustion escalation
+
+Runtime-exhaustion escalation is a second, **separate opt-in**. It never treats a crash, spawn failure, ordinary timeout, reviewer verdict, or manual hold as a trigger. It is eligible only after the existing implementation phase has already consumed its configured failed-run recovery budget and the next exact native failure is a started-worker, iteration-budget `gave_up` record with the same RM02 evidence required by recovery.
+
+For that one task and failed run, the plugin persists the immutable original binding, workspace checkpoint, exhausted phase identity, and target implementation/reviewer route before any native effect. The next dispatch tick may unblock the **same card** and use native reassignment to route its existing task-scoped worktree to the configured implementation profile; it reads both transitions back before publishing effective routing. The implementation worker receives the normal fresh handoff path and the configured distinct reviewer remains required for approval. A pending/lost response is reconciled from exact native readback; a conflicting claim, changed workspace/checkpoint, missing profile, pause, or ambiguous state remains held without a duplicate unblock/reassign.
+
+This policy has no historical sweep. Enabling it does not adopt old blocked cards. For one **already-bound** RM03-shaped hold whose implementation recovery budget is exhausted, an operator can use the public task-scoped catch-up control after inspecting its native task/runs: `POST /runtime-escalation/catch-up` with `{"board":"default","task_id":"TASK_ID"}`. It admits only the exact latest started-worker iteration-exhaustion event, intact original binding/workspace, exhausted implementation budget, and at least one genuine prior `changes_requested` reviewer verdict. It persists the complete task contract, all prior reviewer findings, exact failure, and dirty checkpoint; it does not unblock, reassign, accept, clean, replace, or sweep any card. The next real dispatch tick reconciles that exact intent. The fresh escalated coder's first normal-tool admission receives the packet and must inspect/continue existing changes rather than accept or clean them. Runtime escalation consumes no recovery grants and never refunds the two already-spent phase recoveries.
+
+### RM-03 operator catch-up (documentation only, not executed)
+
+After a separately authorized installation, the operator can opt in on the existing board with `PUT /runtime-escalation` and body `{"board":"default","enabled":true,"max_attempts":1}`. Omitted profile selectors reuse that board's configured escalation implementation and post-escalation reviewer (`worker-code-terra` and `worker-review-terra` in the RM-03 case). Runtime escalation requires distinct profiles and permits exactly one attempt. Enabling records the current native run watermark, so old blocked failures are not swept.
+
+Then explicitly select the existing task with `POST /runtime-escalation/catch-up` and body `{"board":"default","task_id":"t_57851039"}`. The control reads and validates its actual latest failed run, complete genuine prior findings, immutable binding, spent implementation budget and dirty worktree. It persists an intent only. Repeating that request returns the same durable intent; the next real dispatch tick performs native unblock/reassignment and verifies the exact events without creating another task or worktree. Never fake a review verdict or lower the ordinary correction limit to make it eligible.
+
+If a native effect is ambiguous, a checkpoint/owner/profile changes, or the bounded stronger attempt fails, the runtime intent remains held with a diagnostic reason. Neither recovery nor correction budgets are refunded. The coder's first normal tool is refused once with the durable continuation context, then only the exact admitted run may use tools. A fresh independent post-escalation review is still mandatory. Runtime status/hold reason and original/effective routing are exposed in dashboard telemetry.
+
+**This repository change does not enable either control on the live board, resume RM-03, touch its dirty files, or authorize deployment.**
+
 ## Optional autonomous failed-run recovery
 
 Recovery is **off by default** and has explicit dashboard enable/pause controls per board. When enabled, the installed plugin's real `on_kanban_dispatch_tick` hook may adopt only one unbound RM02-class card: exactly one post-watermark implementation run, terminal `gave_up`, a same-run native `spawned` record, `trigger_outcome: timed_out`, `effective_limit: 1`, matching positive `budget_used`/`budget_max`, and the native `Iteration budget exhausted (...)` error classification. This is intentionally the started-worker 180-iteration exhaustion class evidenced by RM02 run 2247—not `spawn_failed`, ordinary wall-clock timeout, a manual hold, or another historical failure. It also requires the exact implementation `claimed` source phase. It refuses every other historical card. Before supported native unblock it atomically persists the immutable binding, bounded Git checkpoint, identity `(board, task, failed-run, phase)`, one intent, a durable phase budget, and a shared-workspace lease. A review failure resumes review and retains the review handoff.
@@ -92,12 +107,12 @@ This is a model-tool policy gate, **not a shell/database/operator sandbox**. Nat
 
 ## Dashboard and troubleshooting
 
-The page offers selectors, explicit enrollment, and read-only native snapshots. It distinguishes lane, inferred phase, native run lifecycle, and process liveness. Process liveness is **unknown, not probed**. Refresh runs every 15 seconds; stale/unavailable warnings mean retained values are not current activity or success.
+The page offers selectors, explicit enrollment for an already-materialized worktree, and read-only native snapshots. It distinguishes lane, inferred phase, native run lifecycle, and process liveness. Process liveness is **unknown, not probed**. Refresh runs every 15 seconds; stale/unavailable warnings mean retained values are not current activity or success.
 
 Counts describe scoped native states, not throughput or OS process counts: implementation claims, queued/claimed reviews, work awaiting correction, verified approved/done cards, and failures/holds. Unknown counts are not zero. Cards show board/task identifiers, bound profiles, summaries, findings, observation time, and next steps. Reads never dispatch or transition work.
 
 - **Missing profile:** restore the bound profile; changing defaults does not reroute existing work. Verify plugin registration/provider readiness before release.
-- **Enrollment refused:** create an initially blocked card, classify it `needs_input`, and enroll before any run. Executed work is not normally adopted; the sole exception is the narrowly evidenced RM02 started-worker iteration-exhaustion class above. A `needs_input` hold is always an operator decision and is never auto-retried.
+- **Enrollment refused:** new board-policy work should use `--workspace worktree:<absolute-repo-root>` and native dispatch; first-run binding is automatic before model tools. Explicit enrollment rejects tasks without a concrete linked worktree, no prior native runs, and an operator-parked `needs_input` state. Executed work is not normally adopted; the sole exception is the narrowly evidenced RM02 started-worker iteration-exhaustion class above. A `needs_input` hold is always an operator decision and is never auto-retried.
 - **Stale candidate/evidence:** inspect changed files and native history; do not approve a candidate different from the handoff.
 - **Worker failure/ordinary exit:** inspect `hermes kanban --board BOARD show TASK_ID`, `hermes kanban --board BOARD runs TASK_ID`, and `hermes kanban --board BOARD log TASK_ID`. Recover through native operations without forcing completion.
 - **Review limit/escalation:** inspect the latest findings and persisted routing. With escalation disabled or its attempt budget exhausted, no further automatic correction is granted; resolve the hold deliberately through native Kanban.

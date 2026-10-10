@@ -5,6 +5,7 @@ import sys
 
 import pytest
 
+from test_runtime_safety import runtime
 from local_first_review import plugin, state
 
 
@@ -79,6 +80,30 @@ def test_effective_escalation_route_requires_exact_current_run_and_profile(monke
     monkeypatch.setattr(plugin, "worker_profile", lambda: "other")
     refused = plugin.guard("terminal", {})
     assert refused and refused["action"] == "block" and "Effective escalation route" in refused["message"]
+
+
+def test_runtime_coder_context_is_not_delivered_to_the_post_escalation_reviewer(monkeypatch):
+    from local_first_review import runtime_escalation
+    monkeypatch.setattr(runtime_escalation, 'admit', lambda *_: None)
+    monkeypatch.setattr(plugin, '_show', lambda *_: {})
+    binding = _binding()
+    runtime = {"binding": binding, "intent": {"status": "routed"},
+               "attempts": [{"implementation_profile": "terra", "reviewer_profile": "terra-review"}],
+               "coder_context": {"checkpoint": {}}}
+    delivered = []
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "22")
+    monkeypatch.setenv("HERMES_PROFILE", "terra-review")
+    monkeypatch.setattr(plugin, "runtime_escalation_entry", lambda *_: runtime)
+    monkeypatch.setattr(plugin, "_routed_escalation_guard", lambda *_: None)
+    monkeypatch.setattr(plugin, "task_binding", lambda *_: binding)
+    monkeypatch.setattr(plugin, "trusted_routing", lambda *_: {"implementation_profile": "terra", "reviewer_profile": "terra-review"})
+    monkeypatch.setattr(plugin, "worker_profile", lambda: "terra-review")
+    monkeypatch.setattr(plugin, "deliver_runtime_coder_context", lambda *args: delivered.append(args) or {"checkpoint": {}})
+    monkeypatch.setattr(plugin, "recovery_entry", lambda *_: None)
+
+    assert plugin.guard("terminal", {}) is None
+    assert delivered == []
 
 
 def test_reconciled_escalation_still_refuses_direct_lifecycle_bypass(monkeypatch):
@@ -221,7 +246,49 @@ def test_terminal_before_admission_requires_one_exact_ended_replacement(monkeypa
     assert not plugin._terminal_unadmitted_replacement(show, entry)
 
 
+def test_reserve_recovery_rejects_workspace_bound_to_another_board(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda _: True)
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("board-a", activation_id="a", native_run_watermark=0)
+    state.activate_board("board-b", activation_id="b", native_run_watermark=0)
+    first = {"board": "board-a", "task_id": "task-a", "implementation_profile": "impl",
+             "reviewer_profile": "review", "workspace_path": "/shared-linked-worktree"}
+    second = {"board": "board-b", "task_id": "task-b", "implementation_profile": "impl",
+              "reviewer_profile": "review", "workspace_path": "/shared-linked-worktree"}
+    current = state.load_state()
+    current["tasks"]["board-a:task-a"] = first
+    state.save_state(current)
+
+    with pytest.raises(ValueError, match="already bound"):
+        state.reserve_recovery("board-b", "task-b", failed_run_id=2, phase="implementation",
+                               workspace_path="/shared-linked-worktree", checkpoint={}, binding=second, adopted=True)
+
+    persisted = state.load_state()
+    assert state.task_binding("task-b", "board-b") is None
+    assert "board-b:task-b:2:implementation" not in persisted["recovery"]
+    assert persisted["recovery_budgets"].get("board-b:task-b:implementation", 0) == 0
+
+
+def test_adopted_recovery_rejects_unmaterialized_worktree(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda _: True)
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("default", activation_id="adoption", native_run_watermark=0)
+    binding = _binding()
+
+    with pytest.raises(ValueError, match="materialized task-scoped linked worktree"):
+        state.reserve_recovery("default", "task", failed_run_id=1, phase="implementation",
+                               workspace_path="/work", checkpoint={}, binding=binding, adopted=True)
+
+    assert state.task_binding("task", "default") is None
+    assert state.load_state()["recovery"] == {}
+
+
 def test_phase_budget_and_workspace_lease_survive_native_counter_reset(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"; monkeypatch.setattr(state, "state_path", lambda: path); monkeypatch.setattr(state, "profile_exists", lambda _: True)
     binding = _binding(); state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {"default": {"activation_id": "a", "native_run_watermark": 0, "implementation_profile": "impl", "reviewer_profile": "review"}}})
     state.reserve_recovery("default", "task", failed_run_id=1, phase="implementation", workspace_path="/work", checkpoint={}, binding=binding, adopted=True)
@@ -234,6 +301,7 @@ def test_phase_budget_and_workspace_lease_survive_native_counter_reset(tmp_path,
 
 def test_configured_phase_budget_counts_distinct_failed_runs_across_restart_and_policy_changes(tmp_path, monkeypatch):
     """Each failed native run consumes one durable per-phase grant, never a toggle."""
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"
     monkeypatch.setattr(state, "state_path", lambda: path)
     monkeypatch.setattr(state, "profile_exists", lambda _: True)
@@ -268,6 +336,135 @@ def test_configured_phase_budget_counts_distinct_failed_runs_across_restart_and_
     assert third["failed_run_id"] == 3
 
 
+def test_runtime_reconciliation_recovers_lost_unblock_response_from_exact_ready_readback(runtime, monkeypatch):
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'reassign_attempted')
+    show['task'].update(status='ready', assignee='strong')
+    show['events'].extend([
+        {'id':21,'kind':'unblocked','run_id':None,'payload':None},
+        {'id':22,'kind':'assigned','run_id':None,'payload':{'assignee':'strong','from':'impl'}},
+    ])
+    monkeypatch.setattr(plugin, '_dispatch', lambda *_: pytest.fail('must not resend known applied effect'))
+    assert plugin._reconcile_runtime_exhaustion_escalation('task', 'default', entry)
+    assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'routed'
+
+
+def test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preserves_binding(tmp_path, monkeypatch):
+    from local_first_review import native
+    monkeypatch.setattr(native, "board_run_watermark", lambda _: 0)
+    """Runtime escalation is a separately opted-in, task-scoped replacement route."""
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
+    path = tmp_path / "state.json"
+    monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda name: name in {"impl", "review", "terra", "terra-review"})
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review",
+                      "tasks": {}, "boards": {}})
+    state.activate_board("default", activation_id="runtime-escalation", native_run_watermark=0)
+    state.set_recovery_policy("default", enabled=True, max_per_phase=2)
+    state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
+                                        implementation_profile="terra", reviewer_profile="terra-review")
+    with pytest.raises(ValueError, match="runtime escalation policy"):
+        state.set_runtime_escalation_policy("default", enabled=True, max_attempts=2,
+                                            implementation_profile="terra", reviewer_profile="terra-review")
+    with pytest.raises(ValueError, match="distinct implementation"):
+        state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
+                                            implementation_profile="terra", reviewer_profile="terra")
+    binding = _binding()
+    for failed_run_id in (2271, 2272):
+        state.reserve_recovery("default", "task", failed_run_id=failed_run_id, phase="implementation",
+                               workspace_path="/work", checkpoint={"head": "a" * 40, "dirty": []},
+                               binding=binding, adopted=failed_run_id == 2271)
+        state.terminalize_recovery("default", "task", failed_run_id, "implementation", "native_terminal")
+
+    entry = state.reserve_runtime_escalation("default", "task", failed_run_id=2273,
+                                             phase="implementation", binding=binding,
+                                             checkpoint={"head": "b" * 40, "dirty": ["partial"]},
+                                             failure={"run_id": 2273, "event_id": 1, "kind": "gave_up", "payload": {}},
+                                             workspace_path="/work")
+    assert entry["intent"]["status"] == "unblock_requested"
+    assert entry["binding"] == binding
+    assert state.task_binding("task", "default") == binding
+    assert state.reserve_runtime_escalation("default", "task", failed_run_id=2273,
+                                            phase="implementation", binding=binding,
+                                            checkpoint={"head": "b" * 40, "dirty": ["partial"]},
+                                            failure={"run_id": 2273, "event_id": 1, "kind": "gave_up", "payload": {}},
+                                            workspace_path="/work") == entry
+    unexhausted = dict(binding, task_id="unexhausted", workspace_path="/other")
+    state.reserve_recovery("default", "unexhausted", failed_run_id=1, phase="implementation",
+                           workspace_path="/other", checkpoint={}, binding=unexhausted, adopted=True)
+    with pytest.raises(ValueError, match="not exhausted"):
+        state.reserve_runtime_escalation("default", "unexhausted", failed_run_id=2,
+                                         phase="implementation", binding=unexhausted, checkpoint={},
+                                         failure={"run_id": 2, "event_id": 2, "kind": "gave_up", "payload": {}},
+                                         workspace_path="/other")
+
+
+def test_explicit_runtime_catchup_preserves_bound_history_and_durable_coder_context(tmp_path, monkeypatch):
+    from local_first_review import native
+    monkeypatch.setattr(native, "board_run_watermark", lambda _: 0)
+    """An operator targets one already-bound RM03 hold; this is not a board sweep."""
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
+    path = tmp_path / "state.json"
+    monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda name: name in {"impl", "review", "terra", "terra-review"})
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review",
+                      "tasks": {}, "boards": {}})
+    state.activate_board("default", activation_id="catchup", native_run_watermark=0)
+    state.set_recovery_policy("default", enabled=True, max_per_phase=2)
+    state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
+                                        implementation_profile="terra", reviewer_profile="terra-review")
+    binding = _binding()
+    for failed_run_id in (1, 2):
+        state.reserve_recovery("default", "task", failed_run_id=failed_run_id, phase="implementation",
+                               workspace_path="/work", checkpoint={"head": "a" * 40, "dirty": []},
+                               binding=binding, adopted=failed_run_id == 1)
+        state.terminalize_recovery("default", "task", failed_run_id, "implementation", "native_terminal")
+    failure = {"run_id": 3, "event_id": 30, "kind": "gave_up", "payload": {"budget_used": 180, "budget_max": 180}}
+    context = {"original_contract": {"title": "Finish RM03", "body": "Keep the existing dirty checkpoint."},
+               "reviewer_findings": [{"run_id": 9, "rationale": "Cover the rejected edge case."}],
+               "latest_failure": failure,
+               "checkpoint": {"head": "b" * 40, "dirty": [{"path": "partial.py", "sha256": "c" * 64}]}}
+
+    entry = state.adopt_runtime_escalation("default", "task", failed_run_id=3, phase="implementation",
+                                           binding=binding, checkpoint=context["checkpoint"], failure=failure,
+                                           workspace_path="/work", coder_context=context)
+
+    assert entry["intent"]["status"] == "catchup_requested"
+    assert entry["binding"] == binding
+    assert entry["coder_context"] == context
+    stored = state.load_state()
+    assert stored["tasks"]["default:task"] == binding
+    assert stored["recovery_budgets"]["default:task:implementation"] == 2
+    assert stored["recovery"]
+
+
+def test_runtime_intent_requires_exact_failure_checkpoint_and_lease(tmp_path, monkeypatch):
+    from local_first_review import native
+    monkeypatch.setattr(native, "board_run_watermark", lambda _: 0)
+    """A runtime route is not a generic unblock: it binds the failed event and workspace lease."""
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
+    path = tmp_path / "state.json"; monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda name: name in {"impl", "review", "terra", "terra-review"})
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("default", activation_id="runtime-contract", native_run_watermark=0)
+    state.set_recovery_policy("default", enabled=True, max_per_phase=1)
+    state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
+                                        implementation_profile="terra", reviewer_profile="terra-review")
+    binding = _binding()
+    state.reserve_recovery("default", "task", failed_run_id=1, phase="implementation", workspace_path="/work",
+                           checkpoint={"head": "a" * 40, "dirty": []}, binding=binding, adopted=True)
+    state.terminalize_recovery("default", "task", 1, "implementation", "native_terminal")
+
+    failure = {"run_id": 2, "event_id": 21, "kind": "gave_up", "payload": {"budget_used": 180, "budget_max": 180}}
+    checkpoint = {"head": "a" * 40, "dirty": [{"path": "partial.txt", "sha256": "b" * 64}]}
+    entry = state.reserve_runtime_escalation("default", "task", failed_run_id=2, phase="implementation",
+                                             binding=binding, checkpoint=checkpoint, failure=failure,
+                                             workspace_path="/work")
+    assert entry["failure"] == failure
+    assert entry["checkpoint"] == checkpoint
+    assert state.load_state()["workspace_leases"]["/work"] == "default:task:2:runtime_escalation"
+
+
 def test_recovery_policy_rejects_zero_boolean_fractional_negative_and_excessive_limits(tmp_path, monkeypatch):
     path = tmp_path / "state.json"
     monkeypatch.setattr(state, "state_path", lambda: path)
@@ -284,6 +481,7 @@ def test_recovery_policy_rejects_zero_boolean_fractional_negative_and_excessive_
 
 
 def test_verified_implementation_handoff_terminalizes_only_its_exact_recovery(tmp_path, monkeypatch):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"
     monkeypatch.setattr(state, "state_path", lambda: path)
     monkeypatch.setattr(state, "profile_exists", lambda _: True)
@@ -310,6 +508,7 @@ def test_verified_implementation_handoff_terminalizes_only_its_exact_recovery(tm
     ("review", 2, 2),
 ])
 def test_implementation_handoff_recovery_refuses_wrong_run_phase_or_missing_receipt(tmp_path, monkeypatch, phase, authorized_run, receipt_run):
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"
     monkeypatch.setattr(state, "state_path", lambda: path)
     monkeypatch.setattr(state, "profile_exists", lambda _: True)
@@ -386,7 +585,7 @@ def test_lost_native_handoff_response_still_terminalizes_exact_recovery(monkeypa
 
 
 def _unbound_rm02_show(task_id: str, run_id: int, *, workspace: str = "/work") -> dict:
-    return {"task": {"id": task_id, "status": "blocked", "workspace_kind": "dir",
+    return {"task": {"id": task_id, "status": "blocked", "workspace_kind": "worktree",
                      "workspace_path": workspace, "assignee": "impl"},
             "runs": [{"id": run_id, "profile": "impl", "outcome": "gave_up"}],
             "events": []}
@@ -399,7 +598,7 @@ def _watchdog_recovery_mocks(monkeypatch, shows: dict[str, dict]):
               "recovery": {"enabled": True, "max_per_phase": 1}}
     recoveries, reservations, unblocks = {}, [], []
     monkeypatch.setattr(plugin, "board_policy", lambda _: policy)
-    monkeypatch.setattr(state, "load_state", lambda: {"tasks": {}})
+    monkeypatch.setattr(state, "load_state", lambda: {"tasks": {}, "runtime_escalations": {}})
     monkeypatch.setattr(plugin, "_show", lambda task_id: shows[task_id])
     monkeypatch.setattr(plugin, "_allowed_terminal_failure", lambda *_: True)
     monkeypatch.setattr(plugin, "_failed_phase", lambda *_: "implementation")
@@ -466,7 +665,7 @@ def test_ambiguous_unbound_history_does_not_skip_bound_recovery_reconciliation(m
              "bound": {"task": {"id": "bound", "status": "running"}, "runs": [], "events": []}}
     reconciled = []
     monkeypatch.setattr(plugin, "board_policy", lambda _: policy)
-    monkeypatch.setattr(state, "load_state", lambda: {"tasks": {"default:bound": bound}})
+    monkeypatch.setattr(state, "load_state", lambda: {"tasks": {"default:bound": bound}, "runtime_escalations": {}})
     monkeypatch.setattr(plugin, "_show", lambda task_id: shows[task_id])
     monkeypatch.setattr(plugin, "_first_unbound_gave_up",
                         lambda _policy, show: (show["runs"][0], "implementation") if show["runs"] else None)
