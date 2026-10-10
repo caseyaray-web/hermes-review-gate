@@ -19,8 +19,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from local_first_review.state import (ESCALATION_MAX_ATTEMPTS_LIMIT, MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT,
-                                      activate_board, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
-                                      set_escalation_policy, set_recovery_policy, set_runtime_escalation_policy, trusted_routing)
+                                      activate_board, adopt_runtime_escalation, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
+                                      recovery_budget_exhausted, runtime_escalation_entry, set_escalation_policy, set_recovery_policy, set_runtime_escalation_policy, task_binding, trusted_routing)
 
 router = APIRouter()
 COUNT_NAMES = (
@@ -78,6 +78,13 @@ class RuntimeEscalationControl(BaseModel):
     max_attempts: StrictInt = Field(ge=1, le=ESCALATION_MAX_ATTEMPTS_LIMIT)
     implementation_profile: str | None = Field(default=None, min_length=1, max_length=128)
     reviewer_profile: str | None = Field(default=None, min_length=1, max_length=128)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RuntimeCatchupControl(BaseModel):
+    board: str = Field(min_length=1, max_length=64)
+    task_id: str = Field(min_length=1, max_length=128)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -589,3 +596,65 @@ def runtime_escalation_control(body: RuntimeEscalationControl) -> dict[str, Any]
         raise HTTPException(409, str(exc)) from exc
     return {"policy": policy,
             "message": "Runtime-exhaustion escalation is enabled for future exhausted recoveries" if body.enabled else "Runtime-exhaustion escalation is disabled"}
+
+
+def _runtime_catchup_context(task: dict[str, Any], runs: list[dict[str, Any]], events: list[dict[str, Any]],
+                             binding: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Prove one existing RM03 hold and freeze its bounded fresh-coder packet."""
+    from local_first_review import plugin
+    if task.get("status") != "blocked" or task.get("assignee") != binding.get("implementation_profile"):
+        raise ValueError("runtime catch-up requires the original bound implementation hold")
+    if not runs:
+        raise ValueError("runtime catch-up requires native run history")
+    show = {"task": task, "runs": runs, "events": events}
+    failed = runs[-1]
+    run_id = failed.get("id") if isinstance(failed, dict) else None
+    if (not isinstance(failed, dict) or type(run_id) is not int or plugin._failed_phase(show, failed) != "implementation"
+            or not plugin._allowed_terminal_failure(show, failed)):
+        raise ValueError("runtime catch-up requires the latest exact implementation iteration-exhaustion failure")
+    failure = plugin._runtime_failure_record(show, run_id)
+    workspace = task.get("workspace_path")
+    if failure is None or not isinstance(workspace, str) or workspace != binding.get("workspace_path"):
+        raise ValueError("runtime catch-up native failure or workspace evidence is invalid")
+    findings = []
+    for run in runs:
+        if not isinstance(run, dict) or run.get("outcome") != "changes_requested" or run.get("ended_at") is None:
+            continue
+        run_id = run.get("id")
+        if _claimed_source_status(events, run_id) != "review":
+            continue
+        if not any(event.get("kind") == "changes_requested" and event.get("run_id") == run_id for event in events):
+            continue
+        metadata = run.get("metadata")
+        review = metadata.get("local_first_review") if isinstance(metadata, dict) else None
+        findings.append({"run_id": run_id, "summary": run.get("summary"), "metadata": review})
+    if not findings:
+        raise ValueError("runtime catch-up requires one prior genuine reviewer changes-requested verdict")
+    checkpoint = plugin._workspace_checkpoint(workspace)
+    context = {"original_contract": dict(task), "reviewer_findings": findings,
+               "latest_failure": failure, "checkpoint": checkpoint}
+    return failure, checkpoint, context
+
+
+@router.post("/runtime-escalation/catch-up")
+def runtime_escalation_catchup(body: RuntimeCatchupControl) -> dict[str, Any]:
+    """Explicitly adopt one already-bound RM03 hold; native state stays untouched."""
+    try:
+        task, runs, events = _observe_task(body.board, body.task_id)
+        binding = task_binding(body.task_id, body.board)
+        if task is None or binding is None:
+            raise ValueError("runtime catch-up requires an existing immutable task binding")
+        if runtime_escalation_entry(body.task_id, body.board) is not None:
+            raise ValueError("runtime catch-up already has an escalation intent")
+        if not recovery_budget_exhausted(body.board, body.task_id, "implementation"):
+            raise ValueError("runtime catch-up requires an exhausted implementation recovery budget")
+        failure, checkpoint, context = _runtime_catchup_context(task, runs, events, binding)
+        entry = adopt_runtime_escalation(body.board, body.task_id, failed_run_id=failure["run_id"], phase="implementation",
+                                         binding=binding, checkpoint=checkpoint, failure=failure,
+                                         workspace_path=binding["workspace_path"], coder_context=context)
+    except TelemetryUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"runtime_escalation": entry,
+            "message": "Catch-up intent is durable; the next real dispatch tick must reconcile this exact task."}

@@ -353,6 +353,43 @@ def test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preser
                                          workspace_path="/other")
 
 
+def test_explicit_runtime_catchup_preserves_bound_history_and_durable_coder_context(tmp_path, monkeypatch):
+    """An operator targets one already-bound RM03 hold; this is not a board sweep."""
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
+    path = tmp_path / "state.json"
+    monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda name: name in {"impl", "review", "terra", "terra-review"})
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review",
+                      "tasks": {}, "boards": {}})
+    state.activate_board("default", activation_id="catchup", native_run_watermark=0)
+    state.set_recovery_policy("default", enabled=True, max_per_phase=2)
+    state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
+                                        implementation_profile="terra", reviewer_profile="terra-review")
+    binding = _binding()
+    for failed_run_id in (1, 2):
+        state.reserve_recovery("default", "task", failed_run_id=failed_run_id, phase="implementation",
+                               workspace_path="/work", checkpoint={"head": "a" * 40, "dirty": []},
+                               binding=binding, adopted=failed_run_id == 1)
+        state.terminalize_recovery("default", "task", failed_run_id, "implementation", "native_terminal")
+    failure = {"run_id": 3, "event_id": 30, "kind": "gave_up", "payload": {"budget_used": 180, "budget_max": 180}}
+    context = {"original_contract": {"title": "Finish RM03", "body": "Keep the existing dirty checkpoint."},
+               "reviewer_findings": [{"run_id": 9, "rationale": "Cover the rejected edge case."}],
+               "latest_failure": failure,
+               "checkpoint": {"head": "b" * 40, "dirty": [{"path": "partial.py", "sha256": "c" * 64}]}}
+
+    entry = state.adopt_runtime_escalation("default", "task", failed_run_id=3, phase="implementation",
+                                           binding=binding, checkpoint=context["checkpoint"], failure=failure,
+                                           workspace_path="/work", coder_context=context)
+
+    assert entry["intent"]["status"] == "catchup_requested"
+    assert entry["binding"] == binding
+    assert entry["coder_context"] == context
+    stored = state.load_state()
+    assert stored["tasks"]["default:task"] == binding
+    assert stored["recovery_budgets"]["default:task:implementation"] == 2
+    assert stored["recovery"]
+
+
 def test_runtime_intent_requires_exact_failure_checkpoint_and_lease(tmp_path, monkeypatch):
     """A runtime route is not a generic unblock: it binds the failed event and workspace lease."""
     monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)

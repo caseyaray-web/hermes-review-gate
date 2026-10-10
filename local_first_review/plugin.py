@@ -11,10 +11,10 @@ from contextvars import ContextVar
 from typing import Any
 
 from .state import (MAX_CHANGES, authorize_recovery_run, bind_first_owned_run, board_name, board_policy,
-                    current_escalation_attempt, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, publish_runtime_escalation_routing,
+                    current_escalation_attempt, deliver_runtime_coder_context, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, publish_runtime_escalation_routing,
                     reconcile_pending_escalation, recovery_budget_exhausted, recovery_entry, reserve_runtime_escalation, runtime_escalation_entry,
                     reserve_escalation, reserve_recovery, task_binding, terminalize_implementation_handoff_recovery,
-                    terminalize_recovery, trusted_routing, update_recovery_identity, worker_profile)
+                    terminalize_recovery, trusted_routing, update_recovery_identity, update_runtime_escalation_intent, worker_profile)
 
 _CONTEXT: Any | None = None
 # Native reassignment can synchronously run the dispatch-tick hook before its
@@ -860,7 +860,11 @@ def _runtime_failure_record(show: dict[str, Any], failed_run_id: int) -> dict[st
 def _reconcile_runtime_exhaustion_escalation(task_id: str, board: str, entry: dict[str, Any]) -> bool:
     """Resume one exact blocked exhausted task, then route its existing worktree."""
     binding = task_binding(task_id, board)
-    if entry.get("intent", {}).get("status") != "unblock_requested":
+    status = entry.get("intent", {}).get("status")
+    if status == "catchup_requested":
+        entry = update_runtime_escalation_intent(board, task_id, "unblock_requested")
+        status = "unblock_requested"
+    if status != "unblock_requested":
         return False
     attempt = entry.get("attempts", [{}])[-1]
     target = attempt.get("implementation_profile") if isinstance(attempt, dict) else None
@@ -1070,6 +1074,9 @@ def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | N
                 admission = _routed_escalation_guard(task_id, board_name(), runtime)
                 if admission:
                     return admission
+                packet = deliver_runtime_coder_context(board_name(), task_id, _run_id())
+                if packet is not None:
+                    return {"action": "block", "message": "Fresh runtime catch-up coder context (inspect and continue the existing dirty checkpoint; do not accept or clean it): " + json.dumps(packet, sort_keys=True)}
             pending = escalation_entry(task_id, board_name())
             if pending and current_escalation_attempt(pending).get("intent", {}).get("status") == "changes_requested_pending":
                 # Only the exact newly assigned target claim may turn a pending

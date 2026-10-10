@@ -51,7 +51,7 @@ def phase_budget_key(board: str, task_id: str, phase: str) -> str:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 8, "implementation_profile": None, "reviewer_profile": None,
+    return {"version": 9, "implementation_profile": None, "reviewer_profile": None,
             "tasks": {}, "boards": {}, "recovery": {}, "recovery_budgets": {}, "workspace_leases": {},
             "escalations": {}, "runtime_escalations": {}, "effective_routing": {}}
 
@@ -139,13 +139,17 @@ def _migrate(data: Any) -> dict[str, Any]:
                 binding = entry.get("binding")
                 if isinstance(binding, dict):
                     entry.setdefault("workspace_path", binding.get("workspace_path"))
+    if data.get("version") == 8:
+        # v8 intents predate explicit catch-up context. They remain auditable,
+        # but only a new task-scoped adoption carries a fresh coder packet.
+        data = dict(data); data["version"] = 9
     return data
 
 
 def _validate(data: Any) -> dict[str, Any]:
     data = _migrate(data)
     required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases", "escalations", "runtime_escalations", "effective_routing")
-    if data.get("version") != 8 or any(not isinstance(data.get(k), dict) for k in required_roots):
+    if data.get("version") != 9 or any(not isinstance(data.get(k), dict) for k in required_roots):
         raise ValueError("review-gate configuration has an invalid shape")
     for key, binding in data["tasks"].items():
         if not isinstance(key, str) or not isinstance(binding, dict):
@@ -207,6 +211,11 @@ def _validate(data: Any) -> dict[str, Any]:
                     or failure.get("kind") != "gave_up" or not isinstance(failure.get("payload"), dict)
                     or not isinstance(checkpoint, dict)):
                 raise ValueError("runtime escalation evidence is invalid")
+        context = entry.get("coder_context")
+        if context is not None:
+            if entry.get("legacy_unverifiable"):
+                raise ValueError("legacy runtime escalation cannot carry coder context")
+            _runtime_coder_context(context, failure=entry["failure"], checkpoint=entry["checkpoint"])
         for number, attempt in enumerate(entry["attempts"], start=1):
             if (not isinstance(attempt, dict) or attempt.get("attempt") != number
                     or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))
@@ -321,9 +330,31 @@ def runtime_escalation_entry(task_id: str, board: str | None = None) -> dict[str
     return load_state()["runtime_escalations"].get(binding_key(board or board_name(), task_id))
 
 
+def _runtime_coder_context(value: Any, *, failure: dict[str, Any], checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Validate the bounded packet delivered to a fresh escalated coder run."""
+    fields = {"original_contract", "reviewer_findings", "latest_failure", "checkpoint"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("runtime coder context is invalid")
+    contract, findings = value.get("original_contract"), value.get("reviewer_findings")
+    if (not isinstance(contract, dict) or not contract or not isinstance(findings, list) or not findings
+            or value.get("latest_failure") != failure or value.get("checkpoint") != checkpoint):
+        raise ValueError("runtime coder context is incomplete")
+    try:
+        encoded = json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("runtime coder context is invalid") from exc
+    if len(encoded.encode()) > 65536 or len(findings) > 32:
+        raise ValueError("runtime coder context exceeds its bounded limit")
+    for finding in findings:
+        if not isinstance(finding, dict) or type(finding.get("run_id")) is not int or finding["run_id"] <= 0:
+            raise ValueError("runtime coder context reviewer findings are invalid")
+    return json.loads(encoded)
+
+
 def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, phase: str,
                                 binding: dict[str, Any], checkpoint: dict[str, Any], failure: dict[str, Any],
-                                workspace_path: str) -> dict[str, Any]:
+                                workspace_path: str, coder_context: dict[str, Any] | None = None,
+                                catchup: bool = False) -> dict[str, Any]:
     """Reserve one auditable replacement route before any native lifecycle effect."""
     if phase != "implementation" or type(failed_run_id) is not int or failed_run_id <= 0:
         raise ValueError("runtime escalation identity is invalid")
@@ -337,6 +368,10 @@ def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, 
             or failure.get("kind") != "gave_up" or not isinstance(failure.get("payload"), dict)
             or not isinstance(checkpoint, dict) or not same_workspace):
         raise ValueError("runtime escalation evidence is invalid")
+    if catchup and coder_context is None:
+        raise ValueError("explicit runtime catch-up requires coder context")
+    if coder_context is not None:
+        coder_context = _runtime_coder_context(coder_context, failure=failure, checkpoint=checkpoint)
     key, budget = binding_key(board, task_id), phase_budget_key(board, task_id, phase)
     lease_key = f"{board}:{task_id}:{failed_run_id}:runtime_escalation"
     with locked_state(write=True) as data:
@@ -350,7 +385,8 @@ def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, 
         existing = data["runtime_escalations"].get(key)
         if existing is not None:
             if (existing.get("binding") != binding or existing.get("failed_run_id") != failed_run_id
-                    or existing.get("failure") != failure or existing.get("checkpoint") != checkpoint):
+                    or existing.get("failure") != failure or existing.get("checkpoint") != checkpoint
+                    or (coder_context is not None and existing.get("coder_context") != coder_context)):
                 raise ValueError("runtime escalation identity conflicts with an existing intent")
             return json.loads(json.dumps(existing))
         recovery = _recovery_settings(policy.get("recovery", {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}))
@@ -363,13 +399,51 @@ def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, 
             raise ValueError("workspace escalation lease is held by another task")
         attempt = {"attempt": 1, "implementation_profile": settings["implementation_profile"],
                    "reviewer_profile": settings["reviewer_profile"],
-                   "intent": {"status": "unblock_requested", "checkpoint": dict(checkpoint)}}
+                   "intent": {"status": "catchup_requested" if catchup else "unblock_requested", "checkpoint": dict(checkpoint)}}
         entry = {"board": board, "task_id": task_id, "binding": dict(binding), "failed_run_id": failed_run_id,
                  "phase": phase, "workspace_path": workspace_path, "failure": dict(failure), "checkpoint": dict(checkpoint),
                  "consumed_attempts": 1, "intent": dict(attempt["intent"]), "attempts": [attempt]}
+        if coder_context is not None:
+            entry["coder_context"] = coder_context
         data["runtime_escalations"][key] = entry
         data["workspace_leases"][workspace_path] = lease_key
         return json.loads(json.dumps(entry))
+
+
+def adopt_runtime_escalation(board: str, task_id: str, **evidence: Any) -> dict[str, Any]:
+    """Persist one operator-selected historical RM03 catch-up intent only."""
+    return reserve_runtime_escalation(board, task_id, catchup=True, **evidence)
+
+
+def update_runtime_escalation_intent(board: str, task_id: str, status: str) -> dict[str, Any]:
+    if status not in {"unblock_requested", "routed"}:
+        raise ValueError("runtime escalation intent status is invalid")
+    with locked_state(write=True) as data:
+        entry = data["runtime_escalations"].get(binding_key(board, task_id))
+        if not isinstance(entry, dict):
+            raise ValueError("runtime escalation intent is absent")
+        entry["intent"] = dict(entry.get("intent", {}), status=status)
+        attempts = entry.get("attempts")
+        if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
+            attempts[-1]["intent"] = dict(attempts[-1].get("intent", {}), status=status)
+        return json.loads(json.dumps(entry))
+
+
+def deliver_runtime_coder_context(board: str, task_id: str, run_id: int) -> dict[str, Any] | None:
+    """Return a catch-up packet once for the exact fresh native coder run."""
+    if type(run_id) is not int or run_id <= 0:
+        raise ValueError("runtime coder context run identity is invalid")
+    with locked_state(write=True) as data:
+        entry = data["runtime_escalations"].get(binding_key(board, task_id))
+        if not isinstance(entry, dict) or not isinstance(entry.get("coder_context"), dict):
+            return None
+        delivered = entry.get("coder_context_delivery_run_id")
+        if delivered is None:
+            entry["coder_context_delivery_run_id"] = run_id
+            return json.loads(json.dumps(entry["coder_context"]))
+        if delivered != run_id:
+            raise ValueError("runtime coder context was already delivered to another run")
+        return None
 
 
 def recovery_budget_exhausted(board: str, task_id: str, phase: str) -> bool:
