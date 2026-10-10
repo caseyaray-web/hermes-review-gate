@@ -132,6 +132,29 @@ def test_runtime_unblock_readback_error_is_held_after_transport_attempt(runtime,
     assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
 
 
+def test_single_action_resume_refuses_later_unproven_run_without_state_change(runtime):
+    """A later protocol-failed run cannot be inferred effect-free from its own summary."""
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='legacy no-effect hold')
+    show['runs'].append({'id': 12, 'profile': 'impl', 'status': 'crashed', 'outcome': 'crashed',
+                         'started_at': 3, 'ended_at': 4, 'error': 'protocol violation'})
+    show['events'].extend([
+        {'id': 21, 'kind': 'claimed', 'run_id': 12, 'payload': {'lock': 'worker-lock'}},
+        {'id': 22, 'kind': 'protocol_violation', 'run_id': 12,
+         'payload': {'worker_output': 'Runtime escalation routing is pending; no worker tool is authorized.'}},
+    ])
+    before_state = copy.deepcopy(state.load_state())
+    before_native = copy.deepcopy(show)
+
+    result = runtime_escalation.resume_held('task', 'default')
+
+    assert result['ok'] is False
+    assert 'later native run 12' in result['reason']
+    assert 'the available native snapshot cannot prove it was effect-free' in result['reason']
+    assert state.load_state() == before_state
+    assert show == before_native
+
+
 def test_explicit_held_reconciliation_proves_no_effect_then_allows_one_real_tick(runtime, monkeypatch):
     """A legacy held intent has no receipt; operator proof authorizes, not fakes, it."""
     binding, entry, show = runtime

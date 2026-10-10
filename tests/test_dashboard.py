@@ -231,18 +231,44 @@ def test_shipped_dashboard_exposes_recovery_limit_not_zero_as_pause():
     assert "Use Pause failed-run recovery to stop automatic recovery." in bundle
 
 
-def test_runtime_held_reconciliation_is_explicit_task_scoped_and_defers_effects(monkeypatch):
-    existing = {'board': 'board-a', 'task_id': 'rm03', 'intent': {'status': 'held'}}
+def test_runtime_resume_held_is_one_task_scoped_operator_action(monkeypatch):
+    existing = {'board': 'board-a', 'task_id': 'rm03', 'intent': {'status': 'routed'}}
     calls = []
-    monkeypatch.setattr(plugin_api, 'reauthorize_held', lambda task_id, board: calls.append((task_id, board)) or True)
-    monkeypatch.setattr(plugin_api, 'runtime_escalation_entry', lambda task_id, board: existing)
+    monkeypatch.setattr(plugin_api, 'resume_held', lambda task_id, board:
+                        calls.append((task_id, board)) or {'ok': True, 'runtime_escalation': existing,
+                                                          'message': 'routed'}, raising=False)
+
+    response = client().post('/runtime-escalation/resume-held', json={'board': 'board-a', 'task_id': 'rm03'})
+
+    assert response.status_code == 200
+    assert calls == [('rm03', 'board-a')]
+    assert response.json()['runtime_escalation'] == existing
+    assert response.json()['message'] == 'routed'
+
+
+def test_runtime_resume_held_returns_specific_refusal(monkeypatch):
+    monkeypatch.setattr(plugin_api, 'resume_held', lambda *_:
+                        {'ok': False, 'reason': 'Later native run 2275 cannot be proved effect-free.'}, raising=False)
+
+    response = client().post('/runtime-escalation/resume-held', json={'board': 'default', 'task_id': 't_57851039'})
+
+    assert response.status_code == 409
+    assert response.json()['detail'] == 'Later native run 2275 cannot be proved effect-free.'
+
+
+def test_legacy_runtime_reconcile_route_is_an_alias_for_single_action_resume(monkeypatch):
+    existing = {'board': 'board-a', 'task_id': 'rm03', 'intent': {'status': 'routed'}}
+    calls = []
+    monkeypatch.setattr(plugin_api, 'resume_held', lambda task_id, board:
+                        calls.append((task_id, board)) or {'ok': True, 'runtime_escalation': existing,
+                                                          'message': 'routed'})
 
     response = client().post('/runtime-escalation/reconcile-held', json={'board': 'board-a', 'task_id': 'rm03'})
 
     assert response.status_code == 200
     assert calls == [('rm03', 'board-a')]
     assert response.json()['runtime_escalation'] == existing
-    assert 'next real dispatch tick' in response.json()['message']
+    assert response.json()['message'] == 'routed'
 
 
 def test_runtime_catchup_is_explicit_task_scoped_and_leaves_native_effects_for_a_tick(monkeypatch):

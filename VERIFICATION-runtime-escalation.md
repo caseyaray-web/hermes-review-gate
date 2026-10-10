@@ -2,21 +2,23 @@
 
 ## Scope
 
-Candidate: uncommitted worktree on `fix/runtime-dispatch-transport`, based on `bd27b9a6d88498ac694013402cd7ef7040a63b29`. No installation, deployment, live board/profile/policy mutation, gateway restart, commit, or push was performed.
+Candidate: isolated worktree on `feat/single-action-held-recovery`, based exactly on canonical `main` at `eee7636ea38ea6dece04a5fd2be6bffa7a7046aa`. No installation, deployment, live board/profile/policy mutation, gateway restart, push, or RM-03 worktree change was performed.
 
 ## Current behavior
 
-`POST /runtime-escalation/reconcile-held` is task-scoped and read-only with respect to native state. Under the runtime operation lock it accepts only a legacy held intent with the original immutable binding, enabled distinct configured profiles, matching lease/workspace/checkpoint, exclusive workspace ownership, and a complete native `task`/`runs`/`events` snapshot whose exact final run and event are the persisted failed run/failure event. It persists the detached snapshot and SHA-256 digest as operator no-effect evidence; it never invents a transport receipt, replaces/refunds an attempt, or sends a native effect.
+`POST /runtime-escalation/resume-held` is the single operator action. It proves the legacy held intent under the existing exclusive runtime-operation lock, writes task-scoped no-effect evidence bound to the immutable binding, failed run, dirty checkpoint, complete snapshot and digest, then invokes the supported runtime reconciliation path. Reconciliation reacquires the same lock and rereads authority immediately before its native effects. A race or failed readback fails closed; a retry either returns the already-routed intent without recapturing evidence or repeating effects, or refuses a previously re-held/ambiguous intent. `POST /runtime-escalation/reconcile-held` is retained as a deprecated alias to the same one-action behavior; it no longer stages a separate operator step.
 
-A lost POST response is idempotent: later retries return the existing durable proof without a new snapshot, including after the intent progresses or returns to held. The next real tick pins a shared non-reentrant runtime-operation lock across native unblock/readback/reassignment/routing. The supported runtime-policy writer uses that same lock and fails busy rather than deadlocking if called from an effect seam. The tick rereads current authority immediately before the only unblock send, immediately before reassignment, and again before route publication. If the proof, route, ownership, binding, checkpoint, profile, lease, or pause state changed, it holds without sending the next effect. Transport/readback/reassignment failures remain held and never loop a native effect.
+The operation preserves the original held reason/history, binding, attempt count and recovery budget. It never synthesizes the old missing transport receipt; any transport receipt after resumption is recorded only from the actual supported native operation. Successful response requires native route readback. The normal dispatcher handles the single newly authorized run; the endpoint does not spawn a worker directly. Strong-worker admission pins the exact fresh implementation run, and the existing independent review gate remains in force.
 
-The joined regression models the prior-handler `Unknown tool: kanban_unblock` response with no native effect and no persisted receipt, then uses explicit recovery, a real dispatch tick, strong-worker admission, handoff, and post-review. It also retains no-refund and downstream-gate assertions.
+The current RM-03 incident is intentionally **not cleared**. The complete native snapshot contains a later run (2275) after the original recorded failure. Native task/run/event data records a protocol-failure and worker output stating that tools were unauthorized, but does not provide a structured authoritative per-tool/effect receipt for that run. A worker-output statement and unchanged final dirty checkpoint cannot prove that no implementation effect happened. The new action therefore refuses with the later-run proof failure and leaves native state unchanged. Do not retry or bypass this gate until the native model can supply authoritative effect evidence.
 
-## Historical claims versus current acceptance
+The joined regression models the old `Unknown tool: kanban_unblock` no-effect hold, then uses the public one-action POST, a real native dispatcher tick, strong-worker admission, implementation handoff, and independent post-review. It checks same binding, no attempt refund, actual effect evidence, read-free idempotent replay, and downstream availability only after approval with a separate dispatch/release.
 
-Earlier version of this document reported parent-owned native proofs, a built wheel, independent review GO decisions, and a fully passing suite for another candidate/worktree. Those are historical claims only; they do **not** prove this uncommitted candidate and must not be treated as current acceptance.
+## Acceptance and verification
 
-Current pending acceptance requires the exact full-suite command below, review of the resulting dirty diff, and a parent-owned native proof in an environment that can initialize an isolated native board. Child contexts preserve `HERMES_DELEGATED_CHILD_CONTEXT` / `HERMES_SUPERVISED_CHILD`; they never clear the production guard. When the fresh isolated process cannot initialize the parent-owned native board, the transport regression is skipped honestly and native transport acceptance remains pending.
+The preceding parent proofs, installed artifact, and independent GO decision recorded below refer to the canonical implementation before this branch. They are historical only and do **not** review this candidate.
+
+This candidate was exercised in the parent-owned native fixture context with child guards intact. It does not contact the live RM-03 task. Independent review is still required before any rollout.
 
 ## Verification command
 
@@ -26,16 +28,18 @@ uv run --no-project --with pytest --with ruamel.yaml --with pydantic --with fast
 
 ## Recorded RED → GREEN evidence
 
-- **RED:** `test_runtime_policy_writer_is_busy_during_native_unblock_authority` failed because the supported runtime-policy writer could mutate during the native effect seam; `test_reassign_final_barrier_holds_when_lease_changes_after_unblock_readback` failed because no final reassignment barrier ran (**2 failed**).
-- **GREEN focused:** `tests/test_runtime_safety.py tests/test_runtime_native.py tests/test_runtime_transport.py` → **34 passed, 16 skipped**. The joined native nodes are skipped under the delegated-child native guard.
-- **GREEN regression:** `test_runtime_reconciliation_recovers_lost_unblock_response_from_exact_ready_readback` plus the two new race tests → **3 passed**.
-- **GREEN full:** the exact command above → **132 passed, 40 skipped**.
-- **Transport fence:** `tests/test_runtime_transport.py -rs` → **1 skipped**: fresh isolated process cannot initialize the parent-owned native board; native transport proof remains pending.
+- **RED:** The joined regression failed at the missing `/runtime-escalation/resume-held` operation. The later-run refusal regression failed because `resume_held` did not exist. The legacy alias regression failed with HTTP 409 because it still performed proof-only reconciliation.
+- **GREEN focused:** the joined native end-to-end path, later-run refusal/no-mutation test, single-action API success/refusal tests, and deprecated alias test → **5 passed**.
+- **GREEN full:** exact command above → **175 passed, 0 skipped, 1 Starlette/httpx deprecation warning, 31.79s**.
+- `git diff --check` passed. These tests ran with native fixture setup and without clearing child guards.
+- **Live RM-03:** no request was made to resume, reconcile, dispatch, or mutate task `default/t_57851039`. Run 2275 remains later than the recorded original failure, so the available no-effect proof cannot authorize resumption; an authoritative per-tool/effect trace is still missing.
 
-## Parent verification and independent acceptance
+## Prior canonical implementation verification (historical only)
 
-The parent ran the exact command above against the corrected candidate without clearing child guards: **172 passed in 32.41s, zero failures and zero skips**. This includes the joined legacy held-intent recovery and fresh-process native transport regressions. `git diff --check` passed.
+The following parent verification and independent review applied to canonical main before this branch. They do not establish review acceptance for this change.
 
-Independent fresh cumulative review from `3ce544b34bbd0afa774a96e96a21023706fd4582` through this corrected worktree returned **GO**, with no acceptance blockers (`deleg_9fd4d9c8`). The reviewer independently ran **132 passed, 40 skipped** in its guarded child context. Prior NO-GO findings concerning policy-writer serialization and stale reassignment authority are resolved by the shared operation lock and final reassignment/publication barriers.
+The parent ran the prior exact command against the corrected canonical candidate without clearing child guards: **172 passed in 32.41s, zero failures and zero skips**. This included the earlier joined legacy held-intent recovery and fresh-process native transport regressions. `git diff --check` passed.
 
-The pending-acceptance language above records the earlier child handoff, not the final parent outcome. Code/native-fixture acceptance is complete. Live installation, deployment and RM03 recovery remain separate parent-owned operations; none were performed for this candidate.
+The prior independent cumulative review from `3ce544b34bbd0afa774a96e96a21023706fd4582` through that candidate returned **GO**, with no acceptance blockers (`deleg_9fd4d9c8`). Those findings concerned the canonical implementation’s policy-writer serialization and reassignment authority barriers.
+
+This branch has not been independently reviewed or rolled out. No install, deployment, push, gateway restart, or live RM-03 recovery was performed.
