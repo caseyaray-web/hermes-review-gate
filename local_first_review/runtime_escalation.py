@@ -1,6 +1,7 @@
 """Bounded runtime escalation effect reconciliation and workspace admission."""
 import hashlib
 import json
+from typing import cast
 from . import state, native
 
 def exclusive_operation():
@@ -49,27 +50,54 @@ def _reconciliation_proof(entry):
     return proof
 
 
-def _no_effect_current(entry, binding, observed, p):
-    """Verify the full current native history still equals the held proof."""
+def _no_effect_refusal(entry, binding, observed, p):
+    """Explain why the full native snapshot cannot authorize held recovery."""
     canonical = _canonical_snapshot(observed)
     if canonical is None:
-        return False
-    task, runs, events = canonical[0]['task'], canonical[0]['runs'], canonical[0]['events']
+        return 'Native task/runs/events snapshot is incomplete or ambiguous.'
+    show = canonical[0]
+    task, runs, events = show['task'], show['runs'], show['events']
     failed_run_id, failure = entry.get('failed_run_id'), entry.get('failure')
     if type(failed_run_id) is not int or not isinstance(failure, dict) or task.get('id') != entry.get('task_id'):
-        return False
+        return 'Native snapshot does not identify the original failed task and run.'
     run_ids = [run.get('id') for run in runs if isinstance(run, dict)]
     event_ids = [event.get('id') for event in events if isinstance(event, dict)]
-    return (len(run_ids) == len(runs) and len(event_ids) == len(events)
-            and all(type(value) is int and value > 0 for value in [*run_ids, *event_ids])
-            and len(set(run_ids)) == len(run_ids) and len(set(event_ids)) == len(event_ids)
-            and p._runtime_failure_record(canonical[0], failed_run_id) == failure
-            and failed_run_id == max(run_ids, default=0)
-            and failure.get('event_id') == max(event_ids, default=0)
-            and task.get('status') == 'blocked' and task.get('assignee') == binding.get('implementation_profile')
-            and task.get('workspace_path') == entry.get('workspace_path')
-            and p._workspace_checkpoint(entry['workspace_path']) == entry.get('checkpoint')
-            and p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path']))
+    if (len(run_ids) != len(runs) or len(event_ids) != len(events)
+            or any(type(value) is not int or value <= 0 for value in [*run_ids, *event_ids])
+            or len(set(run_ids)) != len(run_ids) or len(set(event_ids)) != len(event_ids)):
+        return 'Native run/event history has missing, duplicate, or invalid identities.'
+    run_ids = cast(list[int], run_ids)
+    event_ids = cast(list[int], event_ids)
+    later_runs = [run_id for run_id in run_ids if run_id > failed_run_id]
+    if later_runs:
+        return (f'later native run {max(later_runs)} exists after recorded failed run {failed_run_id}; '
+                'the available native snapshot cannot prove it was effect-free.')
+    if failed_run_id != max(run_ids, default=0):
+        return 'The exact recorded failed run is absent from complete native run history.'
+    if p._runtime_failure_record(show, failed_run_id) != failure:
+        return 'The exact recorded failed-run failure event is missing or changed.'
+    failure_event_id = failure.get('event_id')
+    if type(failure_event_id) is not int or failure_event_id <= 0:
+        return 'The recorded failure event has an invalid native event identity.'
+    later_events = [event_id for event_id in event_ids if event_id > failure_event_id]
+    if later_events:
+        return f'Later native event {max(later_events)} follows the recorded failure; no-effect cannot be proven.'
+    if failure_event_id != max(event_ids, default=0):
+        return 'The recorded failure is not the final event in complete native event history.'
+    if task.get('status') != 'blocked' or task.get('assignee') != binding.get('implementation_profile'):
+        return 'Task is not still blocked under the original implementation owner.'
+    if task.get('workspace_path') != entry.get('workspace_path'):
+        return 'Task workspace no longer matches the immutable runtime binding.'
+    if p._workspace_checkpoint(entry['workspace_path']) != entry.get('checkpoint'):
+        return 'The dirty workspace checkpoint changed since the held intent was recorded.'
+    if not p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path']):
+        return 'The bound workspace is not exclusively owned by this task.'
+    return None
+
+
+def _no_effect_current(entry, binding, observed, p):
+    """Verify the full current native history still equals the held proof."""
+    return _no_effect_refusal(entry, binding, observed, p) is None
 
 
 def _reassignment_barrier(board, task_id, p, expected_assignee):
@@ -103,59 +131,114 @@ def _reassignment_barrier(board, task_id, p, expected_assignee):
 
 
 def reauthorize_held(task_id, board):
-    """Require a complete no-effect proof before resuming one held intent.
-
-    This is an explicit operator boundary, not recovery automation.  It never
-    calls native mutation transport: a later dispatch tick owns the one already
-    reserved unblock attempt.
-    """
-    from . import plugin as p
+    """Prove no effect under the runtime lock without issuing a native effect."""
     with exclusive_operation() as acquired:
         if not acquired:
             return False
+        authorized, _reason = _reauthorize_held_locked(task_id, board)
+        return authorized
+
+
+def _reauthorize_held_locked(task_id, board):
+    """Return (authorized, precise refusal reason); caller owns operation lock."""
+    from . import plugin as p
+    entry = state.runtime_escalation_entry(task_id, board)
+    if not isinstance(entry, dict):
+        return False, 'No durable runtime escalation intent exists for this task.'
+    if entry.get('legacy_unverifiable'):
+        return False, 'The legacy runtime intent cannot be verified against its immutable binding.'
+    # A client may retry after the original response was lost, including
+    # after the intent progresses or re-holds. Replaying the durable proof is
+    # read-free and never opens another authorization window.
+    if _reconciliation_proof(entry) is not None:
+        return True, None
+    if entry.get('intent', {}).get('status') != 'held':
+        return False, f"Runtime intent is {entry.get('intent', {}).get('status')!r}, not held; no new authorization is allowed."
+    if entry.get('consumed_attempts') != 1 or 'transport' in entry.get('intent', {}):
+        return False, 'Held intent does not match the legacy no-receipt, already-spent attempt state.'
+    binding = p.task_binding(task_id, board)
+    policy = p.board_policy(board) or {}
+    settings = policy.get('runtime_escalation', {})
+    attempts = entry.get('attempts')
+    attempt = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 and isinstance(attempts[0], dict) else {}
+    target, reviewer = attempt.get('implementation_profile'), attempt.get('reviewer_profile')
+    if binding != entry.get('binding'):
+        return False, 'The immutable original task binding changed.'
+    if settings.get('enabled') is not True:
+        return False, 'Runtime escalation is disabled or paused.'
+    if (target == reviewer or target != settings.get('implementation_profile')
+            or reviewer != settings.get('reviewer_profile')
+            or not p.profile_exists(target or '') or not p.profile_exists(reviewer or '')):
+        return False, 'Configured implementation/reviewer route changed or a required profile is unavailable.'
+    if not lease_valid(entry):
+        return False, 'The exclusive runtime workspace lease is absent or changed.'
+    try:
+        canonical = _canonical_snapshot(native.snapshot(board, task_id))
+    except Exception as exc:
+        return False, f'Complete native task/runs/events snapshot is unavailable: {type(exc).__name__}: {exc}'
+    if canonical is None:
+        return False, 'Native task/runs/events snapshot is incomplete or ambiguous.'
+    observed, encoded = canonical
+    refusal = _no_effect_refusal(entry, binding, observed, p)
+    if refusal:
+        return False, refusal
+    failure = entry['failure']
+    evidence = {
+        'binding': binding,
+        'failure': failure,
+        'checkpoint': entry['checkpoint'],
+        'failed_run_id': entry['failed_run_id'],
+        'snapshot': observed,
+        'snapshot_sha256': hashlib.sha256(encoded).hexdigest(),
+    }
+    state.authorize_runtime_held_reconciliation(board, task_id, entry=entry, evidence=evidence)
+    return True, None
+
+
+def resume_held(task_id, board):
+    """One operator action: prove, authorize, then reconcile once under effect fences."""
+    with exclusive_operation() as acquired:
+        if not acquired:
+            return {'ok': False, 'reason': 'Runtime routing is busy; no recovery state was changed.'}
         entry = state.runtime_escalation_entry(task_id, board)
-        if not isinstance(entry, dict) or entry.get('legacy_unverifiable'):
-            return False
-        # A client may retry after the original response was lost, including
-        # after the one tick subsequently progressed or re-held the intent.
-        # Replaying the durable proof is deliberately read-free and never opens
-        # another authorization window.
-        if _reconciliation_proof(entry) is not None:
-            return True
-        if (entry.get('intent', {}).get('status') != 'held' or entry.get('consumed_attempts') != 1
-                or 'transport' in entry.get('intent', {})):
-            return False
-        binding = p.task_binding(task_id, board)
-        policy = p.board_policy(board) or {}
-        settings = policy.get('runtime_escalation', {})
-        attempt = entry.get('attempts', [{}])[0]
-        target, reviewer = attempt.get('implementation_profile'), attempt.get('reviewer_profile')
-        if (binding != entry.get('binding') or settings.get('enabled') is not True
-                or target == reviewer or target != settings.get('implementation_profile')
-                or reviewer != settings.get('reviewer_profile')
-                or not p.profile_exists(target) or not p.profile_exists(reviewer)
-                or not lease_valid(entry)):
-            return False
-        try:
-            canonical = _canonical_snapshot(native.snapshot(board, task_id))
-        except Exception:
-            return False
-        if canonical is None:
-            return False
-        observed, encoded = canonical
-        if not _no_effect_current(entry, binding, observed, p):
-            return False
-        failed_run_id, failure = entry['failed_run_id'], entry['failure']
-        evidence = {
-            'binding': binding,
-            'failure': failure,
-            'checkpoint': entry['checkpoint'],
-            'failed_run_id': failed_run_id,
-            'snapshot': observed,
-            'snapshot_sha256': hashlib.sha256(encoded).hexdigest(),
-        }
-        state.authorize_runtime_held_reconciliation(board, task_id, entry=entry, evidence=evidence)
-        return True
+        if not isinstance(entry, dict):
+            return {'ok': False, 'reason': 'No durable runtime escalation intent exists for this task.'}
+        status = entry.get('intent', {}).get('status')
+        proof = _reconciliation_proof(entry)
+        raw_proof = entry.get('intent', {}).get('operator_no_effect_reconciliation')
+        if raw_proof is not None and proof is None:
+            return {'ok': False, 'reason': 'Stored no-effect evidence is malformed or conflicts with the original intent.'}
+        if status == 'routed' and proof is not None:
+            return {'ok': True, 'runtime_escalation': entry,
+                    'message': 'This exact held intent is already routed; no native effect was repeated.'}
+        if status == 'held':
+            if proof is not None:
+                return {'ok': False, 'reason': 'This authorized continuation is already held after its one effect window; refusing another attempt.'}
+            authorized, reason = _reauthorize_held_locked(task_id, board)
+            if not authorized:
+                return {'ok': False, 'reason': reason or 'Held-intent proof failed; native state was not changed.'}
+            entry = state.runtime_escalation_entry(task_id, board)
+            proof = _reconciliation_proof(entry) if isinstance(entry, dict) else None
+            status = entry.get('intent', {}).get('status') if isinstance(entry, dict) else None
+        elif status != 'unblock_requested' or proof is None:
+            return {'ok': False, 'reason': f'Runtime intent is {status!r}; only an unattempted, explicitly authorized held continuation can resume.'}
+        if status != 'unblock_requested' or proof is None:
+            return {'ok': False, 'reason': 'No durable one-shot authorization is available for native reconciliation.'}
+
+    # Reconciliation reacquires the same operation lock and re-reads every
+    # mutable authority input before effects. A race in this gap fails closed.
+    if not reconcile(task_id, board):
+        entry = state.runtime_escalation_entry(task_id, board)
+        if isinstance(entry, dict) and entry.get('intent', {}).get('status') == 'routed':
+            return {'ok': True, 'runtime_escalation': entry,
+                    'message': 'The exact intent was routed by a concurrent serialized reconciliation; no effect was repeated.'}
+        reason = entry.get('intent', {}).get('reason') if isinstance(entry, dict) else None
+        return {'ok': False, 'reason': reason or 'Native reconciliation did not complete; the intent remains held.'}
+    entry = state.runtime_escalation_entry(task_id, board)
+    if not isinstance(entry, dict) or entry.get('intent', {}).get('status') != 'routed':
+        return {'ok': False, 'reason': 'Native effects lacked exact route readback; the intent remains held.'}
+    return {'ok': True, 'runtime_escalation': entry,
+            'message': 'The same held intent was reconciled and routed; the normal native dispatcher may admit its single authorized run.'}
 
 
 def reconcile(task_id, board):

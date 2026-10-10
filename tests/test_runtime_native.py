@@ -7,6 +7,7 @@ import pytest
 from test_review_gate import board
 from local_first_review import plugin, state, native, runtime_escalation
 from dashboard import plugin_api as api
+from test_dashboard import client
 
 def test_native_old_review_retry_cannot_manufacture_correction_threshold(board):
     b=board
@@ -139,18 +140,34 @@ def test_joined_held_unknown_transport_reconciliation_resumes_same_attempt(rm03,
     assert 'transport' not in held['intent']
     before = b.show(tid)
 
-    reconciled = api.runtime_escalation_reconcile_held(api.RuntimeCatchupControl(board='default', task_id=tid))
-
-    entry = reconciled['runtime_escalation']
-    assert entry['intent']['status'] == 'unblock_requested'
+    resumed = client().post('/runtime-escalation/resume-held', json={'board': 'default', 'task_id': tid})
+    assert resumed.status_code == 200, resumed.text
+    entry = resumed.json()['runtime_escalation']
+    assert entry['intent']['status'] == 'routed'
     assert entry['intent']['held_reason_history'] == [held['intent']['reason']]
     assert entry['intent']['operator_no_effect_reconciliation']['snapshot'] == before
-    assert 'transport' not in entry['intent']
-    assert b.show(tid) == before
+    assert 'operator_no_effect_reconciliation' in entry['intent']
+    assert entry['intent']['transport']['operation'] == 'kanban_unblock'
     assert entry['consumed_attempts'] == 1
     assert state.load_state()['recovery_budgets'][f'default:{tid}:implementation'] == 2
+    after_resume = b.show(tid)
+    assert after_resume['task']['assignee'] == 'strong'
+    assert b.kb.get_task(b.conn, b.rm_child).status == 'todo'
+    before_event_ids = {e['id'] for e in before['events']}
+    new_events = [e for e in after_resume['events'] if e['id'] not in before_event_ids]
+    assert len([e for e in new_events if e['kind'] == 'unblocked']) == 1
+    assert len([e for e in new_events if e['kind'] == 'assigned']) == 1
 
-    plugin.watchdog_tick(board='default')
+    # A lost HTTP response is a read-free idempotent replay, not another effect.
+    with monkeypatch.context() as replay_patch:
+        replay_patch.setattr(native, 'snapshot', lambda *_: pytest.fail('replay must not recapture native evidence'))
+        replay_patch.setattr(plugin, '_dispatch', lambda *_: pytest.fail('replay must not unblock twice'))
+        replay_patch.setattr(native, 'reassign_ready_task', lambda *_: pytest.fail('replay must not reassign twice'))
+        replay = client().post('/runtime-escalation/resume-held', json={'board': 'default', 'task_id': tid})
+        assert replay.status_code == 200, replay.text
+        assert replay.json()['runtime_escalation'] == entry
+        assert b.show(tid) == after_resume
+
     assert b.dispatch(expected=tid).assignee == 'strong'
     assert plugin.guard('kanban_show', {}) is not None
     subprocess.check_call(['git', '-C', str(b.rm_workspace), 'add', '.'])
@@ -159,6 +176,12 @@ def test_joined_held_unknown_transport_reconciliation_resumes_same_attempt(rm03,
     assert b.dispatch(expected=tid).assignee == 'post-review'
     assert b.call('submit_review', verdict='approved', rationale='Fresh independent post-review.')['ok']
     assert b.show(tid)['task']['status'] == 'done'
+    child = b.kb.get_task(b.conn, b.rm_child)
+    assert child.status == 'ready'
+    assert child.current_run_id is None
+    assert state.task_binding(tid, 'default') == b.rm_binding
+    # The operator's separate native dispatch/release remains required.
+    assert b.dispatch(expected=b.rm_child).assignee == 'impl'
 
 
 @pytest.mark.parametrize('lost',['unblock','reassign'])
