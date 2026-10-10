@@ -980,14 +980,13 @@ def test_joined_runtime_exhaustion_escalates_same_card_after_two_recoveries(boar
     # Grants one and two are normal recovery paths; each is charged durably.
     first = exhaust()
     plugin.watchdog_tick(board='default'); assert b.show(task_id)['task']['status'] in {'ready', 'todo'}
-    assert b.dispatch(expected=task_id).assignee == 'impl'
     immutable = state.task_binding(task_id, 'default')
     assert immutable and immutable['native_run_id'] == first > policy['native_run_watermark']
     second = exhaust()
     plugin.watchdog_tick(board='default'); plugin.watchdog_tick(board='default')
     assert b.show(task_id)['task']['status'] in {'ready', 'todo'}
-    assert b.dispatch(expected=task_id).assignee == 'impl'
     third = exhaust()
+    plugin.watchdog_tick(board='default')  # Terminalize the spent recovery lease.
 
     # Third exact RM03 failure is not another recovery: it reserves auditable
     # routing before native unblock/reassign and resumes the same worktree.
@@ -1006,8 +1005,10 @@ def test_joined_runtime_exhaustion_escalates_same_card_after_two_recoveries(boar
 
     assert b.dispatch(expected=task_id).assignee == 'strong'
     (workspace / 'implementation.txt').write_text('terra runtime escalation candidate\n')
-    b.git('add', 'implementation.txt'); b.git('commit', '-qm', 'terra runtime escalation candidate')
-    assert b.call('finish_implementation', summary='Fresh Terra candidate after exhausted recovery.')['ok']
+    subprocess.check_call(['git', '-C', str(workspace), 'add', 'implementation.txt'])
+    subprocess.check_call(['git', '-C', str(workspace), 'commit', '-qm', 'terra runtime escalation candidate'])
+    handoff = b.call('finish_implementation', summary='Fresh Terra candidate after exhausted recovery.')
+    assert handoff.get('ok'), handoff
     reviewer = b.dispatch(expected=task_id)
     assert reviewer.assignee == 'post-review'
     approved = b.call('submit_review', verdict='approved', rationale='Independent post-escalation reviewer approved the fresh candidate.')

@@ -86,9 +86,9 @@ def _show(task_id: str) -> dict[str, Any]:
     value = _dispatch("kanban_show", {"task_id": task_id})
     if not isinstance(value.get("task"), dict) or not isinstance(value.get("runs"), list) or not isinstance(value.get("events"), list):
         raise GateError("native kanban_show did not return task/runs/events")
-    if len(value["events"]) >= 50:
-        # kanban_show caps events, but phase and retry authority must not expire
-        # after heartbeats/comments. Read the complete native snapshot without writes.
+    if len(value["events"]) >= 50 or any("id" not in event for event in value["events"]):
+        # The worker-facing tool omits event IDs and caps history. Durable
+        # intent authority needs the complete native event identity/readback.
         from .native import snapshot
         return snapshot(board_name(), task_id)
     return value
@@ -1062,6 +1062,7 @@ def _routed_escalation_guard(task_id: str, board: str, entry: dict[str, Any]) ->
 
 def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | None:
     """Protect only normal model tool calls; environment owns the worker task id."""
+    runtime = None
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     if task_id:
         try:
@@ -1101,7 +1102,7 @@ def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | N
                     return admission
         except Exception as exc:
             return {"action": "block", "message": f"Escalation state is unreadable; refusing tool: {exc}"}
-    recovery = _recovery_guard(tool_name)
+    recovery = None if task_id and runtime and runtime.get("intent", {}).get("status") == "routed" else _recovery_guard(tool_name)
     if recovery:
         return recovery
     if tool_name not in {"kanban_complete", "kanban_request_review", "kanban_request_changes"}:
