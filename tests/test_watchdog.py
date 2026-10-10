@@ -332,19 +332,50 @@ def test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preser
 
     entry = state.reserve_runtime_escalation("default", "task", failed_run_id=2273,
                                              phase="implementation", binding=binding,
-                                             checkpoint={"head": "b" * 40, "dirty": ["partial"]})
+                                             checkpoint={"head": "b" * 40, "dirty": ["partial"]},
+                                             failure={"run_id": 2273, "event_id": 1, "kind": "gave_up", "payload": {}},
+                                             workspace_path="/work")
     assert entry["intent"]["status"] == "unblock_requested"
     assert entry["binding"] == binding
     assert state.task_binding("task", "default") == binding
     assert state.reserve_runtime_escalation("default", "task", failed_run_id=2273,
                                             phase="implementation", binding=binding,
-                                            checkpoint={"head": "ignored", "dirty": []}) == entry
+                                            checkpoint={"head": "b" * 40, "dirty": ["partial"]},
+                                            failure={"run_id": 2273, "event_id": 1, "kind": "gave_up", "payload": {}},
+                                            workspace_path="/work") == entry
     unexhausted = dict(binding, task_id="unexhausted", workspace_path="/other")
     state.reserve_recovery("default", "unexhausted", failed_run_id=1, phase="implementation",
                            workspace_path="/other", checkpoint={}, binding=unexhausted, adopted=True)
     with pytest.raises(ValueError, match="not exhausted"):
         state.reserve_runtime_escalation("default", "unexhausted", failed_run_id=2,
-                                         phase="implementation", binding=unexhausted, checkpoint={})
+                                         phase="implementation", binding=unexhausted, checkpoint={},
+                                         failure={"run_id": 2, "event_id": 2, "kind": "gave_up", "payload": {}},
+                                         workspace_path="/other")
+
+
+def test_runtime_intent_requires_exact_failure_checkpoint_and_lease(tmp_path, monkeypatch):
+    """A runtime route is not a generic unblock: it binds the failed event and workspace lease."""
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
+    path = tmp_path / "state.json"; monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda name: name in {"impl", "review", "terra", "terra-review"})
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review", "tasks": {}, "boards": {}})
+    state.activate_board("default", activation_id="runtime-contract", native_run_watermark=0)
+    state.set_recovery_policy("default", enabled=True, max_per_phase=1)
+    state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
+                                        implementation_profile="terra", reviewer_profile="terra-review")
+    binding = _binding()
+    state.reserve_recovery("default", "task", failed_run_id=1, phase="implementation", workspace_path="/work",
+                           checkpoint={"head": "a" * 40, "dirty": []}, binding=binding, adopted=True)
+    state.terminalize_recovery("default", "task", 1, "implementation", "native_terminal")
+
+    failure = {"run_id": 2, "event_id": 21, "kind": "gave_up", "payload": {"budget_used": 180, "budget_max": 180}}
+    checkpoint = {"head": "a" * 40, "dirty": [{"path": "partial.txt", "sha256": "b" * 64}]}
+    entry = state.reserve_runtime_escalation("default", "task", failed_run_id=2, phase="implementation",
+                                             binding=binding, checkpoint=checkpoint, failure=failure,
+                                             workspace_path="/work")
+    assert entry["failure"] == failure
+    assert entry["checkpoint"] == checkpoint
+    assert state.load_state()["workspace_leases"]["/work"] == "default:task:2:runtime_escalation"
 
 
 def test_recovery_policy_rejects_zero_boolean_fractional_negative_and_excessive_limits(tmp_path, monkeypatch):

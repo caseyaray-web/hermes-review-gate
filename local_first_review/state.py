@@ -51,7 +51,7 @@ def phase_budget_key(board: str, task_id: str, phase: str) -> str:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 7, "implementation_profile": None, "reviewer_profile": None,
+    return {"version": 8, "implementation_profile": None, "reviewer_profile": None,
             "tasks": {}, "boards": {}, "recovery": {}, "recovery_budgets": {}, "workspace_leases": {},
             "escalations": {}, "runtime_escalations": {}, "effective_routing": {}}
 
@@ -129,13 +129,23 @@ def _migrate(data: Any) -> dict[str, Any]:
         }
     if data.get("version") == 6:
         data = dict(data); data["version"] = 7; data["runtime_escalations"] = {}
+    if data.get("version") == 7:
+        # v7 runtime intents lacked an exact terminal-event receipt and lease.
+        # Preserve them for audit, but reconciliation must never resume them.
+        data = dict(data); data["version"] = 8
+        for entry in data.get("runtime_escalations", {}).values():
+            if isinstance(entry, dict):
+                entry.setdefault("legacy_unverifiable", True)
+                binding = entry.get("binding")
+                if isinstance(binding, dict):
+                    entry.setdefault("workspace_path", binding.get("workspace_path"))
     return data
 
 
 def _validate(data: Any) -> dict[str, Any]:
     data = _migrate(data)
     required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases", "escalations", "runtime_escalations", "effective_routing")
-    if data.get("version") != 7 or any(not isinstance(data.get(k), dict) for k in required_roots):
+    if data.get("version") != 8 or any(not isinstance(data.get(k), dict) for k in required_roots):
         raise ValueError("review-gate configuration has an invalid shape")
     for key, binding in data["tasks"].items():
         if not isinstance(key, str) or not isinstance(binding, dict):
@@ -186,9 +196,17 @@ def _validate(data: Any) -> dict[str, Any]:
                 or not _text(entry.get("task_id")) or key != binding_key(entry["board"], entry["task_id"])
                 or not isinstance(entry.get("binding"), dict) or type(entry.get("failed_run_id")) is not int
                 or entry["failed_run_id"] <= 0 or entry.get("phase") != "implementation"
+                or not _text(entry.get("workspace_path"))
                 or type(entry.get("consumed_attempts")) is not int or not isinstance(entry.get("attempts"), list)
                 or entry["consumed_attempts"] != len(entry["attempts"])):
             raise ValueError("runtime escalation ledger is invalid")
+        if not entry.get("legacy_unverifiable"):
+            failure, checkpoint = entry.get("failure"), entry.get("checkpoint")
+            if (not isinstance(failure, dict) or failure.get("run_id") != entry["failed_run_id"]
+                    or type(failure.get("event_id")) is not int or failure["event_id"] <= 0
+                    or failure.get("kind") != "gave_up" or not isinstance(failure.get("payload"), dict)
+                    or not isinstance(checkpoint, dict)):
+                raise ValueError("runtime escalation evidence is invalid")
         for number, attempt in enumerate(entry["attempts"], start=1):
             if (not isinstance(attempt, dict) or attempt.get("attempt") != number
                     or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))
@@ -304,11 +322,23 @@ def runtime_escalation_entry(task_id: str, board: str | None = None) -> dict[str
 
 
 def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, phase: str,
-                                binding: dict[str, Any], checkpoint: dict[str, Any]) -> dict[str, Any]:
-    """Durably reserve the one explicit escalation before any native transition."""
+                                binding: dict[str, Any], checkpoint: dict[str, Any], failure: dict[str, Any],
+                                workspace_path: str) -> dict[str, Any]:
+    """Reserve one auditable replacement route before any native lifecycle effect."""
     if phase != "implementation" or type(failed_run_id) is not int or failed_run_id <= 0:
         raise ValueError("runtime escalation identity is invalid")
+    try:
+        same_workspace = (isinstance(workspace_path, str) and isinstance(binding.get("workspace_path"), str)
+                          and Path(workspace_path).resolve() == Path(binding["workspace_path"]).resolve())
+    except (OSError, RuntimeError):
+        same_workspace = False
+    if (not isinstance(failure, dict) or failure.get("run_id") != failed_run_id
+            or type(failure.get("event_id")) is not int or failure["event_id"] <= 0
+            or failure.get("kind") != "gave_up" or not isinstance(failure.get("payload"), dict)
+            or not isinstance(checkpoint, dict) or not same_workspace):
+        raise ValueError("runtime escalation evidence is invalid")
     key, budget = binding_key(board, task_id), phase_budget_key(board, task_id, phase)
+    lease_key = f"{board}:{task_id}:{failed_run_id}:runtime_escalation"
     with locked_state(write=True) as data:
         policy = data["boards"].get(board)
         if policy is None:
@@ -319,18 +349,26 @@ def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, 
             raise ValueError("runtime escalation is disabled")
         existing = data["runtime_escalations"].get(key)
         if existing is not None:
-            if existing.get("binding") != binding or existing.get("failed_run_id") != failed_run_id:
+            if (existing.get("binding") != binding or existing.get("failed_run_id") != failed_run_id
+                    or existing.get("failure") != failure or existing.get("checkpoint") != checkpoint):
                 raise ValueError("runtime escalation identity conflicts with an existing intent")
             return json.loads(json.dumps(existing))
         recovery = _recovery_settings(policy.get("recovery", {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}))
         if data["recovery_budgets"].get(budget, 0) < recovery["max_per_phase"]:
             raise ValueError("runtime recovery budget is not exhausted")
+        if not profile_exists(settings["implementation_profile"]) or not profile_exists(settings["reviewer_profile"]):
+            raise ValueError("configured runtime escalation profile is missing")
+        holder = data["workspace_leases"].get(workspace_path)
+        if holder is not None and holder != lease_key:
+            raise ValueError("workspace escalation lease is held by another task")
         attempt = {"attempt": 1, "implementation_profile": settings["implementation_profile"],
                    "reviewer_profile": settings["reviewer_profile"],
                    "intent": {"status": "unblock_requested", "checkpoint": dict(checkpoint)}}
         entry = {"board": board, "task_id": task_id, "binding": dict(binding), "failed_run_id": failed_run_id,
-                 "phase": phase, "consumed_attempts": 1, "intent": dict(attempt["intent"]), "attempts": [attempt]}
+                 "phase": phase, "workspace_path": workspace_path, "failure": dict(failure), "checkpoint": dict(checkpoint),
+                 "consumed_attempts": 1, "intent": dict(attempt["intent"]), "attempts": [attempt]}
         data["runtime_escalations"][key] = entry
+        data["workspace_leases"][workspace_path] = lease_key
         return json.loads(json.dumps(entry))
 
 

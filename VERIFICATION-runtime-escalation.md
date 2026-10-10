@@ -1,44 +1,31 @@
 # Runtime-exhaustion escalation verification
 
-## Scope and acceptance coverage
+## Actual evidence (delegated context)
 
-- Added a separate board-level `runtime_escalation` policy and dashboard API (`PUT /runtime-escalation`). It is disabled by default and requires explicit implementation/reviewer profiles.
-- Kept review-correction escalation independent. Runtime escalation is eligible only for the existing exact started-worker iteration-exhaustion evidence after the implementation recovery phase budget is fully consumed.
-- Persisted a task-scoped, idempotent intent before native effects with the immutable original binding, failed run, phase, checkpoint, target implementation/reviewer route, and consumed attempt.
-- The watchdog resumes the same native task, readbacks native unblock and reassignment, then publishes effective routing. It does not create a replacement task/worktree or rewrite the original binding.
-- Effective routing is consumed by implementation/reviewer handoff and approval paths through `trusted_routing`; the original binding remains immutable.
-- Existing RM02 adoption remains narrow: one unbound, post-watermark, started-worker `gave_up` shape only. Enabling runtime escalation does not sweep historical blocked work.
-- Added a strict TDD regression: first observed missing runtime API failure, then verified a two-recovery-budget exhaustion route, durable idempotency, immutable binding, dirty checkpoint capture, and refusal before exhaustion.
+| Acceptance area | Evidence | Result |
+|---|---|---|
+| Durable runtime intent has exact failed run/event, checkpoint, original binding, route, and exclusive workspace lease | `tests/test_watchdog.py::test_runtime_intent_requires_exact_failure_checkpoint_and_lease` | Passed |
+| Recovery budget must be exhausted before reservation; budget is not refunded | `tests/test_watchdog.py::test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preserves_binding` | Passed |
+| Pending runtime intent fences all normal worker tools | Code path added in `local_first_review.plugin.guard`; no joined native race proof in this delegated context | Unit/source coverage only |
+| Reconciliation revalidates enabled policy, exact terminal event, checkpoint, immutable binding/workspace, original owner, profiles, and exclusivity before native effects | `local_first_review.plugin._reconcile_runtime_exhaustion_escalation` | Unit/source coverage only |
+| Same-card exhausted recovery → native unblock/reassign → new implementation → independent review → downstream completion | `tests/test_review_gate.py::test_joined_runtime_exhaustion_escalates_same_card_after_two_recoveries` | Added; skipped by delegated native-mutation guard |
+| Wrong/old profile races, lost responses, duplicate ticks, paused policy, checkpoint drift, concurrent lease, malformed events, and failed Terra no-loop behavior | No complete joined native proof yet | **Not accepted / still required** |
 
-## Commands and results
+## Commands actually run
 
 ```sh
-uv run --no-project --with pytest python -m pytest \
-  tests/test_watchdog.py::test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preserves_binding \
-  -q -o 'addopts='
-# RED: 1 failed — AttributeError: state.set_runtime_escalation_policy was absent
-# GREEN: 1 passed in 0.04s
+uv run --no-project --with pytest --with ruamel.yaml --with pydantic --with fastapi --with httpx \
+  python -c "import sys; sys.path.insert(0, '/home/ocadmin/.hermes/hermes-agent'); import pytest; raise SystemExit(pytest.main(['tests/test_watchdog.py::test_runtime_intent_requires_exact_failure_checkpoint_and_lease','-q','-o','addopts=']))"
+# 1 passed in 0.03s
 
 uv run --no-project --with pytest --with ruamel.yaml --with pydantic --with fastapi --with httpx \
-  python -c "import sys; sys.path.insert(0, '/home/ocadmin/.hermes/hermes-agent'); import pytest; raise SystemExit(pytest.main(['tests/test_watchdog.py', '-q', '-o', 'addopts=']))"
-# 28 passed in 0.17s
+  python -c "import sys; sys.path.insert(0, '/home/ocadmin/.hermes/hermes-agent'); import pytest; raise SystemExit(pytest.main(['tests','-q','-o','addopts=']))"
+# 85 passed, 24 skipped, 1 external FastAPI/httpx deprecation warning in 0.79s
 
-uv run --no-project --with pytest --with ruamel.yaml --with pydantic --with fastapi --with httpx \
-  python -c "import sys; sys.path.insert(0, '/home/ocadmin/.hermes/hermes-agent'); import pytest; raise SystemExit(pytest.main(['tests', '-q', '-o', 'addopts=']))"
-# 84 passed, 23 skipped, 1 external FastAPI/httpx deprecation warning in 0.70s
-
-hermes plugins doctor . --ci
-# OK: runtime discovery, manifest parsing, import, and registration passed
-# registrations: 2 tool(s), 3 hook(s)
-
-node --check dashboard/dist/index.js
 git diff --check
 # passed
-
-uv run --no-project --with build python -m build --outdir /home/ocadmin/.hermes/cache/scratch/runtime-escalation-dist-20261010T011849
-# Successfully built local_first_review-1.0.0.tar.gz and local_first_review-1.0.0-py3-none-any.whl
 ```
 
-## Remaining limitation
+## Blocker
 
-The 23 native mutation fixtures were skipped because this delegated session retains Hermes' parent-only native mutation guard. No live board, profile, installed plugin, worktree, gateway, or deployment state was touched. The parent must run those exact disposable native fixtures from an authorized non-delegated parent context to obtain the requested installed-Hermes native rehearsal evidence.
+This delegated session intentionally skips native mutation fixtures. The newly added joined RM03 fixture has not executed here, so it is not proof of native lifecycle behavior. Run it from a non-delegated parent with the same isolated disposable-home guard before accepting the change. The additional adversarial joined cases listed above are still absent and must be added before acceptance.

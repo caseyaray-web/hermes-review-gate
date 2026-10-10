@@ -944,3 +944,72 @@ def test_missing_profiles_and_corrupt_config_fail_closed(board):
     state.state_path().write_text('{broken')
     assert b.call('kanban_complete',summary='cannot bypass corrupt policy')['error']
     b.gated()
+
+
+def test_joined_runtime_exhaustion_escalates_same_card_after_two_recoveries(board):
+    """Controlled installed-Hermes proof of RM03: exhausted recovery -> Terra -> independent review."""
+    b = board
+    policy = state.activate_board('default', activation_id='rm03-runtime-escalation')
+    state.set_recovery_policy('default', enabled=True, max_per_phase=2)
+    state.set_runtime_escalation_policy('default', enabled=True, max_attempts=1,
+                                        implementation_profile='strong', reviewer_profile='post-review')
+    task_id = b.kb.create_task(b.conn, title='RM03 exhausted recovery route', assignee='impl', priority=500,
+                               max_retries=1, workspace_kind='worktree', workspace_path=str(b.repo))
+    workspace = b.workspace(task_id)
+    immutable = None
+
+    def exhaust() -> int:
+        worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        try:
+            assert b.kbd.dispatch_once(b.conn, spawn_fn=lambda *a, **k: worker.pid,
+                                       max_spawn=1, reconcile_orphans=False).spawned
+            worker.terminate(); worker.wait(timeout=10)
+            assert b.kbd._record_task_failure(
+                b.conn, task_id,
+                'Iteration budget exhausted (180/180) — task could not complete within the allowed iterations',
+                outcome='timed_out', release_claim=True, end_run=True,
+                event_payload_extra={'budget_used': 180, 'budget_max': 180})
+        finally:
+            if worker.poll() is None:
+                worker.kill(); worker.wait(timeout=10)
+        show = b.show(task_id); failed = show['runs'][-1]
+        assert failed['outcome'] == 'gave_up'
+        assert any(event['kind'] == 'spawned' and event['run_id'] == failed['id'] for event in show['events'])
+        return failed['id']
+
+    # Grants one and two are normal recovery paths; each is charged durably.
+    first = exhaust()
+    plugin.watchdog_tick(board='default'); assert b.show(task_id)['task']['status'] in {'ready', 'todo'}
+    assert b.dispatch(expected=task_id).assignee == 'impl'
+    immutable = state.task_binding(task_id, 'default')
+    assert immutable and immutable['native_run_id'] == first > policy['native_run_watermark']
+    second = exhaust()
+    plugin.watchdog_tick(board='default'); plugin.watchdog_tick(board='default')
+    assert b.show(task_id)['task']['status'] in {'ready', 'todo'}
+    assert b.dispatch(expected=task_id).assignee == 'impl'
+    third = exhaust()
+
+    # Third exact RM03 failure is not another recovery: it reserves auditable
+    # routing before native unblock/reassign and resumes the same worktree.
+    plugin.watchdog_tick(board='default')
+    stored = state.load_state(); runtime = stored['runtime_escalations']['default:' + task_id]
+    assert runtime['failed_run_id'] == third and runtime['failure']['run_id'] == third
+    assert runtime['checkpoint']['head'] == b.git('rev-parse', 'HEAD')
+    assert runtime['intent']['status'] == 'routed'
+    assert stored['tasks']['default:' + task_id] == immutable
+    assert stored['effective_routing']['default:' + task_id]['implementation_profile'] == 'strong'
+    assert stored['effective_routing']['default:' + task_id]['reviewer_profile'] == 'post-review'
+    assert stored['recovery_budgets']['default:' + task_id + ':implementation'] == 2
+    routed = b.show(task_id)
+    assert routed['task']['status'] in {'ready', 'todo'} and routed['task']['assignee'] == 'strong'
+    assert routed['task']['workspace_path'] == str(workspace)
+
+    assert b.dispatch(expected=task_id).assignee == 'strong'
+    (workspace / 'implementation.txt').write_text('terra runtime escalation candidate\n')
+    b.git('add', 'implementation.txt'); b.git('commit', '-qm', 'terra runtime escalation candidate')
+    assert b.call('finish_implementation', summary='Fresh Terra candidate after exhausted recovery.')['ok']
+    reviewer = b.dispatch(expected=task_id)
+    assert reviewer.assignee == 'post-review'
+    approved = b.call('submit_review', verdict='approved', rationale='Independent post-escalation reviewer approved the fresh candidate.')
+    assert approved['ok'], approved
+    assert b.show(task_id)['task']['status'] == 'done'

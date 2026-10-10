@@ -844,6 +844,19 @@ def watchdog_claimed(*, task_id: str, board: str, assignee: str | None = None, r
         return
 
 
+def _runtime_failure_record(show: dict[str, Any], failed_run_id: int) -> dict[str, Any] | None:
+    """Freeze the exact native terminal evidence that authorizes escalation."""
+    event = _event(show.get("events", []), "gave_up", failed_run_id)
+    payload = event.get("payload") if isinstance(event, dict) else None
+    event_id = event.get("id") if isinstance(event, dict) else None
+    if (not isinstance(payload, dict) or type(event_id) is not int or event_id <= 0
+            or payload.get("trigger_outcome") != "timed_out" or payload.get("effective_limit") != 1
+            or payload.get("budget_used") != payload.get("budget_max")
+            or not _allowed_terminal_failure(show, {"id": failed_run_id, "outcome": "gave_up"})):
+        return None
+    return {"run_id": failed_run_id, "event_id": event_id, "kind": "gave_up", "payload": dict(payload)}
+
+
 def _reconcile_runtime_exhaustion_escalation(task_id: str, board: str, entry: dict[str, Any]) -> bool:
     """Resume one exact blocked exhausted task, then route its existing worktree."""
     binding = task_binding(task_id, board)
@@ -851,10 +864,22 @@ def _reconcile_runtime_exhaustion_escalation(task_id: str, board: str, entry: di
         return False
     attempt = entry.get("attempts", [{}])[-1]
     target = attempt.get("implementation_profile") if isinstance(attempt, dict) else None
-    if not isinstance(binding, dict) or entry.get("binding") != binding or not isinstance(target, str) or not profile_exists(target):
+    policy = board_policy(board)
+    settings = policy.get("runtime_escalation", {}) if isinstance(policy, dict) else {}
+    if (entry.get("legacy_unverifiable") or not isinstance(binding, dict) or entry.get("binding") != binding
+            or not isinstance(target, str) or not profile_exists(target) or not profile_exists(attempt.get("reviewer_profile"))
+            or settings.get("enabled") is not True or entry.get("consumed_attempts") != 1
+            or entry.get("workspace_path") != binding.get("workspace_path")):
         return False
     observed = _show(task_id)
     task = observed.get("task", {})
+    failure = _runtime_failure_record(observed, entry.get("failed_run_id"))
+    if (failure != entry.get("failure") or task.get("status") != "blocked"
+            or task.get("assignee") != binding.get("implementation_profile")
+            or task.get("workspace_path") != entry.get("workspace_path")
+            or _workspace_checkpoint(entry["workspace_path"]) != entry.get("checkpoint")
+            or not _workspace_is_exclusive(board, task_id, entry["workspace_path"])):
+        return False
     if task.get("status") == "blocked":
         value = _dispatch("kanban_unblock", {"task_id": task_id})
         if value.get("status") not in {"ready", "todo"}:
@@ -976,8 +1001,12 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
                     and recovery_budget_exhausted(board, task_id, phase)):
                 runtime = runtime_escalation_entry(task_id, board)
                 if runtime is None:
+                    failure = _runtime_failure_record(show, failed.get("id"))
+                    if failure is None:
+                        continue
                     runtime = reserve_runtime_escalation(board, task_id, failed_run_id=failed["id"], phase=phase,
-                                                         binding=binding, checkpoint=checkpoint)
+                                                         binding=binding, checkpoint=checkpoint, failure=failure,
+                                                         workspace_path=workspace)
                 _reconcile_runtime_exhaustion_escalation(task_id, board, runtime)
                 continue
             entry = reserve_recovery(board, task_id, failed_run_id=failed["id"], phase=phase, workspace_path=workspace, checkpoint=checkpoint, binding=binding, adopted=adopted)
@@ -1032,6 +1061,15 @@ def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | N
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     if task_id:
         try:
+            runtime = runtime_escalation_entry(task_id, board_name())
+            if runtime and runtime.get("intent", {}).get("status") != "routed":
+                # Persisted intent fences every claimant until one dispatch tick
+                # has proven unblock/reassignment and published the route.
+                return {"action": "block", "message": "Runtime escalation routing is pending native reconciliation; no worker tool is authorized."}
+            if runtime and runtime.get("intent", {}).get("status") == "routed":
+                admission = _routed_escalation_guard(task_id, board_name(), runtime)
+                if admission:
+                    return admission
             pending = escalation_entry(task_id, board_name())
             if pending and current_escalation_attempt(pending).get("intent", {}).get("status") == "changes_requested_pending":
                 # Only the exact newly assigned target claim may turn a pending
