@@ -256,6 +256,21 @@ def test_runtime_resume_held_returns_specific_refusal(monkeypatch):
     assert response.json()['detail'] == 'Later native run 2275 cannot be proved effect-free.'
 
 
+def test_runtime_resume_held_passes_the_explicit_operator_continuation_receipt(monkeypatch):
+    receipt = {'scope': 'rm03-post-hold-continuation'}
+    calls = []
+    monkeypatch.setattr(plugin_api, 'resume_held', lambda task_id, board, operator_receipt=None:
+                        calls.append((task_id, board, operator_receipt)) or {'ok': True, 'runtime_escalation': {}},
+                        raising=False)
+
+    response = client().post('/runtime-escalation/resume-held', json={
+        'board': 'default', 'task_id': 't_57851039', 'operator_receipt': receipt,
+    })
+
+    assert response.status_code == 200
+    assert calls == [('t_57851039', 'default', receipt)]
+
+
 def test_legacy_runtime_reconcile_route_is_an_alias_for_single_action_resume(monkeypatch):
     existing = {'board': 'board-a', 'task_id': 'rm03', 'intent': {'status': 'routed'}}
     calls = []

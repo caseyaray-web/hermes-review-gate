@@ -268,6 +268,26 @@ def _validate(data: Any) -> dict[str, Any]:
                     or set(no_effect["snapshot"]) != {"task", "runs", "events"}):
                 raise ValueError("runtime held reconciliation evidence is invalid")
         transport = _runtime_transport(entry_intent.get("transport"))
+        continuation_history = entry_intent.get("operator_continuation_history")
+        if continuation_history is not None:
+            if (not isinstance(continuation_history, list) or len(continuation_history) != 1
+                    or not isinstance(continuation_history[0], dict)
+                    or set(continuation_history[0]) != {"receipt", "snapshot"}
+                    or not isinstance(continuation_history[0]["receipt"], dict)
+                    or not isinstance(continuation_history[0]["snapshot"], dict)
+                    or set(continuation_history[0]["snapshot"]) != {"task", "runs", "events"}):
+                raise ValueError("runtime operator continuation history is invalid")
+            try:
+                continuation_bytes = json.dumps(continuation_history, sort_keys=True, separators=(",", ":")).encode()
+            except (TypeError, ValueError) as exc:
+                raise ValueError("runtime operator continuation history is invalid") from exc
+            if len(continuation_bytes) > 524288:
+                raise ValueError("runtime operator continuation history is invalid")
+        transport_history = entry_intent.get("transport_history")
+        if transport_history is not None:
+            if (not isinstance(transport_history, list) or any(_runtime_transport(item) is None for item in transport_history)
+                    or (transport is not None and (not transport_history or transport_history[0] != transport))):
+                raise ValueError("runtime escalation transport history is invalid")
         for number, attempt in enumerate(entry["attempts"], start=1):
             if (not isinstance(attempt, dict) or attempt.get("attempt") != number
                     or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))
@@ -566,6 +586,23 @@ def authorize_runtime_held_reconciliation(board: str, task_id: str, *, entry: di
         return json.loads(json.dumps(current))
 
 
+def authorize_operator_continuation(board: str, task_id: str, *, entry: dict[str, Any],
+                                    receipt: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Persist the one reviewed continuation before its reserved native effect."""
+    with locked_state(write=True) as data:
+        current = data['runtime_escalations'].get(binding_key(board, task_id))
+        if (current != entry or current.get('intent', {}).get('status') != 'held'
+                or current.get('intent', {}).get('operator_continuation_history')):
+            raise ValueError('runtime operator continuation intent changed')
+        intent = dict(current['intent'])
+        intent.update(status='unblock_requested', operator_continuation_history=[{
+            'receipt': json.loads(json.dumps(receipt)), 'snapshot': json.loads(json.dumps(snapshot)),
+        }])
+        current['intent'] = intent
+        current['attempts'][-1]['intent'] = dict(current['attempts'][-1]['intent'], status='unblock_requested')
+        return json.loads(json.dumps(current))
+
+
 def record_runtime_escalation_transport(board: str, task_id: str, operation: str, *,
                                         result: dict[str, Any] | None = None,
                                         error: BaseException | None = None) -> dict[str, Any]:
@@ -590,10 +627,24 @@ def record_runtime_escalation_transport(board: str, task_id: str, operation: str
         entry = data["runtime_escalations"].get(binding_key(board, task_id))
         if not isinstance(entry, dict):
             raise ValueError("runtime escalation intent is absent")
-        entry["intent"] = dict(entry.get("intent", {}), transport=transport)
+        intent = dict(entry.get("intent", {}))
+        history = list(intent.get("transport_history", []))
+        if not history:
+            history.append(intent.get("transport", transport))
+            if intent.get("transport") is not None:
+                history.append(transport)
+        else:
+            history.append(transport)
+        intent["transport_history"] = history
+        # Preserve the first actual transport receipt verbatim; subsequent
+        # transport outcomes are append-only history.
+        intent.setdefault("transport", transport)
+        entry["intent"] = intent
         attempts = entry.get("attempts")
         if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
-            attempts[-1]["intent"] = dict(attempts[-1].get("intent", {}), transport=transport)
+            attempt_intent = dict(attempts[-1].get("intent", {}))
+            attempt_intent.setdefault("transport", transport)
+            attempts[-1]["intent"] = attempt_intent
         return json.loads(json.dumps(entry))
 
 

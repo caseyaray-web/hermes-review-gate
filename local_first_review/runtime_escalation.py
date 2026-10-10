@@ -4,6 +4,22 @@ import json
 from typing import cast
 from . import state, native
 
+# This is deliberately an incident-scoped attestation, not a general native
+# run/session binding mechanism.  Changing any value makes the special path
+# unavailable; ordinary held-intent behavior remains unchanged.
+OPERATOR_CONTINUATION_RECEIPT = {
+    'scope': 'rm03-post-hold-continuation-v1',
+    'sessions': [
+        {'id': '20261010_104557_2b0040', 'sha256': '7b24ba0fa0a01aa1ea6c8bf1dd42b81c98fbefa2dd1442f8b40c382fe369560c', 'tool_calls': 20, 'api_calls': 10, 'disposition': 'blocked'},
+        {'id': '20261010_130543_2da108', 'sha256': 'edcd553c73351e4b81118b47ec4246b30f59cb3b6e6b828a6f03ac9a26a8cd5a', 'tool_calls': 2, 'api_calls': 3, 'disposition': 'crashed'},
+    ],
+    'later_event_manifest_sha256': '0ddacd18af6febfc7322d0ea8e31bab1c577befd95b3faaa56fd2762babe5596',
+    'later_runs': [
+        {'id': 2274, 'profile': 'worker-code-terra', 'status': 'blocked', 'outcome': 'blocked', 'started_at': 1791643552, 'ended_at': 1791643651},
+        {'id': 2275, 'profile': 'worker-code-terra', 'status': 'crashed', 'outcome': 'crashed', 'started_at': 1791651937, 'ended_at': 1791651999},
+    ],
+}
+
 def exclusive_operation():
     """Serialize native effects with supported runtime control writers."""
     return state.runtime_escalation_operation()
@@ -33,6 +49,63 @@ def _canonical_snapshot(value):
     except (TypeError, ValueError, OverflowError, RecursionError):
         return None
     return (detached, encoded) if len(encoded) <= 524288 else None
+
+
+def _operator_continuation_refusal(entry, binding, observed, p, receipt, *, recorded=False):
+    """Validate the single reviewed post-hold continuation without inference."""
+    if receipt != OPERATOR_CONTINUATION_RECEIPT:
+        return 'Operator continuation receipt does not exactly match the reviewed RM-03 scope.'
+    intent = entry.get('intent', {})
+    history = intent.get('operator_continuation_history')
+    if (entry.get('consumed_attempts') != 1 or binding != entry.get('binding')
+            or not isinstance(intent.get('operator_no_effect_reconciliation'), dict)
+            or intent.get('transport') != {'operation': 'kanban_unblock', 'result': {'ok': True, 'status': 'ready', 'task_id': 't_57851039'}}):
+        return 'Original proof, original successful unblock transport, or one-attempt ledger is not intact.'
+    task, runs, events = observed.get('task'), observed.get('runs'), observed.get('events')
+    if not isinstance(task, dict) or not isinstance(runs, list) or not isinstance(events, list):
+        return 'Current native history is incomplete or ambiguous.'
+    if recorded:
+        if (not isinstance(history, list) or len(history) != 1 or not isinstance(history[0], dict)
+                or history[0].get('receipt') != receipt or history[0].get('snapshot') != observed):
+            return 'The persisted operator continuation authorization changed or no longer matches native history.'
+    elif history:
+        return 'Original proof, original successful unblock transport, or one-attempt ledger is not intact.'
+    later_runs = [{key: run.get(key) for key in ('id', 'profile', 'status', 'outcome', 'started_at', 'ended_at')}
+                  for run in runs if isinstance(run, dict) and run.get('id', 0) > entry['failed_run_id']]
+    manifest = [{'kind': event.get('kind'), 'run_id': event.get('run_id'), 'created_at': event.get('created_at'), 'payload': event.get('payload')}
+                for event in events if isinstance(event, dict) and event.get('id', 0) > entry['failure']['event_id']]
+    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    attempt = entry.get('attempts', [{}])[0]
+    target = attempt.get('implementation_profile') if isinstance(attempt, dict) else None
+    if (task.get('id') != entry.get('task_id') or later_runs != receipt['later_runs']
+            or digest != receipt['later_event_manifest_sha256'] or len(manifest) != 15
+            or not isinstance(target, str) or task.get('status') != 'blocked'
+            or task.get('assignee') != target or task.get('current_run_id') is not None
+            or any(run.get('ended_at') is None for run in runs if isinstance(run, dict))
+            or task.get('workspace_path') != entry.get('workspace_path')
+            or p._workspace_checkpoint(entry['workspace_path']) != entry.get('checkpoint')
+            or not p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path'])
+            or not lease_valid(entry)):
+        return 'Current state no longer exactly matches the reviewed post-hold continuation receipt.'
+    return None
+
+
+def _continuation_post_unblock_current(entry, binding, observed, p, target):
+    """Recheck mutable authority before publishing the continuation route."""
+    policy = p.board_policy(entry['board']) or {}
+    settings = policy.get('runtime_escalation', {})
+    task = observed.get('task') if isinstance(observed, dict) else None
+    reviewer = entry['attempts'][0].get('reviewer_profile')
+    return (isinstance(task, dict) and binding == entry.get('binding')
+            and settings.get('enabled') is True and lease_valid(entry)
+            and target == settings.get('implementation_profile')
+            and isinstance(reviewer, str) and p.profile_exists(target) and p.profile_exists(reviewer)
+            and p._runtime_failure_record(observed, entry['failed_run_id']) == entry['failure']
+            and task.get('workspace_path') == entry['workspace_path']
+            and task.get('status') in {'ready', 'todo'} and task.get('assignee') == target
+            and task.get('current_run_id') is None
+            and p._workspace_checkpoint(entry['workspace_path']) == entry['checkpoint']
+            and p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path']))
 
 
 def _reconciliation_proof(entry):
@@ -195,7 +268,7 @@ def _reauthorize_held_locked(task_id, board):
     return True, None
 
 
-def resume_held(task_id, board):
+def resume_held(task_id, board, operator_receipt=None):
     """One operator action: prove, authorize, then reconcile once under effect fences."""
     with exclusive_operation() as acquired:
         if not acquired:
@@ -213,13 +286,31 @@ def resume_held(task_id, board):
                     'message': 'This exact held intent is already routed; no native effect was repeated.'}
         if status == 'held':
             if proof is not None:
-                return {'ok': False, 'reason': 'This authorized continuation is already held after its one effect window; refusing another attempt.'}
+                if operator_receipt is None:
+                    return {'ok': False, 'reason': 'This authorized continuation is already held after its one effect window; refusing another attempt.'}
+                from . import plugin as p
+                binding = p.task_binding(task_id, board)
+                try:
+                    observed = native.snapshot(board, task_id)
+                except Exception as exc:
+                    return {'ok': False, 'reason': f'Current native history is unavailable: {type(exc).__name__}: {exc}'}
+                refusal = _operator_continuation_refusal(entry, binding, observed, p, operator_receipt)
+                if refusal:
+                    return {'ok': False, 'reason': refusal}
+                try:
+                    state.authorize_operator_continuation(board, task_id, entry=entry,
+                                                          receipt=operator_receipt, snapshot=observed)
+                except ValueError as exc:
+                    return {'ok': False, 'reason': str(exc)}
+                entry = state.runtime_escalation_entry(task_id, board)
+                status = entry.get('intent', {}).get('status') if isinstance(entry, dict) else None
             authorized, reason = _reauthorize_held_locked(task_id, board)
-            if not authorized:
-                return {'ok': False, 'reason': reason or 'Held-intent proof failed; native state was not changed.'}
-            entry = state.runtime_escalation_entry(task_id, board)
-            proof = _reconciliation_proof(entry) if isinstance(entry, dict) else None
-            status = entry.get('intent', {}).get('status') if isinstance(entry, dict) else None
+            if status == 'held':
+                if not authorized:
+                    return {'ok': False, 'reason': reason or 'Held-intent proof failed; native state was not changed.'}
+                entry = state.runtime_escalation_entry(task_id, board)
+                proof = _reconciliation_proof(entry) if isinstance(entry, dict) else None
+                status = entry.get('intent', {}).get('status') if isinstance(entry, dict) else None
         elif status != 'unblock_requested' or proof is None:
             return {'ok': False, 'reason': f'Runtime intent is {status!r}; only an unattempted, explicitly authorized held continuation can resume.'}
         if status != 'unblock_requested' or proof is None:
@@ -257,6 +348,7 @@ def reconcile(task_id, board):
         settings = policy.get('runtime_escalation', {})
         attempt = entry['attempts'][0]
         target, reviewer = attempt['implementation_profile'], attempt['reviewer_profile']
+        continuation = entry.get('intent', {}).get('operator_continuation_history')
         if (entry.get('legacy_unverifiable') or binding != entry['binding']
                 or settings.get('enabled') is not True
                 or target == reviewer or not p.profile_exists(target) or not p.profile_exists(reviewer)
@@ -277,7 +369,8 @@ def reconcile(task_id, board):
         if task.get('status') == 'blocked':
             if status not in {'catchup_requested', 'unblock_requested'}:
                 return hold(board, task_id, 'Unblock outcome is unresolved; refusing duplicate effect')
-            if task.get('assignee') != binding['implementation_profile'] or observed['runs'][-1:][0:1] and observed['runs'][-1]['id'] != entry['failed_run_id']:
+            if (not continuation and (task.get('assignee') != binding['implementation_profile']
+                                      or observed['runs'][-1:][0:1] and observed['runs'][-1]['id'] != entry['failed_run_id'])):
                 return hold(board, task_id, 'Blocked task no longer matches the original failed worker')
             # The previous observation is stale at the native-effect boundary.
             # Revalidate every mutable authority input before spending the one
@@ -312,7 +405,10 @@ def reconcile(task_id, board):
                         or not p.profile_exists(final_target) or not p.profile_exists(final_reviewer)
                         or (proof is None and (entry.get('intent', {}).get('operator_no_effect_reconciliation') is not None
                                                or not ordinary_current))
-                        or (proof is not None and (not _no_effect_current(entry, binding, observed, p)
+                        or (continuation and _operator_continuation_refusal(
+                            entry, binding, observed, p, continuation[0].get('receipt') if isinstance(continuation, list) and continuation else None,
+                            recorded=True))
+                        or (proof is not None and not continuation and (not _no_effect_current(entry, binding, observed, p)
                                                    or observed != proof['snapshot']))):
                     return hold(board, task_id, 'Runtime authority or no-effect proof changed before native unblock')
             except Exception as exc:
@@ -331,6 +427,17 @@ def reconcile(task_id, board):
                 return hold(board, task_id, f'Native unblock readback failed: {type(exc).__name__}: {exc}')
             task = observed['task']
         unblocks = _events(observed, 'unblocked', entry['failure']['event_id'])
+        if continuation:
+            prior_events = continuation[0].get('snapshot', {}).get('events', []) if isinstance(continuation, list) and continuation else []
+            prior_ids = {event.get('id') for event in prior_events if isinstance(event, dict)}
+            fresh = [event for event in unblocks if event.get('id') not in prior_ids]
+            if (len(fresh) != 1 or not _continuation_post_unblock_current(
+                    entry, binding, observed, p, target)):
+                return hold(board, task_id, 'No unique native unblock receipt or current authority for the reviewed continuation')
+            # The target already owns this card; a reassignment would be a
+            # second native effect and is forbidden by the attestation scope.
+            state.publish_runtime_escalation_routing(board, task_id, binding=binding)
+            return True
         if len(unblocks) != 1 or task.get('status') not in {'ready','todo','running'}:
             if transport_error is not None:
                 return hold(board, task_id, f'Native unblock transport failed: {transport_error}')
