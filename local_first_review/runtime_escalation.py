@@ -59,6 +59,7 @@ def reconcile(task_id, board):
                 or p._workspace_checkpoint(entry['workspace_path']) != entry['checkpoint']
                 or not p._workspace_is_exclusive(board, task_id, entry['workspace_path'])):
             return hold(board, task_id, 'Runtime failure evidence or workspace checkpoint/ownership changed')
+        transport_error = None
         if task.get('status') == 'blocked':
             if status not in {'catchup_requested', 'unblock_requested'}:
                 return hold(board, task_id, 'Unblock outcome is unresolved; refusing duplicate effect')
@@ -66,12 +67,21 @@ def reconcile(task_id, board):
                 return hold(board, task_id, 'Blocked task no longer matches the original failed worker')
             state.update_runtime_escalation_intent(board, task_id, 'unblock_attempted')
             try:
-                p._dispatch('kanban_unblock', {'board':board, 'task_id':task_id})
-            except Exception:
-                pass  # The persisted unknown outcome is reconciled only through readback.
-            observed = native.snapshot(board, task_id); task = observed['task']
+                result = p._dispatch('kanban_unblock', {'task_id': task_id})
+            except Exception as exc:
+                state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', error=exc)
+                transport_error = f'{type(exc).__name__}: {exc}'
+            else:
+                state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', result=result)
+            try:
+                observed = native.snapshot(board, task_id)
+            except Exception as exc:
+                return hold(board, task_id, f'Native unblock readback failed: {type(exc).__name__}: {exc}')
+            task = observed['task']
         unblocks = _events(observed, 'unblocked', entry['failure']['event_id'])
         if len(unblocks) != 1 or task.get('status') not in {'ready','todo','running'}:
+            if transport_error is not None:
+                return hold(board, task_id, f'Native unblock transport failed: {transport_error}')
             return hold(board, task_id, 'No unique native unblock receipt for the exact failure')
         assigned = _events(observed, 'assigned', unblocks[0]['id'])
         if task.get('assignee') != target:

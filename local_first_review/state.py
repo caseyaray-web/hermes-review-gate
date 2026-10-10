@@ -60,6 +60,32 @@ def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _runtime_transport(value: Any) -> dict[str, Any] | None:
+    """Validate the bounded persisted native-unblock transport diagnostic."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("operation") != "kanban_unblock":
+        raise ValueError("runtime escalation transport record is invalid")
+    has_result, has_error = "result" in value, "error" in value
+    if has_result == has_error:
+        raise ValueError("runtime escalation transport record is invalid")
+    if has_result:
+        if not isinstance(value["result"], dict):
+            raise ValueError("runtime escalation transport record is invalid")
+    else:
+        error = value["error"]
+        if (not isinstance(error, dict) or set(error) != {"type", "message"}
+                or not _text(error.get("type")) or not _text(error.get("message"))):
+            raise ValueError("runtime escalation transport record is invalid")
+    try:
+        encoded = json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("runtime escalation transport record is invalid") from exc
+    if len(encoded.encode()) > 4096:
+        raise ValueError("runtime escalation transport record is invalid")
+    return json.loads(encoded)
+
+
 def _recovery_settings(value: Any) -> dict[str, Any]:
     """Validate the persisted board policy; zero is never a pause surrogate."""
     if not isinstance(value, dict) or set(value) != {"enabled", "max_per_phase"}:
@@ -218,11 +244,17 @@ def _validate(data: Any) -> dict[str, Any]:
             if entry.get("legacy_unverifiable"):
                 raise ValueError("legacy runtime escalation cannot carry coder context")
             _runtime_coder_context(context, failure=entry["failure"], checkpoint=entry["checkpoint"])
+        entry_intent = entry.get("intent")
+        if not isinstance(entry_intent, dict):
+            raise ValueError("runtime escalation ledger is invalid")
+        transport = _runtime_transport(entry_intent.get("transport"))
         for number, attempt in enumerate(entry["attempts"], start=1):
             if (not isinstance(attempt, dict) or attempt.get("attempt") != number
                     or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))
                     or not isinstance(attempt.get("intent"), dict)):
                 raise ValueError("runtime escalation ledger is invalid")
+            if _runtime_transport(attempt["intent"].get("transport")) != transport:
+                raise ValueError("runtime escalation transport record is invalid")
     for key, route in data["effective_routing"].items():
         if (not isinstance(key, str) or not isinstance(route, dict) or not _text(route.get("board"))
                 or not _text(route.get("task_id")) or key != binding_key(route["board"], route["task_id"])):
@@ -445,6 +477,37 @@ def update_runtime_escalation_intent(board: str, task_id: str, status: str, *, r
         attempts = entry.get("attempts")
         if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
             attempts[-1]["intent"] = dict(attempts[-1].get("intent", {}), status=status)
+        return json.loads(json.dumps(entry))
+
+
+def record_runtime_escalation_transport(board: str, task_id: str, operation: str, *,
+                                        result: dict[str, Any] | None = None,
+                                        error: BaseException | None = None) -> dict[str, Any]:
+    """Persist the bounded outcome of one native transport call before readback."""
+    if operation != "kanban_unblock" or (result is None) == (error is None):
+        raise ValueError("runtime escalation transport record is invalid")
+    if result is not None:
+        try:
+            encoded = json.dumps(result, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("runtime escalation transport result is invalid") from exc
+        if len(encoded.encode()) > 4096:
+            raise ValueError("runtime escalation transport result exceeds its bounded limit")
+        transport = {"operation": operation, "result": json.loads(encoded)}
+    else:
+        message = str(error)
+        if len(message.encode()) > 2048:
+            message = message.encode()[:2048].decode(errors="replace")
+        transport = {"operation": operation,
+                     "error": {"type": type(error).__name__, "message": message}}
+    with locked_state(write=True) as data:
+        entry = data["runtime_escalations"].get(binding_key(board, task_id))
+        if not isinstance(entry, dict):
+            raise ValueError("runtime escalation intent is absent")
+        entry["intent"] = dict(entry.get("intent", {}), transport=transport)
+        attempts = entry.get("attempts")
+        if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
+            attempts[-1]["intent"] = dict(attempts[-1].get("intent", {}), transport=transport)
         return json.loads(json.dumps(entry))
 
 

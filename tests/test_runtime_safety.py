@@ -77,7 +77,66 @@ def test_runtime_effect_transport_pins_selected_board(runtime,monkeypatch):
     monkeypatch.setattr(plugin,'_dispatch',unblock)
     monkeypatch.setattr(native,'reassign_ready_task',reassign)
     assert plugin._reconcile_runtime_exhaustion_escalation('task','default',entry)
-    assert calls==[{'board':'default','task_id':'task'}]
+    assert calls==[{'task_id':'task'}]
+    assert state.runtime_escalation_entry('task', 'default')['intent']['transport'] == {
+        'operation': 'kanban_unblock', 'result': {'status': 'ready'},
+    }
+
+
+def test_runtime_unblock_transport_error_is_persisted_before_safe_hold(runtime, monkeypatch):
+    binding, entry, show = runtime
+
+    def refused(*_args):
+        raise plugin.GateError('native kanban_unblock refused: unknown parameter(s): board')
+
+    monkeypatch.setattr(plugin, '_dispatch', refused)
+
+    assert not runtime_escalation.reconcile('task', 'default')
+
+    stored = state.runtime_escalation_entry('task', 'default')
+    transport = stored['intent']['transport']
+    assert transport == {
+        'operation': 'kanban_unblock',
+        'error': {
+            'type': 'GateError',
+            'message': 'native kanban_unblock refused: unknown parameter(s): board',
+        },
+    }
+    assert stored['intent']['status'] == 'held'
+    assert 'Native unblock transport failed: GateError: native kanban_unblock refused' in stored['intent']['reason']
+    assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
+
+
+def test_runtime_unblock_readback_error_is_held_after_transport_attempt(runtime, monkeypatch):
+    binding, entry, show = runtime
+    snapshots = [show, RuntimeError('native snapshot unavailable')]
+
+    def snapshot(*_args):
+        value = snapshots.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return copy.deepcopy(value)
+
+    monkeypatch.setattr(native, 'snapshot', snapshot)
+    monkeypatch.setattr(plugin, '_dispatch', lambda *_args: {'status': 'ready'})
+
+    assert not runtime_escalation.reconcile('task', 'default')
+
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'held'
+    assert stored['intent']['transport'] == {
+        'operation': 'kanban_unblock', 'result': {'status': 'ready'},
+    }
+    assert 'Native unblock readback failed: RuntimeError: native snapshot unavailable' in stored['intent']['reason']
+    assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
+
+
+def test_runtime_transport_record_rejects_invalid_persisted_shape(runtime):
+    with pytest.raises(ValueError, match='runtime escalation transport record is invalid'):
+        with state.locked_state(write=True) as data:
+            data['runtime_escalations']['default:task']['intent']['transport'] = {
+                'operation': 'kanban_unblock', 'error': {'type': 'GateError'},
+            }
 
 
 def test_failed_stronger_attempt_is_held_without_refunding_or_recovery(runtime):
