@@ -109,7 +109,8 @@ def test_runtime_unblock_transport_error_is_persisted_before_safe_hold(runtime, 
 
 def test_runtime_unblock_readback_error_is_held_after_transport_attempt(runtime, monkeypatch):
     binding, entry, show = runtime
-    snapshots = [show, RuntimeError('native snapshot unavailable')]
+    # Initial admission plus final pre-send authority barrier, then readback.
+    snapshots = [show, show, RuntimeError('native snapshot unavailable')]
 
     def snapshot(*_args):
         value = snapshots.pop(0)
@@ -162,6 +163,110 @@ def test_explicit_held_reconciliation_proves_no_effect_then_allows_one_real_tick
     monkeypatch.setattr(native, 'reassign_ready_task', lambda *_: True)
     assert runtime_escalation.reconcile('task', 'default') is False
     assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'held'
+
+
+def test_held_reconciliation_is_idempotent_after_progress_without_recapturing_snapshot(runtime, monkeypatch):
+    """A lost POST response returns its original proof even after the tick moved on."""
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='legacy Unknown tool no-effect hold')
+    show['runs'].append({'id': 11, 'profile': 'impl', 'status': 'gave_up', 'outcome': 'gave_up',
+                         'started_at': 1, 'ended_at': 2})
+    assert runtime_escalation.reauthorize_held('task', 'default')
+    proof = state.runtime_escalation_entry('task', 'default')['intent']['operator_no_effect_reconciliation']
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='tick failed after the only attempt')
+    monkeypatch.setattr(native, 'snapshot', lambda *_: pytest.fail('idempotent replay must not recapture native snapshot'))
+
+    assert runtime_escalation.reauthorize_held('task', 'default')
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['operator_no_effect_reconciliation'] == proof
+    assert stored['intent']['status'] == 'held'
+    assert stored['consumed_attempts'] == 1
+
+
+def test_reauthorized_tick_revalidates_authority_immediately_before_unblock(runtime, monkeypatch):
+    """A pause arriving after initial observation prevents the native send."""
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='legacy Unknown tool no-effect hold')
+    show['runs'].append({'id': 11, 'profile': 'impl', 'status': 'gave_up', 'outcome': 'gave_up',
+                         'started_at': 1, 'ended_at': 2})
+    assert runtime_escalation.reauthorize_held('task', 'default')
+    calls = []
+    original_snapshot = native.snapshot
+    snapshots = 0
+
+    def snapshot(*args):
+        nonlocal snapshots
+        snapshots += 1
+        if snapshots == 2:
+            state.set_runtime_escalation_policy('default', enabled=False)
+        return original_snapshot(*args)
+
+    monkeypatch.setattr(native, 'snapshot', snapshot)
+    monkeypatch.setattr(plugin, '_dispatch', lambda *args: calls.append(args) or pytest.fail('send after pause'))
+
+    assert not runtime_escalation.reconcile('task', 'default')
+    assert calls == []
+    assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'held'
+
+
+def test_runtime_policy_writer_is_busy_during_native_unblock_authority(runtime, monkeypatch):
+    """A supported pause writer cannot slip between final validation and send."""
+    binding, entry, show = runtime
+    writer_results, effects = [], []
+
+    def unblock(*_args):
+        with pytest.raises(RuntimeError, match='runtime escalation operation is busy'):
+            state.set_runtime_escalation_policy('default', enabled=False)
+        writer_results.append(state.board_policy('default')['runtime_escalation']['enabled'])
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
+        return {'status': 'ready'}
+
+    def reassign(_board, _task, profile):
+        effects.append(profile)
+        show['task']['assignee'] = profile
+        show['events'].append({'id': 22, 'kind': 'assigned', 'run_id': None,
+                               'payload': {'from': 'impl', 'assignee': profile}})
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    monkeypatch.setattr(native, 'reassign_ready_task', reassign)
+
+    assert runtime_escalation.reconcile('task', 'default')
+    assert writer_results == [True]
+    assert effects == ['strong']
+
+
+def test_reassign_final_barrier_holds_when_lease_changes_after_unblock_readback(runtime, monkeypatch):
+    """A lease change after the unblock receipt must prevent reassignment/publish."""
+    binding, entry, show = runtime
+    original_snapshot = native.snapshot
+    snapshots, reassigned = 0, []
+
+    def snapshot(*args):
+        nonlocal snapshots
+        snapshots += 1
+        value = original_snapshot(*args)
+        if snapshots == 3:  # exact unblock readback, before the reassign barrier
+            with state.locked_state(write=True) as data:
+                data['workspace_leases'][binding['workspace_path']] = 'another-owner'
+        return value
+
+    def unblock(*_args):
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
+        return {'status': 'ready'}
+
+    monkeypatch.setattr(native, 'snapshot', snapshot)
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *args: reassigned.append(args))
+
+    assert not runtime_escalation.reconcile('task', 'default')
+    assert snapshots == 4
+    assert reassigned == []
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'held'
+    assert stored['consumed_attempts'] == 1
+    assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
 
 
 def test_held_reconciliation_refuses_any_later_native_effect_without_reauthorizing(runtime):

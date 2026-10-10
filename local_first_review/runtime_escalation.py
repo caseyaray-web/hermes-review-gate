@@ -1,25 +1,11 @@
 """Bounded runtime escalation effect reconciliation and workspace admission."""
-from contextlib import contextmanager
 import hashlib
 import json
-import fcntl
 from . import state, native
 
-@contextmanager
 def exclusive_operation():
-    """Serialize intent/effect/readback across processes without nesting state locks."""
-    path = state.state_path().with_suffix('.runtime.lock')
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('a') as stream:
-        try:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(stream, fcntl.LOCK_UN)
+    """Serialize native effects with supported runtime control writers."""
+    return state.runtime_escalation_operation()
 
 def hold(board, task_id, reason):
     state.update_runtime_escalation_intent(board, task_id, 'held', reason=reason + '; inspect the exact native run and workspace before operator intervention')
@@ -31,6 +17,89 @@ def lease_valid(entry):
 
 def _events(show, kind, after):
     return [e for e in show['events'] if type(e.get('id')) is int and e['id'] > after and e.get('kind') == kind]
+
+
+def _canonical_snapshot(value):
+    """Return one bounded, detached complete native read or ``None``."""
+    if not isinstance(value, dict) or set(value) != {'task', 'runs', 'events'}:
+        return None
+    if (not isinstance(value['task'], dict) or not isinstance(value['runs'], list)
+            or not isinstance(value['events'], list)):
+        return None
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+        detached = json.loads(encoded)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+    return (detached, encoded) if len(encoded) <= 524288 else None
+
+
+def _reconciliation_proof(entry):
+    proof = entry.get('intent', {}).get('operator_no_effect_reconciliation')
+    if not isinstance(proof, dict):
+        return None
+    required = {'binding', 'failure', 'checkpoint', 'failed_run_id', 'snapshot', 'snapshot_sha256'}
+    canonical = _canonical_snapshot(proof.get('snapshot'))
+    if (set(proof) != required or canonical is None or not isinstance(proof.get('snapshot_sha256'), str)
+            or hashlib.sha256(canonical[1]).hexdigest() != proof['snapshot_sha256']
+            or proof.get('binding') != entry.get('binding') or proof.get('failure') != entry.get('failure')
+            or proof.get('checkpoint') != entry.get('checkpoint')
+            or proof.get('failed_run_id') != entry.get('failed_run_id')):
+        return None
+    return proof
+
+
+def _no_effect_current(entry, binding, observed, p):
+    """Verify the full current native history still equals the held proof."""
+    canonical = _canonical_snapshot(observed)
+    if canonical is None:
+        return False
+    task, runs, events = canonical[0]['task'], canonical[0]['runs'], canonical[0]['events']
+    failed_run_id, failure = entry.get('failed_run_id'), entry.get('failure')
+    if type(failed_run_id) is not int or not isinstance(failure, dict) or task.get('id') != entry.get('task_id'):
+        return False
+    run_ids = [run.get('id') for run in runs if isinstance(run, dict)]
+    event_ids = [event.get('id') for event in events if isinstance(event, dict)]
+    return (len(run_ids) == len(runs) and len(event_ids) == len(events)
+            and all(type(value) is int and value > 0 for value in [*run_ids, *event_ids])
+            and len(set(run_ids)) == len(run_ids) and len(set(event_ids)) == len(event_ids)
+            and p._runtime_failure_record(canonical[0], failed_run_id) == failure
+            and failed_run_id == max(run_ids, default=0)
+            and failure.get('event_id') == max(event_ids, default=0)
+            and task.get('status') == 'blocked' and task.get('assignee') == binding.get('implementation_profile')
+            and task.get('workspace_path') == entry.get('workspace_path')
+            and p._workspace_checkpoint(entry['workspace_path']) == entry.get('checkpoint')
+            and p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path']))
+
+
+def _reassignment_barrier(board, task_id, p, expected_assignee):
+    """Read every authority again immediately before reassigning or routing."""
+    observed = native.snapshot(board, task_id)
+    entry = state.runtime_escalation_entry(task_id, board)
+    binding = p.task_binding(task_id, board)
+    settings = (p.board_policy(board) or {}).get('runtime_escalation', {})
+    if not isinstance(entry, dict) or not isinstance(binding, dict):
+        return None
+    attempts = entry.get('attempts')
+    attempt = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 and isinstance(attempts[0], dict) else None
+    task = observed.get('task') if isinstance(observed, dict) else None
+    if not isinstance(attempt, dict) or not isinstance(task, dict):
+        return None
+    target, reviewer = attempt.get('implementation_profile'), attempt.get('reviewer_profile')
+    unblocks = _events(observed, 'unblocked', entry.get('failure', {}).get('event_id'))
+    if (binding != entry.get('binding') or settings.get('enabled') is not True or not lease_valid(entry)
+            or not isinstance(target, str) or not isinstance(reviewer, str) or target == reviewer
+            or target != settings.get('implementation_profile') or reviewer != settings.get('reviewer_profile')
+            or not p.profile_exists(target) or not p.profile_exists(reviewer)
+            or p._runtime_failure_record(observed, entry.get('failed_run_id')) != entry.get('failure')
+            or task.get('workspace_path') != entry.get('workspace_path')
+            or task.get('assignee') != expected_assignee
+            or task.get('status') not in {'ready', 'todo', 'running'}
+            or p._workspace_checkpoint(entry['workspace_path']) != entry.get('checkpoint')
+            or not p._workspace_is_exclusive(board, task_id, entry['workspace_path'])
+            or len(unblocks) != 1):
+        return None
+    return entry, binding, target, observed, unblocks[0]
 
 
 def reauthorize_held(task_id, board):
@@ -47,6 +116,12 @@ def reauthorize_held(task_id, board):
         entry = state.runtime_escalation_entry(task_id, board)
         if not isinstance(entry, dict) or entry.get('legacy_unverifiable'):
             return False
+        # A client may retry after the original response was lost, including
+        # after the one tick subsequently progressed or re-held the intent.
+        # Replaying the durable proof is deliberately read-free and never opens
+        # another authorization window.
+        if _reconciliation_proof(entry) is not None:
+            return True
         if (entry.get('intent', {}).get('status') != 'held' or entry.get('consumed_attempts') != 1
                 or 'transport' in entry.get('intent', {})):
             return False
@@ -62,36 +137,21 @@ def reauthorize_held(task_id, board):
                 or not lease_valid(entry)):
             return False
         try:
-            observed = native.snapshot(board, task_id)
-            encoded = json.dumps(observed, sort_keys=True, separators=(',', ':')).encode()
-        except (OSError, RuntimeError, TypeError, ValueError):
+            canonical = _canonical_snapshot(native.snapshot(board, task_id))
+        except Exception:
             return False
-        # Refuse incomplete/ambiguous snapshots rather than treating a partial
-        # history as a no-effect proof.
-        if (len(encoded) > 524288 or not isinstance(observed.get('task'), dict)
-                or not isinstance(observed.get('runs'), list) or not isinstance(observed.get('events'), list)):
+        if canonical is None:
             return False
-        task, runs, events = observed['task'], observed['runs'], observed['events']
-        failed_run_id, failure = entry.get('failed_run_id'), entry.get('failure')
-        run_ids = [run.get('id') for run in runs if isinstance(run, dict)]
-        event_ids = [event.get('id') for event in events if isinstance(event, dict)]
-        if (len(run_ids) != len(runs) or len(event_ids) != len(events)
-                or any(type(value) is not int or value <= 0 for value in [*run_ids, *event_ids])
-                or len(set(run_ids)) != len(run_ids) or len(set(event_ids)) != len(event_ids)
-                or p._runtime_failure_record(observed, failed_run_id) != failure
-                or any(run_id > failed_run_id for run_id in run_ids)
-                or any(event_id > failure.get('event_id', 0) for event_id in event_ids)
-                or task.get('status') != 'blocked' or task.get('assignee') != binding.get('implementation_profile')
-                or task.get('workspace_path') != entry.get('workspace_path')
-                or p._workspace_checkpoint(entry['workspace_path']) != entry.get('checkpoint')
-                or not p._workspace_is_exclusive(board, task_id, entry['workspace_path'])):
+        observed, encoded = canonical
+        if not _no_effect_current(entry, binding, observed, p):
             return False
+        failed_run_id, failure = entry['failed_run_id'], entry['failure']
         evidence = {
             'binding': binding,
             'failure': failure,
             'checkpoint': entry['checkpoint'],
             'failed_run_id': failed_run_id,
-            'snapshot': json.loads(encoded),
+            'snapshot': observed,
             'snapshot_sha256': hashlib.sha256(encoded).hexdigest(),
         }
         state.authorize_runtime_held_reconciliation(board, task_id, entry=entry, evidence=evidence)
@@ -120,7 +180,10 @@ def reconcile(task_id, board):
                 or target != settings.get('implementation_profile') or reviewer != settings.get('reviewer_profile')
                 or not lease_valid(entry)):
             return hold(board, task_id, 'Runtime policy, profiles, original binding or exclusive lease changed')
-        observed = native.snapshot(board, task_id)
+        try:
+            observed = native.snapshot(board, task_id)
+        except Exception as exc:
+            return hold(board, task_id, f'Native reconciliation read failed: {type(exc).__name__}: {exc}')
         task = observed['task']
         if (p._runtime_failure_record(observed, entry['failed_run_id']) != entry['failure']
                 or task.get('workspace_path') != entry['workspace_path']
@@ -133,6 +196,44 @@ def reconcile(task_id, board):
                 return hold(board, task_id, 'Unblock outcome is unresolved; refusing duplicate effect')
             if task.get('assignee') != binding['implementation_profile'] or observed['runs'][-1:][0:1] and observed['runs'][-1]['id'] != entry['failed_run_id']:
                 return hold(board, task_id, 'Blocked task no longer matches the original failed worker')
+            # The previous observation is stale at the native-effect boundary.
+            # Revalidate every mutable authority input before spending the one
+            # already-reserved native send.
+            try:
+                entry = state.runtime_escalation_entry(task_id, board)
+                binding = p.task_binding(task_id, board)
+                observed = native.snapshot(board, task_id)
+                # Read policy after the last native read: a control write can
+                # race that read while the operation lock is held locally.
+                policy = p.board_policy(board) or {}
+                settings = policy.get('runtime_escalation', {})
+                proof = _reconciliation_proof(entry) if isinstance(entry, dict) else None
+                final_attempts = entry.get('attempts') if isinstance(entry, dict) else None
+                final_attempt = final_attempts[0] if isinstance(final_attempts, list) and len(final_attempts) == 1 and isinstance(final_attempts[0], dict) else None
+                final_target = final_attempt.get('implementation_profile') if isinstance(final_attempt, dict) else None
+                final_reviewer = final_attempt.get('reviewer_profile') if isinstance(final_attempt, dict) else None
+                task = observed.get('task') if isinstance(observed, dict) else None
+                ordinary_current = (isinstance(task, dict)
+                                    and p._runtime_failure_record(observed, entry['failed_run_id']) == entry['failure']
+                                    and task.get('status') == 'blocked'
+                                    and task.get('assignee') == binding.get('implementation_profile')
+                                    and task.get('workspace_path') == entry.get('workspace_path')
+                                    and p._workspace_checkpoint(entry['workspace_path']) == entry.get('checkpoint')
+                                    and p._workspace_is_exclusive(board, task_id, entry['workspace_path']))
+                if (not isinstance(entry, dict) or binding != entry.get('binding')
+                        or settings.get('enabled') is not True or not lease_valid(entry)
+                        or not isinstance(final_target, str) or not isinstance(final_reviewer, str)
+                        or final_target == final_reviewer
+                        or final_target != settings.get('implementation_profile')
+                        or final_reviewer != settings.get('reviewer_profile')
+                        or not p.profile_exists(final_target) or not p.profile_exists(final_reviewer)
+                        or (proof is None and (entry.get('intent', {}).get('operator_no_effect_reconciliation') is not None
+                                               or not ordinary_current))
+                        or (proof is not None and (not _no_effect_current(entry, binding, observed, p)
+                                                   or observed != proof['snapshot']))):
+                    return hold(board, task_id, 'Runtime authority or no-effect proof changed before native unblock')
+            except Exception as exc:
+                return hold(board, task_id, f'Runtime authority revalidation failed before native unblock: {type(exc).__name__}: {exc}')
             state.update_runtime_escalation_intent(board, task_id, 'unblock_attempted')
             try:
                 result = p._dispatch('kanban_unblock', {'board': board, 'task_id': task_id})
@@ -151,6 +252,18 @@ def reconcile(task_id, board):
             if transport_error is not None:
                 return hold(board, task_id, f'Native unblock transport failed: {transport_error}')
             return hold(board, task_id, 'No unique native unblock receipt for the exact failure')
+        # The unblock readback is not authority to assign: controls, lease,
+        # binding, profiles, checkpoint and native ownership are all mutable.
+        try:
+            expected_owner = target if status == 'reassign_attempted' else binding['implementation_profile']
+            barrier = _reassignment_barrier(board, task_id, p, expected_owner)
+        except Exception as exc:
+            return hold(board, task_id, f'Runtime authority revalidation failed before native reassignment: {type(exc).__name__}: {exc}')
+        if barrier is None:
+            return hold(board, task_id, 'Runtime authority changed before native reassignment')
+        entry, binding, target, observed, unblock = barrier
+        unblocks = [unblock]
+        task = observed['task']
         assigned = _events(observed, 'assigned', unblocks[0]['id'])
         if task.get('assignee') != target:
             if status == 'reassign_attempted' or assigned or task.get('status') == 'running':
@@ -158,12 +271,30 @@ def reconcile(task_id, board):
             if task.get('assignee') != binding['implementation_profile']:
                 return hold(board, task_id, 'Native owner changed before reassignment')
             state.update_runtime_escalation_intent(board, task_id, 'reassign_attempted')
+            reassign_error = None
             try:
                 native.reassign_ready_task(board, task_id, target)
-            except Exception:
-                pass
-            observed = native.snapshot(board, task_id); task = observed['task']
+            except Exception as exc:
+                reassign_error = f'{type(exc).__name__}: {exc}'
+            try:
+                observed = native.snapshot(board, task_id)
+            except Exception as exc:
+                return hold(board, task_id, f'Native reassignment readback failed: {type(exc).__name__}: {exc}')
+            task = observed['task']
             assigned = _events(observed, 'assigned', unblocks[0]['id'])
+            if reassign_error is not None and not assigned:
+                return hold(board, task_id, f'Native reassignment transport failed: {reassign_error}')
+        # Recheck once more before publishing a route after the native effect.
+        try:
+            barrier = _reassignment_barrier(board, task_id, p, target)
+        except Exception as exc:
+            return hold(board, task_id, f'Runtime authority revalidation failed before route publication: {type(exc).__name__}: {exc}')
+        if barrier is None:
+            return hold(board, task_id, 'Runtime authority changed before route publication')
+        entry, binding, target, observed, unblock = barrier
+        unblocks = [unblock]
+        task = observed['task']
+        assigned = _events(observed, 'assigned', unblocks[0]['id'])
         if (len(assigned) != 1 or assigned[0].get('payload') != {'assignee':target,'from':binding['implementation_profile']}
                 or task.get('assignee') != target or task.get('status') not in {'ready','todo','running'}):
             return hold(board, task_id, 'No unique native reassignment receipt for configured escalation')

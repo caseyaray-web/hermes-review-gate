@@ -117,21 +117,33 @@ def test_joined_rm03_explicit_catchup_preserves_dirty_work_and_fresh_review(rm03
 
 
 
-def test_joined_held_unknown_transport_reconciliation_resumes_same_attempt(rm03):
-    """Old held RM03 has no receipt; explicit proof resumes its original attempt."""
+def test_joined_held_unknown_transport_reconciliation_resumes_same_attempt(rm03, monkeypatch):
+    """Model the old Unknown-tool no-effect hold, then recover through the public POST."""
     b = rm03
     tid = b.rm_tid
     adopted = adopt(b)
     assert 'transport' not in adopted['runtime_escalation']['intent']
-    state.update_runtime_escalation_intent('default', tid, 'held',
-                                           reason='No unique native unblock receipt for the exact failure')
+    # A persisted old-version handler saw an Unknown tool response after the
+    # durable reservation but did not have today's transport-receipt writer.
+    # It held the original attempt without a receipt and made no native effect.
+    original_dispatch = plugin._dispatch
+    original_record = state.record_runtime_escalation_transport
+    monkeypatch.setattr(plugin, '_dispatch', lambda *_: {'error': 'Unknown tool: kanban_unblock'})
+    monkeypatch.setattr(state, 'record_runtime_escalation_transport', lambda *_args, **_kwargs: None)
+    plugin.watchdog_tick(board='default')
+    monkeypatch.setattr(plugin, '_dispatch', original_dispatch)
+    monkeypatch.setattr(state, 'record_runtime_escalation_transport', original_record)
+    held = state.runtime_escalation_entry(tid, 'default')
+    assert held['intent']['status'] == 'held'
+    assert 'Unknown tool' not in str(held['intent'].get('reason'))  # native proof, not response text, is authority
+    assert 'transport' not in held['intent']
     before = b.show(tid)
 
     reconciled = api.runtime_escalation_reconcile_held(api.RuntimeCatchupControl(board='default', task_id=tid))
 
     entry = reconciled['runtime_escalation']
     assert entry['intent']['status'] == 'unblock_requested'
-    assert entry['intent']['held_reason_history'] == ['No unique native unblock receipt for the exact failure']
+    assert entry['intent']['held_reason_history'] == [held['intent']['reason']]
     assert entry['intent']['operator_no_effect_reconciliation']['snapshot'] == before
     assert 'transport' not in entry['intent']
     assert b.show(tid) == before

@@ -327,6 +327,28 @@ def task_binding(task_id: str, board: str | None = None) -> dict[str, Any] | Non
 
 def board_policy(board: str) -> dict[str, Any] | None: return load_state()["boards"].get(board)
 
+
+@contextmanager
+def runtime_escalation_operation() -> Iterator[bool]:
+    """Try to join the native runtime-effect authority without deadlocking it.
+
+    Supported runtime control writes use this same non-reentrant lock as an
+    effect reconciliation.  A writer invoked by an effect seam therefore fails
+    closed instead of waiting on itself while native authority is pinned.
+    """
+    path = state_path().with_suffix('.runtime.lock')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
 def set_recovery_policy(board: str, *, enabled: bool, max_per_phase: int | None = None) -> dict[str, Any]:
     with locked_state(write=True) as data:
         policy = data["boards"].get(board)
@@ -363,29 +385,32 @@ def set_runtime_escalation_policy(board: str, *, enabled: bool, max_attempts: in
                                   implementation_profile: str | None = None,
                                   reviewer_profile: str | None = None) -> dict[str, Any]:
     """Configure an opt-in route used only after runtime recovery is exhausted."""
-    with locked_state(write=True) as data:
-        policy = data["boards"].get(board)
-        if policy is None:
-            raise ValueError("board has no active review-gate policy")
-        current = _runtime_escalation_settings(policy.get("runtime_escalation", {"enabled": False,
-                                                                                     "max_attempts": 1,
-                                                                                     "implementation_profile": None,
-                                                                                     "reviewer_profile": None}))
-        if enabled:
-            configured = policy.get("escalation", {})
-            implementation_profile = implementation_profile or configured.get("implementation_profile")
-            reviewer_profile = reviewer_profile or configured.get("reviewer_profile")
-        proposed = {"enabled": enabled, "max_attempts": current["max_attempts"] if max_attempts is None else max_attempts,
-                    "implementation_profile": implementation_profile if enabled else None,
-                    "reviewer_profile": reviewer_profile if enabled else None}
-        if enabled and (not profile_exists(implementation_profile or "") or not profile_exists(reviewer_profile or "")):
-            raise ValueError("configured runtime escalation profile is missing")
-        validated = _runtime_escalation_settings(proposed)
-        if enabled and not current["enabled"]:
-            from .native import board_run_watermark
-            policy["runtime_escalation_watermark"] = board_run_watermark(board)
-        policy["runtime_escalation"] = validated
-        return json.loads(json.dumps(policy))
+    with runtime_escalation_operation() as acquired:
+        if not acquired:
+            raise RuntimeError("runtime escalation operation is busy")
+        with locked_state(write=True) as data:
+            policy = data["boards"].get(board)
+            if policy is None:
+                raise ValueError("board has no active review-gate policy")
+            current = _runtime_escalation_settings(policy.get("runtime_escalation", {"enabled": False,
+                                                                                         "max_attempts": 1,
+                                                                                         "implementation_profile": None,
+                                                                                         "reviewer_profile": None}))
+            if enabled:
+                configured = policy.get("escalation", {})
+                implementation_profile = implementation_profile or configured.get("implementation_profile")
+                reviewer_profile = reviewer_profile or configured.get("reviewer_profile")
+            proposed = {"enabled": enabled, "max_attempts": current["max_attempts"] if max_attempts is None else max_attempts,
+                        "implementation_profile": implementation_profile if enabled else None,
+                        "reviewer_profile": reviewer_profile if enabled else None}
+            if enabled and (not profile_exists(implementation_profile or "") or not profile_exists(reviewer_profile or "")):
+                raise ValueError("configured runtime escalation profile is missing")
+            validated = _runtime_escalation_settings(proposed)
+            if enabled and not current["enabled"]:
+                from .native import board_run_watermark
+                policy["runtime_escalation_watermark"] = board_run_watermark(board)
+            policy["runtime_escalation"] = validated
+            return json.loads(json.dumps(policy))
 
 
 def runtime_escalation_entry(task_id: str, board: str | None = None) -> dict[str, Any] | None:
