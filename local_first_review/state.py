@@ -407,8 +407,6 @@ def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, 
         if not catchup and (type(watermark) is not int or failed_run_id <= watermark):
             raise ValueError("historical runtime failure requires explicit task-scoped catch-up")
         recovery = _recovery_settings(policy.get("recovery", {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}))
-        if not recovery['enabled']:
-            raise ValueError('runtime recovery policy is paused')
         if data["recovery_budgets"].get(budget, 0) < recovery["max_per_phase"]:
             raise ValueError("runtime recovery budget is not exhausted")
         if not profile_exists(settings["implementation_profile"]) or not profile_exists(settings["reviewer_profile"]):

@@ -47,7 +47,7 @@ def reconcile(task_id, board):
         attempt = entry['attempts'][0]
         target, reviewer = attempt['implementation_profile'], attempt['reviewer_profile']
         if (entry.get('legacy_unverifiable') or binding != entry['binding']
-                or settings.get('enabled') is not True or not policy.get('recovery',{}).get('enabled')
+                or settings.get('enabled') is not True
                 or target == reviewer or not p.profile_exists(target) or not p.profile_exists(reviewer)
                 or target != settings.get('implementation_profile') or reviewer != settings.get('reviewer_profile')
                 or not lease_valid(entry)):

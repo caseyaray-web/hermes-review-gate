@@ -80,9 +80,14 @@ def adopt(b):
     return result
 
 
-def test_joined_rm03_explicit_catchup_preserves_dirty_work_and_fresh_review(rm03):
+@pytest.mark.parametrize('pause_recovery',[None,'before_adoption','after_adoption'])
+def test_joined_rm03_explicit_catchup_preserves_dirty_work_and_fresh_review(rm03,pause_recovery):
     b=rm03;tid=b.rm_tid
+    if pause_recovery=='before_adoption':
+        state.set_recovery_policy('default',enabled=False)
     result=adopt(b)
+    if pause_recovery=='after_adoption':
+        state.set_recovery_policy('default',enabled=False)
     packet=result['runtime_escalation']['coder_context']
     assert 'Full finding set.' in str(packet['reviewer_findings'])
     assert packet['checkpoint']==b.rm_checkpoint

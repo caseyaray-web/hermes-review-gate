@@ -92,13 +92,12 @@ def test_failed_stronger_attempt_is_held_without_refunding_or_recovery(runtime):
     assert stored['runtime_escalations']['default:task']['consumed_attempts']==1
 
 
-@pytest.mark.parametrize('change',['binding','recovery_paused','prior_escalation'])
+@pytest.mark.parametrize('change',['binding','prior_escalation'])
 def test_invalid_reservation_does_not_charge_attempt(runtime,change):
     binding,entry,show=runtime
     with state.locked_state(write=True) as data:
         data['runtime_escalations'].clear();data['workspace_leases'].clear()
     if change=='binding': binding=dict(binding,implementation_profile='other')
-    elif change=='recovery_paused': state.set_recovery_policy('default',enabled=False)
     else:
         with state.locked_state(write=True) as data:
             data['effective_routing']['default:task']={'board':'default','task_id':'task','attempt':1,'implementation_profile':'other','reviewer_profile':'post-review'}
