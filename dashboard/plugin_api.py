@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from local_first_review.state import (ESCALATION_MAX_ATTEMPTS_LIMIT, MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT,
                                       activate_board, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
-                                      set_escalation_policy, set_recovery_policy, trusted_routing)
+                                      set_escalation_policy, set_recovery_policy, set_runtime_escalation_policy, trusted_routing)
 
 router = APIRouter()
 COUNT_NAMES = (
@@ -65,6 +65,16 @@ class EscalationControl(BaseModel):
     board: str = Field(min_length=1, max_length=64)
     enabled: StrictBool
     normal_correction_limit: StrictInt = Field(ge=1, le=MAX_CHANGES)
+    max_attempts: StrictInt = Field(ge=1, le=ESCALATION_MAX_ATTEMPTS_LIMIT)
+    implementation_profile: str | None = Field(default=None, min_length=1, max_length=128)
+    reviewer_profile: str | None = Field(default=None, min_length=1, max_length=128)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RuntimeEscalationControl(BaseModel):
+    board: str = Field(min_length=1, max_length=64)
+    enabled: StrictBool
     max_attempts: StrictInt = Field(ge=1, le=ESCALATION_MAX_ATTEMPTS_LIMIT)
     implementation_profile: str | None = Field(default=None, min_length=1, max_length=128)
     reviewer_profile: str | None = Field(default=None, min_length=1, max_length=128)
@@ -236,6 +246,7 @@ def _policy_scope_view(board: str, policy: dict[str, Any]) -> dict[str, Any]:
                 "implementation_profile": policy["implementation_profile"],
                 "reviewer_profile": policy["reviewer_profile"], "recovery": policy.get("recovery", {"enabled": False, "max_per_phase": 1}),
                 "escalation": policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
+                "runtime_escalation": policy.get("runtime_escalation", {"enabled": False, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
                 "eligible_no_run": classification["eligible_no_run"],
                 "awaiting_first_gate": classification["awaiting_first_gate"],
                 "attention": classification["attention"], "history": classification["history"],
@@ -247,6 +258,7 @@ def _policy_scope_view(board: str, policy: dict[str, Any]) -> dict[str, Any]:
                 "reviewer_profile": policy["reviewer_profile"],
                 "recovery": policy.get("recovery", {"enabled": False, "max_per_phase": 1}),
                 "escalation": policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
+                "runtime_escalation": policy.get("runtime_escalation", {"enabled": False, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}),
                 "eligible_no_run": None, "awaiting_first_gate": None, "attention": None,
                 "history": None, "legacy_bound": None, "error": str(exc)}
 
@@ -564,3 +576,16 @@ def escalation_control(body: EscalationControl) -> dict[str, Any]:
         raise HTTPException(409, str(exc)) from exc
     return {"policy": policy,
             "message": "Review-correction escalation is enabled for future exhaustion" if body.enabled else "Review-correction escalation is disabled"}
+
+
+@router.put("/runtime-escalation")
+def runtime_escalation_control(body: RuntimeEscalationControl) -> dict[str, Any]:
+    """Persist an explicit future runtime-exhaustion route without changing cards."""
+    try:
+        policy = set_runtime_escalation_policy(body.board, enabled=body.enabled, max_attempts=body.max_attempts,
+                                               implementation_profile=body.implementation_profile,
+                                               reviewer_profile=body.reviewer_profile)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"policy": policy,
+            "message": "Runtime-exhaustion escalation is enabled for future exhausted recoveries" if body.enabled else "Runtime-exhaustion escalation is disabled"}

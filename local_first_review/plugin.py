@@ -11,7 +11,8 @@ from contextvars import ContextVar
 from typing import Any
 
 from .state import (MAX_CHANGES, authorize_recovery_run, bind_first_owned_run, board_name, board_policy,
-                    current_escalation_attempt, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, reconcile_pending_escalation, recovery_entry,
+                    current_escalation_attempt, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, publish_runtime_escalation_routing,
+                    reconcile_pending_escalation, recovery_budget_exhausted, recovery_entry, reserve_runtime_escalation, runtime_escalation_entry,
                     reserve_escalation, reserve_recovery, task_binding, terminalize_implementation_handoff_recovery,
                     terminalize_recovery, trusted_routing, update_recovery_identity, worker_profile)
 
@@ -843,6 +844,35 @@ def watchdog_claimed(*, task_id: str, board: str, assignee: str | None = None, r
         return
 
 
+def _reconcile_runtime_exhaustion_escalation(task_id: str, board: str, entry: dict[str, Any]) -> bool:
+    """Resume one exact blocked exhausted task, then route its existing worktree."""
+    binding = task_binding(task_id, board)
+    if entry.get("intent", {}).get("status") != "unblock_requested":
+        return False
+    attempt = entry.get("attempts", [{}])[-1]
+    target = attempt.get("implementation_profile") if isinstance(attempt, dict) else None
+    if not isinstance(binding, dict) or entry.get("binding") != binding or not isinstance(target, str) or not profile_exists(target):
+        return False
+    observed = _show(task_id)
+    task = observed.get("task", {})
+    if task.get("status") == "blocked":
+        value = _dispatch("kanban_unblock", {"task_id": task_id})
+        if value.get("status") not in {"ready", "todo"}:
+            return False
+        observed = _show(task_id); task = observed.get("task", {})
+    if task.get("status") not in {"ready", "todo"}:
+        return False
+    if task.get("assignee") != target:
+        from .native import reassign_ready_task
+        if not reassign_ready_task(board, task_id, target):
+            return False
+        observed = _show(task_id); task = observed.get("task", {})
+    if task.get("status") not in {"ready", "todo"} or task.get("assignee") != target:
+        return False
+    publish_runtime_escalation_routing(board, task_id, binding=binding)
+    return True
+
+
 def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) -> None:
     """Autonomous post-dispatch recovery; all uncertain observations fail closed."""
     if dry_run or not board: return
@@ -869,6 +899,13 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
             status = _reconcile_pending_escalation(task_id, board)
             if status == "held":
                 continue
+        # Runtime exhaustion is separate from review-correction escalation.  It
+        # only revisits a task-scoped intent created from an exact eligible run.
+        for entry in load_state().get("runtime_escalations", {}).values():
+            if entry.get("board") == board and entry.get("intent", {}).get("status") != "routed":
+                task_id = entry.get("task_id")
+                if isinstance(task_id, str):
+                    _reconcile_runtime_exhaustion_escalation(task_id, board, entry)
         policy = board_policy(board)
         if not policy or policy.get("recovery", {}).get("enabled") is not True: return
         candidates = list(load_state()["tasks"].values())
@@ -934,6 +971,15 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
             profile = route["reviewer_profile"] if phase == "review" else route["implementation_profile"]
             if not isinstance(workspace, str) or not _same_path(workspace, binding["workspace_path"]) or task.get("assignee") != profile or not profile_exists(profile) or not _workspace_is_exclusive(board, task_id, workspace): continue
             checkpoint = _workspace_checkpoint(workspace)
+            runtime_policy = policy.get("runtime_escalation", {})
+            if (phase == "implementation" and runtime_policy.get("enabled") is True
+                    and recovery_budget_exhausted(board, task_id, phase)):
+                runtime = runtime_escalation_entry(task_id, board)
+                if runtime is None:
+                    runtime = reserve_runtime_escalation(board, task_id, failed_run_id=failed["id"], phase=phase,
+                                                         binding=binding, checkpoint=checkpoint)
+                _reconcile_runtime_exhaustion_escalation(task_id, board, runtime)
+                continue
             entry = reserve_recovery(board, task_id, failed_run_id=failed["id"], phase=phase, workspace_path=workspace, checkpoint=checkpoint, binding=binding, adopted=adopted)
             # Exact task evidence remains blocked after the durable reservation.
             if _show(task_id)["task"].get("status") != "blocked": continue

@@ -51,9 +51,9 @@ def phase_budget_key(board: str, task_id: str, phase: str) -> str:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 6, "implementation_profile": None, "reviewer_profile": None,
+    return {"version": 7, "implementation_profile": None, "reviewer_profile": None,
             "tasks": {}, "boards": {}, "recovery": {}, "recovery_budgets": {}, "workspace_leases": {},
-            "escalations": {}, "effective_routing": {}}
+            "escalations": {}, "runtime_escalations": {}, "effective_routing": {}}
 
 
 def _text(value: Any) -> bool:
@@ -88,6 +88,22 @@ def _escalation_settings(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
+def _runtime_escalation_settings(value: Any) -> dict[str, Any]:
+    """Validate the distinct, explicit runtime-exhaustion escalation policy."""
+    fields = {"enabled", "max_attempts", "implementation_profile", "reviewer_profile"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("runtime escalation policy is invalid")
+    enabled, attempts = value["enabled"], value["max_attempts"]
+    implementation, reviewer = value["implementation_profile"], value["reviewer_profile"]
+    if type(enabled) is not bool or type(attempts) is not int or not 1 <= attempts <= ESCALATION_MAX_ATTEMPTS_LIMIT:
+        raise ValueError("runtime escalation policy is invalid")
+    if enabled and (not _text(implementation) or not _text(reviewer)):
+        raise ValueError("enabled runtime escalation requires implementation and reviewer profiles")
+    if not enabled and (implementation is not None or reviewer is not None):
+        raise ValueError("disabled runtime escalation must not retain routing")
+    return dict(value)
+
+
 def _migrate(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict) or not isinstance(data.get("tasks"), dict):
         raise ValueError("review-gate configuration has an invalid shape")
@@ -111,13 +127,15 @@ def _migrate(data: Any) -> dict[str, Any]:
                    "attempts": [{field: entry.get(field) for field in ("attempt", "implementation_profile", "reviewer_profile", "intent")}]} if isinstance(entry, dict) else entry)
             for key, entry in data.get("escalations", {}).items()
         }
+    if data.get("version") == 6:
+        data = dict(data); data["version"] = 7; data["runtime_escalations"] = {}
     return data
 
 
 def _validate(data: Any) -> dict[str, Any]:
     data = _migrate(data)
-    required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases", "escalations", "effective_routing")
-    if data.get("version") != 6 or any(not isinstance(data.get(k), dict) for k in required_roots):
+    required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases", "escalations", "runtime_escalations", "effective_routing")
+    if data.get("version") != 7 or any(not isinstance(data.get(k), dict) for k in required_roots):
         raise ValueError("review-gate configuration has an invalid shape")
     for key, binding in data["tasks"].items():
         if not isinstance(key, str) or not isinstance(binding, dict):
@@ -145,6 +163,9 @@ def _validate(data: Any) -> dict[str, Any]:
         _escalation_settings(policy.get("escalation", {"enabled": False, "normal_correction_limit": MAX_CHANGES,
                                                         "max_attempts": 1, "implementation_profile": None,
                                                         "reviewer_profile": None}))
+        _runtime_escalation_settings(policy.get("runtime_escalation", {"enabled": False, "max_attempts": 1,
+                                                                          "implementation_profile": None,
+                                                                          "reviewer_profile": None}))
     for key, entry in data["escalations"].items():
         if (not isinstance(key, str) or not isinstance(entry, dict) or not _text(entry.get("board"))
                 or not _text(entry.get("task_id")) or key != binding_key(entry["board"], entry["task_id"])):
@@ -160,6 +181,19 @@ def _validate(data: Any) -> dict[str, Any]:
             if (not isinstance(attempt, dict) or attempt.get("attempt") != number or not isinstance(attempt.get("intent"), dict)
                     or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))):
                 raise ValueError("review escalation ledger is invalid")
+    for key, entry in data["runtime_escalations"].items():
+        if (not isinstance(key, str) or not isinstance(entry, dict) or not _text(entry.get("board"))
+                or not _text(entry.get("task_id")) or key != binding_key(entry["board"], entry["task_id"])
+                or not isinstance(entry.get("binding"), dict) or type(entry.get("failed_run_id")) is not int
+                or entry["failed_run_id"] <= 0 or entry.get("phase") != "implementation"
+                or type(entry.get("consumed_attempts")) is not int or not isinstance(entry.get("attempts"), list)
+                or entry["consumed_attempts"] != len(entry["attempts"])):
+            raise ValueError("runtime escalation ledger is invalid")
+        for number, attempt in enumerate(entry["attempts"], start=1):
+            if (not isinstance(attempt, dict) or attempt.get("attempt") != number
+                    or not _text(attempt.get("implementation_profile")) or not _text(attempt.get("reviewer_profile"))
+                    or not isinstance(attempt.get("intent"), dict)):
+                raise ValueError("runtime escalation ledger is invalid")
     for key, route in data["effective_routing"].items():
         if (not isinstance(key, str) or not isinstance(route, dict) or not _text(route.get("board"))
                 or not _text(route.get("task_id")) or key != binding_key(route["board"], route["task_id"])):
@@ -244,6 +278,89 @@ def set_escalation_policy(board: str, *, enabled: bool, normal_correction_limit:
         return json.loads(json.dumps(policy))
 
 
+def set_runtime_escalation_policy(board: str, *, enabled: bool, max_attempts: int | None = None,
+                                  implementation_profile: str | None = None,
+                                  reviewer_profile: str | None = None) -> dict[str, Any]:
+    """Configure an opt-in route used only after runtime recovery is exhausted."""
+    with locked_state(write=True) as data:
+        policy = data["boards"].get(board)
+        if policy is None:
+            raise ValueError("board has no active review-gate policy")
+        current = _runtime_escalation_settings(policy.get("runtime_escalation", {"enabled": False,
+                                                                                     "max_attempts": 1,
+                                                                                     "implementation_profile": None,
+                                                                                     "reviewer_profile": None}))
+        proposed = {"enabled": enabled, "max_attempts": current["max_attempts"] if max_attempts is None else max_attempts,
+                    "implementation_profile": implementation_profile if enabled else None,
+                    "reviewer_profile": reviewer_profile if enabled else None}
+        if enabled and (not profile_exists(implementation_profile or "") or not profile_exists(reviewer_profile or "")):
+            raise ValueError("configured runtime escalation profile is missing")
+        policy["runtime_escalation"] = _runtime_escalation_settings(proposed)
+        return json.loads(json.dumps(policy))
+
+
+def runtime_escalation_entry(task_id: str, board: str | None = None) -> dict[str, Any] | None:
+    return load_state()["runtime_escalations"].get(binding_key(board or board_name(), task_id))
+
+
+def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, phase: str,
+                                binding: dict[str, Any], checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Durably reserve the one explicit escalation before any native transition."""
+    if phase != "implementation" or type(failed_run_id) is not int or failed_run_id <= 0:
+        raise ValueError("runtime escalation identity is invalid")
+    key, budget = binding_key(board, task_id), phase_budget_key(board, task_id, phase)
+    with locked_state(write=True) as data:
+        policy = data["boards"].get(board)
+        if policy is None:
+            raise ValueError("runtime escalation requires an active board policy")
+        settings = _runtime_escalation_settings(policy.get("runtime_escalation", {"enabled": False, "max_attempts": 1,
+                                                                                     "implementation_profile": None, "reviewer_profile": None}))
+        if not settings["enabled"]:
+            raise ValueError("runtime escalation is disabled")
+        existing = data["runtime_escalations"].get(key)
+        if existing is not None:
+            if existing.get("binding") != binding or existing.get("failed_run_id") != failed_run_id:
+                raise ValueError("runtime escalation identity conflicts with an existing intent")
+            return json.loads(json.dumps(existing))
+        recovery = _recovery_settings(policy.get("recovery", {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}))
+        if data["recovery_budgets"].get(budget, 0) < recovery["max_per_phase"]:
+            raise ValueError("runtime recovery budget is not exhausted")
+        attempt = {"attempt": 1, "implementation_profile": settings["implementation_profile"],
+                   "reviewer_profile": settings["reviewer_profile"],
+                   "intent": {"status": "unblock_requested", "checkpoint": dict(checkpoint)}}
+        entry = {"board": board, "task_id": task_id, "binding": dict(binding), "failed_run_id": failed_run_id,
+                 "phase": phase, "consumed_attempts": 1, "intent": dict(attempt["intent"]), "attempts": [attempt]}
+        data["runtime_escalations"][key] = entry
+        return json.loads(json.dumps(entry))
+
+
+def recovery_budget_exhausted(board: str, task_id: str, phase: str) -> bool:
+    policy = board_policy(board)
+    if policy is None:
+        return False
+    maximum = _recovery_settings(policy.get("recovery", {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}))["max_per_phase"]
+    return load_state()["recovery_budgets"].get(phase_budget_key(board, task_id, phase), 0) >= maximum
+
+
+def publish_runtime_escalation_routing(board: str, task_id: str, *, binding: dict[str, Any]) -> dict[str, Any]:
+    """Publish routing only after the caller has read back native unblock/reassign."""
+    key = binding_key(board, task_id)
+    with locked_state(write=True) as data:
+        entry = data["runtime_escalations"].get(key)
+        if not isinstance(entry, dict) or entry.get("binding") != binding:
+            raise ValueError("runtime escalation intent is absent or mismatched")
+        attempt = entry["attempts"][-1]
+        route = {"board": board, "task_id": task_id, "attempt": attempt["attempt"],
+                 "implementation_profile": attempt["implementation_profile"], "reviewer_profile": attempt["reviewer_profile"]}
+        existing = data["effective_routing"].get(key)
+        if existing is not None and existing != route:
+            raise ValueError("runtime escalation routing conflicts with an existing effective route")
+        data["effective_routing"][key] = route
+        entry["intent"] = dict(entry["intent"], status="routed")
+        attempt["intent"] = dict(attempt["intent"], status="routed")
+        return json.loads(json.dumps(route))
+
+
 def effective_routing(task_id: str, board: str | None = None) -> dict[str, Any] | None:
     return load_state()["effective_routing"].get(binding_key(board or board_name(), task_id))
 
@@ -273,6 +390,17 @@ def trusted_routing(task_id: str, board: str, binding: dict[str, Any], *, includ
     admission guards only; it never pretends reassignment landed.
     """
     data = load_state(); key = binding_key(board, task_id)
+    runtime = data.get("runtime_escalations", {}).get(key)
+    if isinstance(runtime, dict) and runtime.get("binding") == binding and runtime.get("intent", {}).get("status") == "routed":
+        attempts = runtime.get("attempts")
+        attempt = attempts[-1] if isinstance(attempts, list) and attempts else None
+        route = {"board": board, "task_id": task_id,
+                 "implementation_profile": attempt.get("implementation_profile") if isinstance(attempt, dict) else None,
+                 "reviewer_profile": attempt.get("reviewer_profile") if isinstance(attempt, dict) else None}
+        published = data["effective_routing"].get(key)
+        if not isinstance(published, dict) or any(published.get(field) != route[field] for field in route):
+            raise ValueError("published runtime escalation routing is inconsistent")
+        return route
     entry = data.get("escalations", {}).get(key)
     if not isinstance(entry, dict) or entry.get("binding") != binding:
         return dict(binding)
@@ -501,7 +629,7 @@ def activate_board(board: str, *, activation_id: str, native_run_watermark: int 
         implementation, reviewer = data.get("implementation_profile"), data.get("reviewer_profile")
         if not _text(implementation) or not _text(reviewer): raise ValueError("save implementation and reviewer profiles before board activation")
         if not profile_exists(implementation) or not profile_exists(reviewer): raise ValueError("configured worker profile is missing; save valid Hermes profiles before board activation")
-        policy = {"activation_id": activation_id, "native_run_watermark": native_run_watermark, "implementation_profile": implementation, "reviewer_profile": reviewer, "recovery": {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}, "escalation": {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}}
+        policy = {"activation_id": activation_id, "native_run_watermark": native_run_watermark, "implementation_profile": implementation, "reviewer_profile": reviewer, "recovery": {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}, "escalation": {"enabled": False, "normal_correction_limit": MAX_CHANGES, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}, "runtime_escalation": {"enabled": False, "max_attempts": 1, "implementation_profile": None, "reviewer_profile": None}}
         data["boards"][board] = policy; return json.loads(json.dumps(policy))
 
 def _workspace_binding_conflict(data: dict[str, Any], board: str, task_id: str, workspace: str) -> bool:

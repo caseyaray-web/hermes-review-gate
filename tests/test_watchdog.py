@@ -311,6 +311,42 @@ def test_configured_phase_budget_counts_distinct_failed_runs_across_restart_and_
     assert third["failed_run_id"] == 3
 
 
+def test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preserves_binding(tmp_path, monkeypatch):
+    """Runtime escalation is a separately opted-in, task-scoped replacement route."""
+    monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
+    path = tmp_path / "state.json"
+    monkeypatch.setattr(state, "state_path", lambda: path)
+    monkeypatch.setattr(state, "profile_exists", lambda name: name in {"impl", "review", "terra", "terra-review"})
+    state.save_state({"version": 3, "implementation_profile": "impl", "reviewer_profile": "review",
+                      "tasks": {}, "boards": {}})
+    state.activate_board("default", activation_id="runtime-escalation", native_run_watermark=0)
+    state.set_recovery_policy("default", enabled=True, max_per_phase=2)
+    state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
+                                        implementation_profile="terra", reviewer_profile="terra-review")
+    binding = _binding()
+    for failed_run_id in (2271, 2272):
+        state.reserve_recovery("default", "task", failed_run_id=failed_run_id, phase="implementation",
+                               workspace_path="/work", checkpoint={"head": "a" * 40, "dirty": []},
+                               binding=binding, adopted=failed_run_id == 2271)
+        state.terminalize_recovery("default", "task", failed_run_id, "implementation", "native_terminal")
+
+    entry = state.reserve_runtime_escalation("default", "task", failed_run_id=2273,
+                                             phase="implementation", binding=binding,
+                                             checkpoint={"head": "b" * 40, "dirty": ["partial"]})
+    assert entry["intent"]["status"] == "unblock_requested"
+    assert entry["binding"] == binding
+    assert state.task_binding("task", "default") == binding
+    assert state.reserve_runtime_escalation("default", "task", failed_run_id=2273,
+                                            phase="implementation", binding=binding,
+                                            checkpoint={"head": "ignored", "dirty": []}) == entry
+    unexhausted = dict(binding, task_id="unexhausted", workspace_path="/other")
+    state.reserve_recovery("default", "unexhausted", failed_run_id=1, phase="implementation",
+                           workspace_path="/other", checkpoint={}, binding=unexhausted, adopted=True)
+    with pytest.raises(ValueError, match="not exhausted"):
+        state.reserve_runtime_escalation("default", "unexhausted", failed_run_id=2,
+                                         phase="implementation", binding=unexhausted, checkpoint={})
+
+
 def test_recovery_policy_rejects_zero_boolean_fractional_negative_and_excessive_limits(tmp_path, monkeypatch):
     path = tmp_path / "state.json"
     monkeypatch.setattr(state, "state_path", lambda: path)

@@ -59,7 +59,7 @@ def test_activation_migrates_legacy_state_and_first_future_run_is_bound(policy_f
     binding = state.bind_first_owned_run("board-a", native_task(), [native_run()], run_id=9, profile="impl")
 
     persisted = state.load_state()
-    assert persisted["version"] == 6
+    assert persisted["version"] == 7
     assert persisted["tasks"]["old:legacy"]["workspace_path"] == "/legacy"
     assert policy == persisted["boards"]["board-a"]
     assert binding["policy_activation_id"] == "activation-a"
