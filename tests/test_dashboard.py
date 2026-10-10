@@ -207,6 +207,31 @@ def test_shipped_dashboard_exposes_recovery_limit_not_zero_as_pause():
     assert "Use Pause failed-run recovery to stop automatic recovery." in bundle
 
 
+def test_runtime_catchup_is_explicit_task_scoped_and_leaves_native_effects_for_a_tick(monkeypatch):
+    binding = {"board": "board-a", "task_id": "rm03", "implementation_profile": "impl",
+               "reviewer_profile": "review", "workspace_path": "/work"}
+    failure = {"run_id": 31, "event_id": 71, "kind": "gave_up", "payload": {"budget_used": 2, "budget_max": 2}}
+    checkpoint = {"head": "a" * 40, "dirty": []}
+    context = {"original_contract": {"title": "RM03"}, "reviewer_findings": [{"run_id": 9, "summary": "fix edge"}],
+               "latest_failure": failure, "checkpoint": checkpoint}
+    calls = []
+    monkeypatch.setattr(plugin_api, "_observe_task", lambda *_: ({"id": "rm03", "status": "blocked"}, [], []))
+    monkeypatch.setattr(plugin_api, "task_binding", lambda *_: binding)
+    monkeypatch.setattr(plugin_api, "runtime_escalation_entry", lambda *_: None)
+    monkeypatch.setattr(plugin_api, "recovery_budget_exhausted", lambda *_: True)
+    monkeypatch.setattr(plugin_api, "_runtime_catchup_context", lambda *_: (failure, checkpoint, context))
+    monkeypatch.setattr(plugin_api, "adopt_runtime_escalation", lambda board, task_id, **kwargs:
+                        calls.append((board, task_id, kwargs)) or {"intent": {"status": "catchup_requested"}})
+
+    response = client().post("/runtime-escalation/catch-up", json={"board": "board-a", "task_id": "rm03"})
+
+    assert response.status_code == 200
+    assert calls == [("board-a", "rm03", {"failed_run_id": 31, "phase": "implementation", "binding": binding,
+                                             "checkpoint": checkpoint, "failure": failure, "workspace_path": "/work",
+                                             "coder_context": context})]
+    assert "next real dispatch tick" in response.json()["message"]
+
+
 def test_escalation_control_persists_future_only_routing_and_shipped_controls(monkeypatch):
     calls = []
     monkeypatch.setattr(plugin_api, "set_escalation_policy", lambda board, **kwargs:
