@@ -87,6 +87,7 @@ class RuntimeEscalationControl(BaseModel):
 class RuntimeCatchupControl(BaseModel):
     board: str = Field(min_length=1, max_length=64)
     task_id: str = Field(min_length=1, max_length=128)
+    operator_receipt: dict[str, Any] | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -617,7 +618,8 @@ def _runtime_catchup_context(task: dict[str, Any], runs: list[dict[str, Any]], e
 def runtime_escalation_resume_held(body: RuntimeCatchupControl) -> dict[str, Any]:
     """One operator action to prove, authorize, and reconcile an exact held intent."""
     try:
-        result = resume_held(body.task_id, body.board)
+        result = (resume_held(body.task_id, body.board, operator_receipt=body.operator_receipt)
+                  if body.operator_receipt is not None else resume_held(body.task_id, body.board))
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         raise HTTPException(409, str(exc)) from exc
     if not result.get("ok"):

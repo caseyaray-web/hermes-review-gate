@@ -1,5 +1,8 @@
 """Fail-closed runtime routing boundaries; joined native proof lives separately."""
 import copy
+import hashlib
+import json
+from types import SimpleNamespace
 import pytest
 from local_first_review import plugin, state, native, runtime_escalation
 
@@ -81,6 +84,301 @@ def test_runtime_effect_transport_pins_selected_board(runtime,monkeypatch):
     assert state.runtime_escalation_entry('task', 'default')['intent']['transport'] == {
         'operation': 'kanban_unblock', 'result': {'status': 'ready'},
     }
+
+
+def test_continuation_transport_appends_history_without_replacing_original_receipt(runtime):
+    """A second permitted send is auditable but cannot overwrite first-send proof."""
+    binding, entry, show = runtime
+    first = {'operation': 'kanban_unblock', 'result': {'status': 'ready'}}
+    second = {'operation': 'kanban_unblock', 'result': {'status': 'ready', 'continued': True}}
+    state.record_runtime_escalation_transport('default', 'task', 'kanban_unblock', result=first['result'])
+
+    state.record_runtime_escalation_transport('default', 'task', 'kanban_unblock', result=second['result'])
+
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['transport'] == first
+    assert stored['intent']['transport_history'] == [first, second]
+    assert stored['attempts'][0]['intent']['transport'] == first
+
+
+def test_state_rejects_empty_or_unbounded_operator_continuation_history(runtime):
+    """The exceptional authorization is exactly one canonical receipt/snapshot pair."""
+    binding, entry, show = runtime
+    with pytest.raises(ValueError, match='runtime operator continuation history is invalid'):
+        with state.locked_state(write=True) as data:
+            data['runtime_escalations']['default:task']['intent']['operator_continuation_history'] = []
+
+
+@pytest.mark.parametrize('change', ['receipt_session', 'task', 'run', 'event', 'checkpoint',
+                                    'binding', 'attempt', 'transport'])
+def test_operator_continuation_receipt_refuses_every_changed_reviewed_identity(monkeypatch, change):
+    """Every receipt component is an authority fence, never merely audit text."""
+    binding = {'board': 'default', 'task_id': 'task', 'workspace_path': '/work'}
+    events = [{'id': event_id, 'kind': 'observed', 'run_id': None, 'created_at': event_id,
+               'payload': {'sequence': event_id}} for event_id in range(21, 36)]
+    observed = {'task': {'id': 'task', 'status': 'blocked', 'assignee': 'strong',
+                         'workspace_path': '/work', 'current_run_id': None},
+                'runs': [], 'events': events}
+    receipt = {'scope': 'test-continuation', 'sessions': [{'id': 'reviewed'}], 'later_runs': [],
+               'later_event_manifest_sha256': hashlib.sha256(json.dumps([
+                   {'kind': event['kind'], 'run_id': event['run_id'], 'created_at': event['created_at'],
+                    'payload': event['payload']} for event in events], sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()}
+    entry = {'board': 'default', 'task_id': 'task', 'binding': binding, 'failed_run_id': 11,
+             'workspace_path': '/work', 'failure': {'event_id': 20}, 'checkpoint': {'head': 'a'},
+             'consumed_attempts': 1, 'attempts': [{'implementation_profile': 'strong'}],
+             'intent': {'operator_no_effect_reconciliation': {}, 'transport': {
+                 'operation': 'kanban_unblock', 'result': {'ok': True, 'status': 'ready', 'task_id': 't_57851039'},
+             }}}
+    current_binding = binding
+    checkpoint = {'head': 'a'}
+    supplied = copy.deepcopy(receipt)
+    if change == 'receipt_session': supplied['sessions'][0]['id'] = 'changed'
+    elif change == 'task': observed['task']['id'] = 'other'
+    elif change == 'run': observed['runs'].append({'id': 12, 'ended_at': 1})
+    elif change == 'event': observed['events'][0]['payload']['sequence'] = 'changed'
+    elif change == 'checkpoint': checkpoint = {'head': 'changed'}
+    elif change == 'binding': current_binding = dict(binding, task_id='other')
+    elif change == 'attempt': entry['consumed_attempts'] = 2
+    else: entry['intent']['transport']['result']['status'] = 'changed'
+    fake_plugin = SimpleNamespace(_workspace_checkpoint=lambda _: checkpoint,
+                                  _workspace_is_exclusive=lambda *_: True)
+    monkeypatch.setattr(runtime_escalation, 'OPERATOR_CONTINUATION_RECEIPT', receipt)
+    monkeypatch.setattr(runtime_escalation, 'lease_valid', lambda _: True)
+
+    assert runtime_escalation._operator_continuation_refusal(
+        entry, current_binding, observed, fake_plugin, supplied) is not None
+
+
+@pytest.mark.parametrize('mutate_checkpoint', [False, True])
+def test_continuation_rechecks_checkpoint_after_unblock_before_publishing(runtime, monkeypatch, mutate_checkpoint):
+    """The exceptional unblock cannot publish a route after its workspace changes."""
+    binding, entry, show = runtime
+    original = {'operation': 'kanban_unblock', 'result': {
+        'ok': True, 'status': 'ready', 'task_id': 't_57851039',
+    }}
+    show['task']['assignee'] = 'strong'
+    for event_id in range(21, 36):
+        show['events'].append({'id': event_id, 'kind': 'observed', 'run_id': None,
+                               'created_at': event_id, 'payload': {'sequence': event_id}})
+    manifest = [{'kind': event['kind'], 'run_id': event['run_id'], 'created_at': event.get('created_at'),
+                 'payload': event['payload']} for event in show['events'] if event['id'] > entry['failure']['event_id']]
+    receipt = {'scope': 'test-continuation', 'sessions': [], 'later_runs': [],
+               'later_event_manifest_sha256': hashlib.sha256(
+                   json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+    proof_snapshot = copy.deepcopy(show)
+    proof = {'binding': binding, 'failure': entry['failure'], 'checkpoint': entry['checkpoint'],
+             'failed_run_id': entry['failed_run_id'], 'snapshot': proof_snapshot,
+             'snapshot_sha256': hashlib.sha256(
+                 json.dumps(proof_snapshot, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+    with state.locked_state(write=True) as data:
+        intent = data['runtime_escalations']['default:task']['intent']
+        intent.update(status='unblock_requested', transport=original, transport_history=[original],
+                      operator_no_effect_reconciliation=proof,
+                      operator_continuation_history=[{'receipt': receipt, 'snapshot': copy.deepcopy(show)}])
+        data['runtime_escalations']['default:task']['attempts'][0]['intent'].update(
+            status='unblock_requested', transport=original)
+    monkeypatch.setattr(runtime_escalation, 'OPERATOR_CONTINUATION_RECEIPT', receipt)
+    changed = False
+
+    def checkpoint(_path):
+        return {'head': 'changed' * 8, 'dirty': []} if changed else entry['checkpoint']
+
+    calls = []
+
+    def unblock(_name, _args):
+        nonlocal changed
+        calls.append((_name, _args))
+        changed = mutate_checkpoint
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 36, 'kind': 'unblocked', 'run_id': None,
+                               'created_at': 36, 'payload': None})
+        return {'ok': True, 'status': 'ready', 'task_id': 't_57851039'}
+
+    monkeypatch.setattr(plugin, '_workspace_checkpoint', checkpoint)
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *_: pytest.fail('continuation must not reassign'))
+
+    assert runtime_escalation.reconcile('task', 'default') is (not mutate_checkpoint)
+    assert calls == [('kanban_unblock', {'board': 'default', 'task_id': 'task'})]
+    stored = state.runtime_escalation_entry('task', 'default')
+    if mutate_checkpoint:
+        assert state.effective_routing('task', 'default') is None
+        assert stored['intent']['status'] == 'held'
+        replay = runtime_escalation.resume_held('task', 'default', operator_receipt=receipt)
+        assert replay['ok'] is False
+        assert calls == [('kanban_unblock', {'board': 'default', 'task_id': 'task'})]
+    else:
+        assert state.effective_routing('task', 'default')['implementation_profile'] == 'strong'
+        assert stored['intent']['status'] == 'routed'
+        assert stored['intent']['transport'] == original
+        assert stored['intent']['transport_history'] == [original, {
+            'operation': 'kanban_unblock', 'result': {'ok': True, 'status': 'ready', 'task_id': 't_57851039'},
+        }]
+        replay = runtime_escalation.resume_held('task', 'default', operator_receipt=receipt)
+        assert replay['ok'] is True and replay['runtime_escalation'] == stored
+        assert calls == [('kanban_unblock', {'board': 'default', 'task_id': 'task'})]
+
+
+def _held_operator_continuation(runtime, monkeypatch):
+    """Build the exact already-spent held state; only resume_held may advance it."""
+    binding, entry, show = runtime
+    show['task'].update(assignee='strong', current_run_id=None)
+    for event_id in range(21, 36):
+        show['events'].append({'id': event_id, 'kind': 'observed', 'run_id': None,
+                               'created_at': event_id, 'payload': {'sequence': event_id}})
+    original_transport = {'operation': 'kanban_unblock', 'result': {
+        'ok': True, 'status': 'ready', 'task_id': 't_57851039',
+    }}
+    manifest = [{'kind': event['kind'], 'run_id': event['run_id'],
+                 'created_at': event.get('created_at'), 'payload': event['payload']}
+                for event in show['events'] if event['id'] > entry['failure']['event_id']]
+    receipt = {'scope': 'test-exact-operator-continuation', 'sessions': [], 'later_runs': [],
+               'later_event_manifest_sha256': hashlib.sha256(
+                   json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+    proof_snapshot = copy.deepcopy(show)
+    proof = {'binding': binding, 'failure': entry['failure'], 'checkpoint': entry['checkpoint'],
+             'failed_run_id': entry['failed_run_id'], 'snapshot': proof_snapshot,
+             'snapshot_sha256': hashlib.sha256(
+                 json.dumps(proof_snapshot, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+    with state.locked_state(write=True) as data:
+        stored = data['runtime_escalations']['default:task']
+        stored['intent'].update(status='held', transport=original_transport,
+                                transport_history=[original_transport],
+                                operator_no_effect_reconciliation=proof)
+        stored['attempts'][0]['intent'].update(status='held', transport=original_transport)
+    monkeypatch.setattr(runtime_escalation, 'OPERATOR_CONTINUATION_RECEIPT', receipt)
+    return binding, entry, show, receipt, original_transport
+
+
+def test_resume_held_exact_operator_receipt_persists_then_routes_once(runtime, monkeypatch):
+    """The receipt path is a real held -> authorize -> send -> readback -> route slice."""
+    binding, entry, show, receipt, original_transport = _held_operator_continuation(runtime, monkeypatch)
+    authorization_snapshot = copy.deepcopy(show)
+    dispatches = []
+
+    def unblock(name, args):
+        dispatches.append((name, args))
+        persisted = state.runtime_escalation_entry('task', 'default')
+        assert persisted['intent']['operator_continuation_history'] == [{
+            'receipt': receipt, 'snapshot': copy.deepcopy(show),
+        }]
+        assert persisted['intent']['status'] == 'unblock_attempted'
+        assert persisted['intent']['transport'] == original_transport
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 36, 'kind': 'unblocked', 'run_id': None,
+                               'created_at': 36, 'payload': None})
+        return {'ok': True, 'status': 'ready', 'task_id': 't_57851039'}
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *_: pytest.fail('continuation must not reassign'))
+
+    result = runtime_escalation.resume_held('task', 'default', operator_receipt=receipt)
+
+    assert result['ok'] is True
+    assert dispatches == [('kanban_unblock', {'board': 'default', 'task_id': 'task'})]
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'routed'
+    assert stored['intent']['transport'] == original_transport
+    assert stored['intent']['transport_history'] == [original_transport, {
+        'operation': 'kanban_unblock', 'result': {'ok': True, 'status': 'ready', 'task_id': 't_57851039'},
+    }]
+    assert stored['intent']['operator_continuation_history'] == [{'receipt': receipt,
+                                                                    'snapshot': authorization_snapshot}]
+    assert state.effective_routing('task', 'default')['implementation_profile'] == 'strong'
+    replay = runtime_escalation.resume_held('task', 'default', operator_receipt=receipt)
+    assert replay['ok'] is True
+    assert dispatches == [('kanban_unblock', {'board': 'default', 'task_id': 'task'})]
+
+
+@pytest.mark.parametrize('mode', ['dispatch_exception', 'readback_failure', 'duplicate_unblock'])
+def test_resume_held_operator_receipt_failure_paths_hold_without_resend(runtime, monkeypatch, mode):
+    """Every ambiguous continuation result consumes the one send and remains held."""
+    binding, entry, show, receipt, original_transport = _held_operator_continuation(runtime, monkeypatch)
+    dispatches = []
+    if mode == 'readback_failure':
+        original_snapshot = native.snapshot
+        reads = 0
+
+        def snapshot(*args):
+            nonlocal reads
+            reads += 1
+            if reads == 4:
+                raise RuntimeError('lost native readback')
+            return original_snapshot(*args)
+
+        monkeypatch.setattr(native, 'snapshot', snapshot)
+
+    def unblock(*_args):
+        dispatches.append('unblock')
+        if mode == 'dispatch_exception':
+            raise OSError('lost response after send')
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 36, 'kind': 'unblocked', 'run_id': None,
+                               'created_at': 36, 'payload': None})
+        if mode == 'duplicate_unblock':
+            show['events'].append({'id': 37, 'kind': 'unblocked', 'run_id': None,
+                                   'created_at': 37, 'payload': None})
+        return {'ok': True, 'status': 'ready', 'task_id': 't_57851039'}
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    result = runtime_escalation.resume_held('task', 'default', operator_receipt=receipt)
+
+    assert result['ok'] is False
+    assert dispatches == ['unblock']
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'held'
+    assert stored['intent']['transport'] == original_transport
+    assert len(stored['intent']['operator_continuation_history']) == 1
+    replay = runtime_escalation.resume_held('task', 'default', operator_receipt=receipt)
+    assert replay['ok'] is False
+    assert dispatches == ['unblock']
+
+
+def test_resume_held_operator_receipt_lost_response_routes_from_readback(runtime, monkeypatch):
+    """A send that raises after native success routes only from the unique readback receipt."""
+    binding, entry, show, receipt, original_transport = _held_operator_continuation(runtime, monkeypatch)
+    dispatches = []
+
+    def lost_response(*_args):
+        dispatches.append('unblock')
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 36, 'kind': 'unblocked', 'run_id': None,
+                               'created_at': 36, 'payload': None})
+        raise OSError('response lost after native success')
+
+    monkeypatch.setattr(plugin, '_dispatch', lost_response)
+    result = runtime_escalation.resume_held('task', 'default', operator_receipt=receipt)
+
+    assert result['ok'] is True
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'routed'
+    assert stored['intent']['transport'] == original_transport
+    assert stored['intent']['transport_history'][-1]['error'] == {
+        'type': 'OSError', 'message': 'response lost after native success',
+    }
+    assert dispatches == ['unblock']
+
+
+@pytest.mark.parametrize('mode', ['malformed_receipt', 'changed_manifest'])
+def test_resume_held_operator_receipt_refuses_before_dispatch(runtime, monkeypatch, mode):
+    """Receipt or reviewed-native-history drift is rejected before spending a new effect."""
+    binding, entry, show, receipt, original_transport = _held_operator_continuation(runtime, monkeypatch)
+    if mode == 'malformed_receipt':
+        receipt = dict(receipt, scope='wrong-scope')
+    else:
+        show['events'][-1]['payload']['sequence'] = 'changed-after-review'
+    dispatches = []
+    monkeypatch.setattr(plugin, '_dispatch', lambda *_: dispatches.append('unblock'))
+
+    result = runtime_escalation.resume_held('task', 'default', operator_receipt=receipt)
+
+    assert result['ok'] is False
+    assert dispatches == []
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'held'
+    assert 'operator_continuation_history' not in stored['intent']
+    assert stored['intent']['transport'] == original_transport
 
 
 def test_runtime_unblock_transport_error_is_persisted_before_safe_hold(runtime, monkeypatch):
