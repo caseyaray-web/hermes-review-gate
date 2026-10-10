@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
-from .review_evidence import changes_requested_verdicts
+from .review_evidence import changes_requested_verdicts, correction_count
 from .state import (MAX_CHANGES, authorize_recovery_run, bind_first_owned_run, board_name, board_policy,
                     current_escalation_attempt, deliver_runtime_coder_context, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, publish_runtime_escalation_routing,
                     reconcile_pending_escalation, recovery_budget_exhausted, recovery_entry, reserve_runtime_escalation, runtime_escalation_entry,
@@ -400,7 +400,7 @@ def finish_implementation(args: dict[str, Any], **_: Any) -> str:
 
 def _changes_count(runs: list[dict[str, Any]], events: list[dict[str, Any]], binding: dict[str, Any]) -> int:
     """Count only distinct, candidate-bound native reviewer verdicts."""
-    return len(changes_requested_verdicts(runs, events, binding))
+    return correction_count(runs, events, binding)
 
 
 def _pending_escalation_proof(task_id: str, board: str, entry: dict[str, Any], *,
@@ -521,6 +521,9 @@ def submit_review(args: dict[str, Any], **_: Any) -> str:
         tool, native_args = "kanban_block", {"reason": "Runtime escalation is exhausted; independent reviewer requested changes. Latest findings: " + rationale,
                                               "kind": "needs_input"}
         expected_status, expected_event = "blocked", None
+    elif any(v['candidate'] == _review['candidate'] for v in changes_requested_verdicts(show['runs'], show['events'], _binding_value)):
+        tool, native_args = 'kanban_block', {'reason': 'Unchanged rejected candidate was retried; no additional correction budget was charged. Latest findings: ' + rationale, 'kind':'needs_input'}
+        expected_status, expected_event = 'blocked', None
     elif _changes_count(show["runs"], show["events"], _binding_value) >= (board_policy(board_name()) or {}).get("escalation", {}).get("normal_correction_limit", MAX_CHANGES):
         policy = board_policy(board_name()) or {}
         escalation = policy.get("escalation", {})
@@ -856,7 +859,16 @@ def watchdog_claimed(*, task_id: str, board: str, assignee: str | None = None, r
 
 def _runtime_failure_record(show: dict[str, Any], failed_run_id: int) -> dict[str, Any] | None:
     """Freeze the exact native terminal evidence that authorizes escalation."""
-    event = _event(show.get("events", []), "gave_up", failed_run_id)
+    if type(failed_run_id) is not int or failed_run_id <= 0:
+        return None
+    runs = [r for r in show.get("runs", []) if r.get("id") == failed_run_id]
+    events = [e for e in show.get("events", []) if e.get("kind") == "gave_up" and e.get("run_id") == failed_run_id]
+    spawns = [e for e in show.get("events", []) if e.get("kind") == "spawned" and e.get("run_id") == failed_run_id]
+    if (len(runs) != 1 or len(events) != 1 or len(spawns) != 1
+            or runs[0].get("started_at") is None or runs[0].get("ended_at") is None
+            or runs[0].get("outcome") != "gave_up" or runs[0].get("status") != "gave_up"):
+        return None
+    event = events[0]
     payload = event.get("payload") if isinstance(event, dict) else None
     event_id = event.get("id") if isinstance(event, dict) else None
     if (not isinstance(payload, dict) or type(event_id) is not int or event_id <= 0
@@ -868,58 +880,8 @@ def _runtime_failure_record(show: dict[str, Any], failed_run_id: int) -> dict[st
 
 
 def _reconcile_runtime_exhaustion_escalation(task_id: str, board: str, entry: dict[str, Any]) -> bool:
-    """Reconcile one exact persisted route without replaying ambiguous effects."""
-    binding = task_binding(task_id, board)
-    status = entry.get("intent", {}).get("status")
-    if status == "catchup_requested":
-        entry = update_runtime_escalation_intent(board, task_id, "unblock_requested")
-        status = "unblock_requested"
-    if status not in {"unblock_requested", "unblock_attempted", "unblock_verified", "reassign_attempted"}:
-        return False
-    attempt = entry.get("attempts", [{}])[-1]
-    target = attempt.get("implementation_profile") if isinstance(attempt, dict) else None
-    policy = board_policy(board)
-    settings = policy.get("runtime_escalation", {}) if isinstance(policy, dict) else {}
-    if (entry.get("legacy_unverifiable") or not isinstance(binding, dict) or entry.get("binding") != binding
-            or not isinstance(target, str) or not profile_exists(target) or not profile_exists(attempt.get("reviewer_profile"))
-            or settings.get("enabled") is not True or entry.get("consumed_attempts") != 1
-            or entry.get("workspace_path") != binding.get("workspace_path")):
-        return False
-    observed = _show(task_id)
-    task = observed.get("task", {})
-    failure = _runtime_failure_record(observed, entry.get("failed_run_id"))
-    expected_assignees = ({binding.get("implementation_profile")} if task.get("status") == "blocked"
-                          else {binding.get("implementation_profile"), target})
-    if (failure != entry.get("failure") or task.get("status") not in {"blocked", "ready", "todo"}
-            or task.get("assignee") not in expected_assignees
-            or task.get("workspace_path") != entry.get("workspace_path")
-            or _workspace_checkpoint(entry["workspace_path"]) != entry.get("checkpoint")
-            or not _workspace_is_exclusive(board, task_id, entry["workspace_path"])):
-        return False
-    if task.get("status") == "blocked":
-        # Persist ambiguity before the native mutation. A response loss may
-        # leave the card ready, in which case a later tick must read it back
-        # rather than sending another unblock.
-        if status != "unblock_attempted":
-            entry = update_runtime_escalation_intent(board, task_id, "unblock_attempted")
-        _dispatch("kanban_unblock", {"task_id": task_id})
-        observed = _show(task_id); task = observed.get("task", {})
-        if task.get("status") not in {"ready", "todo"}:
-            return False
-        entry = update_runtime_escalation_intent(board, task_id, "unblock_verified")
-    if task.get("status") not in {"ready", "todo"}:
-        return False
-    if task.get("assignee") != target:
-        from .native import reassign_ready_task
-        if entry.get("intent", {}).get("status") != "reassign_attempted":
-            entry = update_runtime_escalation_intent(board, task_id, "reassign_attempted")
-        if not reassign_ready_task(board, task_id, target):
-            return False
-        observed = _show(task_id); task = observed.get("task", {})
-    if task.get("status") not in {"ready", "todo"} or task.get("assignee") != target:
-        return False
-    publish_runtime_escalation_routing(board, task_id, binding=binding)
-    return True
+    from .runtime_escalation import reconcile
+    return reconcile(task_id, board)
 
 
 def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) -> None:
@@ -951,10 +913,14 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
         # Runtime exhaustion is separate from review-correction escalation.  It
         # only revisits a task-scoped intent created from an exact eligible run.
         for entry in load_state().get("runtime_escalations", {}).values():
-            if entry.get("board") == board and entry.get("intent", {}).get("status") != "routed":
+            if entry.get("board") == board:
                 task_id = entry.get("task_id")
                 if isinstance(task_id, str):
-                    _reconcile_runtime_exhaustion_escalation(task_id, board, entry)
+                    if entry.get("intent", {}).get("status") == "routed":
+                        from .runtime_escalation import monitor
+                        monitor(task_id, board)
+                    elif entry.get("intent", {}).get("status") != "held":
+                        _reconcile_runtime_exhaustion_escalation(task_id, board, entry)
         policy = board_policy(board)
         if not policy or policy.get("recovery", {}).get("enabled") is not True: return
         candidates = list(load_state()["tasks"].values())
@@ -988,6 +954,10 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
         task_id = candidate["task_id"]
         try:
             show = _show(task_id); task, runs = show["task"], show["runs"]
+            if runtime_escalation_entry(task_id, board) is not None:
+                # Runtime escalation owns its one attempt; ordinary recovery
+                # must never replenish either implementation or review work.
+                continue
             existing = recovery_entry(task_id, board)
             if existing:
                 # A claim can commit after our unblock write but before its
@@ -1028,9 +998,12 @@ def watchdog_tick(*, board: str | None = None, dry_run: bool = False, **_: Any) 
                     failure = _runtime_failure_record(show, failed.get("id"))
                     if failure is None:
                         continue
+                    context = {"original_contract": dict(task),
+                               "reviewer_findings": [dict(v, run_id=v['reviewer_run_id']) for v in changes_requested_verdicts(runs, show['events'], binding)],
+                               "latest_failure": failure, "checkpoint": checkpoint}
                     runtime = reserve_runtime_escalation(board, task_id, failed_run_id=failed["id"], phase=phase,
                                                          binding=binding, checkpoint=checkpoint, failure=failure,
-                                                         workspace_path=workspace)
+                                                         workspace_path=workspace, coder_context=context)
                 _reconcile_runtime_exhaustion_escalation(task_id, board, runtime)
                 continue
             entry = reserve_recovery(board, task_id, failed_run_id=failed["id"], phase=phase, workspace_path=workspace, checkpoint=checkpoint, binding=binding, adopted=adopted)
@@ -1093,6 +1066,10 @@ def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | N
                 return {"action": "block", "message": "Runtime escalation routing is pending native reconciliation; no worker tool is authorized."}
             if runtime and runtime.get("intent", {}).get("status") == "routed":
                 admission = _routed_escalation_guard(task_id, board_name(), runtime)
+                if admission:
+                    return admission
+                from .runtime_escalation import admit
+                admission = admit(task_id, board_name(), _run_id(), worker_profile(), _show(task_id))
                 if admission:
                     return admission
                 binding = task_binding(task_id, board_name())

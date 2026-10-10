@@ -5,6 +5,7 @@ import sys
 
 import pytest
 
+from test_runtime_safety import runtime
 from local_first_review import plugin, state
 
 
@@ -82,6 +83,9 @@ def test_effective_escalation_route_requires_exact_current_run_and_profile(monke
 
 
 def test_runtime_coder_context_is_not_delivered_to_the_post_escalation_reviewer(monkeypatch):
+    from local_first_review import runtime_escalation
+    monkeypatch.setattr(runtime_escalation, 'admit', lambda *_: None)
+    monkeypatch.setattr(plugin, '_show', lambda *_: {})
     binding = _binding()
     runtime = {"binding": binding, "intent": {"status": "routed"},
                "attempts": [{"implementation_profile": "terra", "reviewer_profile": "terra-review"}],
@@ -332,33 +336,22 @@ def test_configured_phase_budget_counts_distinct_failed_runs_across_restart_and_
     assert third["failed_run_id"] == 3
 
 
-def test_runtime_reconciliation_recovers_lost_unblock_response_from_exact_ready_readback(monkeypatch):
-    """An unknown unblock outcome is never resent once native shows the route ready."""
-    binding = _binding()
-    entry = {"binding": binding, "failed_run_id": 7, "workspace_path": "/work",
-             "failure": {"run_id": 7, "event_id": 11, "kind": "gave_up", "payload": {}},
-             "checkpoint": {"head": "a" * 40, "dirty": []}, "consumed_attempts": 1,
-             "intent": {"status": "unblock_attempted"},
-             "attempts": [{"implementation_profile": "terra", "reviewer_profile": "terra-review"}]}
-    show = {"task": {"status": "ready", "assignee": "terra", "workspace_path": "/work"},
-            "runs": [], "events": []}
-    effects = []
-    monkeypatch.setattr(plugin, "task_binding", lambda *_: binding)
-    monkeypatch.setattr(plugin, "board_policy", lambda *_: {"runtime_escalation": {"enabled": True}})
-    monkeypatch.setattr(plugin, "profile_exists", lambda _: True)
-    monkeypatch.setattr(plugin, "_show", lambda *_: show)
-    monkeypatch.setattr(plugin, "_runtime_failure_record", lambda *_: entry["failure"])
-    monkeypatch.setattr(plugin, "_workspace_checkpoint", lambda *_: entry["checkpoint"])
-    monkeypatch.setattr(plugin, "_workspace_is_exclusive", lambda *_: True)
-    monkeypatch.setattr(plugin, "update_runtime_escalation_intent", lambda *_args: entry)
-    monkeypatch.setattr(plugin, "_dispatch", lambda *args: effects.append(args))
-    monkeypatch.setattr(plugin, "publish_runtime_escalation_routing", lambda *args, **kwargs: effects.append((args, kwargs)))
-
-    assert plugin._reconcile_runtime_exhaustion_escalation("task", "default", entry) is True
-    assert effects == [(("default", "task"), {"binding": binding})]
+def test_runtime_reconciliation_recovers_lost_unblock_response_from_exact_ready_readback(runtime, monkeypatch):
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'reassign_attempted')
+    show['task'].update(status='ready', assignee='strong')
+    show['events'].extend([
+        {'id':21,'kind':'unblocked','run_id':None,'payload':None},
+        {'id':22,'kind':'assigned','run_id':None,'payload':{'assignee':'strong','from':'impl'}},
+    ])
+    monkeypatch.setattr(plugin, '_dispatch', lambda *_: pytest.fail('must not resend known applied effect'))
+    assert plugin._reconcile_runtime_exhaustion_escalation('task', 'default', entry)
+    assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'routed'
 
 
 def test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preserves_binding(tmp_path, monkeypatch):
+    from local_first_review import native
+    monkeypatch.setattr(native, "board_run_watermark", lambda _: 0)
     """Runtime escalation is a separately opted-in, task-scoped replacement route."""
     monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"
@@ -407,6 +400,8 @@ def test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preser
 
 
 def test_explicit_runtime_catchup_preserves_bound_history_and_durable_coder_context(tmp_path, monkeypatch):
+    from local_first_review import native
+    monkeypatch.setattr(native, "board_run_watermark", lambda _: 0)
     """An operator targets one already-bound RM03 hold; this is not a board sweep."""
     monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"
@@ -444,6 +439,8 @@ def test_explicit_runtime_catchup_preserves_bound_history_and_durable_coder_cont
 
 
 def test_runtime_intent_requires_exact_failure_checkpoint_and_lease(tmp_path, monkeypatch):
+    from local_first_review import native
+    monkeypatch.setattr(native, "board_run_watermark", lambda _: 0)
     """A runtime route is not a generic unblock: it binds the failed event and workspace lease."""
     monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
     path = tmp_path / "state.json"; monkeypatch.setattr(state, "state_path", lambda: path)
@@ -601,7 +598,7 @@ def _watchdog_recovery_mocks(monkeypatch, shows: dict[str, dict]):
               "recovery": {"enabled": True, "max_per_phase": 1}}
     recoveries, reservations, unblocks = {}, [], []
     monkeypatch.setattr(plugin, "board_policy", lambda _: policy)
-    monkeypatch.setattr(state, "load_state", lambda: {"tasks": {}})
+    monkeypatch.setattr(state, "load_state", lambda: {"tasks": {}, "runtime_escalations": {}})
     monkeypatch.setattr(plugin, "_show", lambda task_id: shows[task_id])
     monkeypatch.setattr(plugin, "_allowed_terminal_failure", lambda *_: True)
     monkeypatch.setattr(plugin, "_failed_phase", lambda *_: "implementation")
@@ -668,7 +665,7 @@ def test_ambiguous_unbound_history_does_not_skip_bound_recovery_reconciliation(m
              "bound": {"task": {"id": "bound", "status": "running"}, "runs": [], "events": []}}
     reconciled = []
     monkeypatch.setattr(plugin, "board_policy", lambda _: policy)
-    monkeypatch.setattr(state, "load_state", lambda: {"tasks": {"default:bound": bound}})
+    monkeypatch.setattr(state, "load_state", lambda: {"tasks": {"default:bound": bound}, "runtime_escalations": {}})
     monkeypatch.setattr(plugin, "_show", lambda task_id: shows[task_id])
     monkeypatch.setattr(plugin, "_first_unbound_gave_up",
                         lambda _policy, show: (show["runs"][0], "implementation") if show["runs"] else None)

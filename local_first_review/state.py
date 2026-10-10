@@ -319,12 +319,20 @@ def set_runtime_escalation_policy(board: str, *, enabled: bool, max_attempts: in
                                                                                      "max_attempts": 1,
                                                                                      "implementation_profile": None,
                                                                                      "reviewer_profile": None}))
+        if enabled:
+            configured = policy.get("escalation", {})
+            implementation_profile = implementation_profile or configured.get("implementation_profile")
+            reviewer_profile = reviewer_profile or configured.get("reviewer_profile")
         proposed = {"enabled": enabled, "max_attempts": current["max_attempts"] if max_attempts is None else max_attempts,
                     "implementation_profile": implementation_profile if enabled else None,
                     "reviewer_profile": reviewer_profile if enabled else None}
         if enabled and (not profile_exists(implementation_profile or "") or not profile_exists(reviewer_profile or "")):
             raise ValueError("configured runtime escalation profile is missing")
-        policy["runtime_escalation"] = _runtime_escalation_settings(proposed)
+        validated = _runtime_escalation_settings(proposed)
+        if enabled and not current["enabled"]:
+            from .native import board_run_watermark
+            policy["runtime_escalation_watermark"] = board_run_watermark(board)
+        policy["runtime_escalation"] = validated
         return json.loads(json.dumps(policy))
 
 
@@ -338,7 +346,7 @@ def _runtime_coder_context(value: Any, *, failure: dict[str, Any], checkpoint: d
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("runtime coder context is invalid")
     contract, findings = value.get("original_contract"), value.get("reviewer_findings")
-    if (not isinstance(contract, dict) or not contract or not isinstance(findings, list) or not findings
+    if (not isinstance(contract, dict) or not contract or not isinstance(findings, list)
             or value.get("latest_failure") != failure or value.get("checkpoint") != checkpoint):
         raise ValueError("runtime coder context is incomplete")
     try:
@@ -391,7 +399,16 @@ def reserve_runtime_escalation(board: str, task_id: str, *, failed_run_id: int, 
                     or (coder_context is not None and existing.get("coder_context") != coder_context)):
                 raise ValueError("runtime escalation identity conflicts with an existing intent")
             return json.loads(json.dumps(existing))
+        if data['tasks'].get(key) != binding:
+            raise ValueError('runtime escalation original binding is missing or changed')
+        if key in data['effective_routing'] or key in data['escalations']:
+            raise ValueError('configured escalation attempt has already been reserved')
+        watermark = policy.get("runtime_escalation_watermark")
+        if not catchup and (type(watermark) is not int or failed_run_id <= watermark):
+            raise ValueError("historical runtime failure requires explicit task-scoped catch-up")
         recovery = _recovery_settings(policy.get("recovery", {"enabled": False, "max_per_phase": RECOVERY_MAX_PER_PHASE}))
+        if not recovery['enabled']:
+            raise ValueError('runtime recovery policy is paused')
         if data["recovery_budgets"].get(budget, 0) < recovery["max_per_phase"]:
             raise ValueError("runtime recovery budget is not exhausted")
         if not profile_exists(settings["implementation_profile"]) or not profile_exists(settings["reviewer_profile"]):
@@ -417,14 +434,16 @@ def adopt_runtime_escalation(board: str, task_id: str, **evidence: Any) -> dict[
     return reserve_runtime_escalation(board, task_id, catchup=True, **evidence)
 
 
-def update_runtime_escalation_intent(board: str, task_id: str, status: str) -> dict[str, Any]:
-    if status not in {"unblock_requested", "unblock_attempted", "unblock_verified", "reassign_attempted", "routed"}:
+def update_runtime_escalation_intent(board: str, task_id: str, status: str, *, reason: str | None = None) -> dict[str, Any]:
+    if status not in {"unblock_requested", "unblock_attempted", "unblock_verified", "reassign_attempted", "routed", "held"}:
         raise ValueError("runtime escalation intent status is invalid")
     with locked_state(write=True) as data:
         entry = data["runtime_escalations"].get(binding_key(board, task_id))
         if not isinstance(entry, dict):
             raise ValueError("runtime escalation intent is absent")
         entry["intent"] = dict(entry.get("intent", {}), status=status)
+        if reason is not None:
+            entry["intent"]["reason"] = reason
         attempts = entry.get("attempts")
         if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
             attempts[-1]["intent"] = dict(attempts[-1].get("intent", {}), status=status)

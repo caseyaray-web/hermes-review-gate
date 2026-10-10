@@ -18,7 +18,7 @@ if _plugin_root not in sys.path:
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
-from local_first_review.review_evidence import approved_completion, changes_requested_verdicts
+from local_first_review.review_evidence import approved_completion, changes_requested_verdicts, correction_count
 from local_first_review.state import (ESCALATION_MAX_ATTEMPTS_LIMIT, MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT,
                                       activate_board, adopt_runtime_escalation, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
                                       recovery_budget_exhausted, runtime_escalation_entry, set_escalation_policy, set_recovery_policy, set_runtime_escalation_policy, task_binding, trusted_routing)
@@ -407,7 +407,7 @@ def _task_view(binding: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
             break
     summary = next((run.get("summary") for run in reversed(runs) if run.get("summary")), task.get("result"))
     handoff_summary = next((run.get("summary") for run in reversed(runs) if run.get("outcome") == "review_requested"), None)
-    changes = len(changes_requested_verdicts(runs, events, binding))
+    changes = correction_count(runs, events, binding)
     approved = _completion_is_approved(task, runs, events, binding)
     phase = _phase(task, runs, events, approved)
     stale = _active_run_is_stale(active, observed_at)

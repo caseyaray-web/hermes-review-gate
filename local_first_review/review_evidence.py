@@ -115,6 +115,11 @@ def changes_requested_verdicts(runs: list[dict[str, Any]], events: list[dict[str
     return valid
 
 
+def correction_count(runs, events, binding):
+    """A repeated review of an unchanged candidate is not another correction."""
+    return len({_candidate_key(v['candidate']) for v in changes_requested_verdicts(runs, events, binding)})
+
+
 def approved_completion(task: dict[str, Any], runs: list[dict[str, Any]], events: list[dict[str, Any]],
                          binding: dict[str, Any], route: dict[str, Any]) -> bool:
     """Accept a completed card only when its approval has exact immutable provenance."""

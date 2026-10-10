@@ -45,6 +45,18 @@ def test_changes_requested_deduplicates_a_replayed_native_reviewer_run():
     assert [verdict["reviewer_run_id"] for verdict in verdicts] == [11]
 
 
+def test_retrying_same_candidate_in_a_new_review_run_cannot_inflate_corrections():
+    from local_first_review.review_evidence import correction_count
+    runs = [_handoff(), _review(), _handoff(12), _review(13)]
+    events = _events() + [
+        {"kind":"review_requested","run_id":12},
+        {"kind":"claimed","run_id":13,"payload":{"source_status":"review"}},
+        {"kind":"changes_requested","run_id":13},
+    ]
+    assert correction_count(runs,events,BINDING)==1
+    assert len(changes_requested_verdicts(runs,events,BINDING))==2  # retain complete findings
+
+
 def test_changes_requested_rejects_missing_native_event():
     runs = [_handoff(), _review()]
 

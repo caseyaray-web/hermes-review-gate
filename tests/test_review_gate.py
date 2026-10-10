@@ -256,6 +256,8 @@ def test_correction_limit_from_native_runs(board):
     b=board
     for cycle in range(3):
         assert b.dispatch().assignee=='impl'
+        (b.repo/'implementation.txt').write_text(f'fresh correction candidate {cycle}\n')
+        b.git('add','implementation.txt');b.git('commit','-qm',f'fresh candidate {cycle}')
         assert b.call('finish_implementation',summary=f'Candidate attempt {cycle}: source and checks reviewed.')['ok']
         assert b.dispatch().assignee=='review'
         result=b.call('submit_review',verdict='changes_requested',rationale=f'Missing required behavior {cycle}; implement and verify it.')
@@ -995,6 +997,8 @@ def test_joined_runtime_exhaustion_escalates_same_card_after_two_recoveries(boar
     assert runtime['failed_run_id'] == third and runtime['failure']['run_id'] == third
     assert runtime['checkpoint']['head'] == b.git('rev-parse', 'HEAD')
     assert runtime['intent']['status'] == 'routed'
+    assert runtime['coder_context']['original_contract']['title']=='RM03 exhausted recovery route'
+    assert runtime['coder_context']['reviewer_findings']==[]
     assert stored['tasks']['default:' + task_id] == immutable
     assert stored['effective_routing']['default:' + task_id]['implementation_profile'] == 'strong'
     assert stored['effective_routing']['default:' + task_id]['reviewer_profile'] == 'post-review'
@@ -1004,6 +1008,9 @@ def test_joined_runtime_exhaustion_escalates_same_card_after_two_recoveries(boar
     assert routed['task']['workspace_path'] == str(workspace)
 
     assert b.dispatch(expected=task_id).assignee == 'strong'
+    context_notice = plugin.guard('kanban_show', {})
+    assert context_notice and 'RM03 exhausted recovery route' in context_notice['message']
+    assert plugin.guard('kanban_show', {}) is None
     (workspace / 'implementation.txt').write_text('terra runtime escalation candidate\n')
     subprocess.check_call(['git', '-C', str(workspace), 'add', 'implementation.txt'])
     subprocess.check_call(['git', '-C', str(workspace), 'commit', '-qm', 'terra runtime escalation candidate'])
