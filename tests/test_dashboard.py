@@ -32,14 +32,16 @@ def test_status_uses_native_snapshot_and_marks_counts_unknown(monkeypatch):
         {"title": "Native task", "status": "done", "created_at": 1, "completed_at": 7},
         [
             {"id": 1, "profile": "impl", "status": "review", "outcome": "review_requested", "started_at": 2,
-             "ended_at": 6, "metadata": {"local_first_review": {"implementation_run_id": 1,
-                 "implementation_profile": "impl", "reviewer_profile": "review", "candidate": {"head": "a"}}}},
+             "ended_at": 6, "metadata": {"worker_session_id": "implementation-session", "local_first_review": {"implementation_run_id": 1,
+                 "implementation_profile": "impl", "reviewer_profile": "review", "candidate": {"head": "a" * 40, "clean_tracked": True},
+                 "binding": {"board": "default", "task_id": "one", "implementation_profile": "impl", "reviewer_profile": "review", "workspace_path": "/work"}}}},
             {"id": 2, "profile": "review", "status": "done", "outcome": "completed", "summary": "approved summary",
-             "started_at": 6, "ended_at": 7, "metadata": {"local_first_review": {"verdict": "approved",
+             "started_at": 6, "ended_at": 7, "metadata": {"worker_session_id": "reviewer-session", "local_first_review": {"verdict": "approved",
                  "rationale": "checks pass", "implementation_run_id": 1, "reviewer_run_id": 2,
-                 "reviewer_profile": "review", "candidate": {"head": "a"}}}},
+                 "reviewer_profile": "review", "candidate": {"head": "a" * 40, "clean_tracked": True}}}},
         ],
-        [],
+        [{"kind": "review_requested", "run_id": 1}, {"kind": "claimed", "run_id": 2, "payload": {"source_status": "review"}},
+         {"kind": "completed", "run_id": 2}],
     ) if task_id == "one" else (_ for _ in ()).throw(plugin_api.TelemetryUnavailable("native unavailable")))
 
     response = client().get("/status")
@@ -77,20 +79,24 @@ def test_escalated_completion_uses_trusted_effective_route_not_original_binding(
     route = {"board": "default", "task_id": "one", "implementation_profile": "strong",
              "reviewer_profile": "strong"}
     monkeypatch.setattr(plugin_api, "trusted_routing", lambda *_args, **_kwargs: route)
-    candidate = {"head": "a"}
+    candidate = {"head": "a" * 40, "clean_tracked": True}
+    handoff_binding = {"board": "default", "task_id": "one", "implementation_profile": "impl",
+                       "reviewer_profile": "review", "workspace_path": "/work"}
     runs = [
         {"id": 11, "profile": "strong", "status": "review", "outcome": "review_requested", "ended_at": 6,
-         "metadata": {"local_first_review": {"implementation_run_id": 11, "implementation_profile": "strong",
-                                                "reviewer_profile": "strong", "candidate": candidate}}},
+         "metadata": {"worker_session_id": "implementation-session", "local_first_review": {"implementation_run_id": 11, "implementation_profile": "strong",
+                                                "reviewer_profile": "strong", "candidate": candidate, "binding": handoff_binding}}},
         {"id": 12, "profile": "strong", "status": "done", "outcome": "completed", "ended_at": 7,
-         "metadata": {"local_first_review": {"verdict": "approved", "reviewer_run_id": 12,
+         "metadata": {"worker_session_id": "reviewer-session", "local_first_review": {"verdict": "approved", "reviewer_run_id": 12,
                                                 "reviewer_profile": "strong", "implementation_run_id": 11,
                                                 "candidate": candidate}}},
     ]
+    events = [{"kind": "review_requested", "run_id": 11}, {"kind": "claimed", "run_id": 12, "payload": {"source_status": "review"}},
+              {"kind": "completed", "run_id": 12}]
 
-    assert plugin_api._completion_is_approved({"status": "done"}, runs, binding)
+    assert plugin_api._completion_is_approved({"status": "done"}, runs, events, binding)
     runs[0]["metadata"]["local_first_review"]["implementation_profile"] = "impl"
-    assert not plugin_api._completion_is_approved({"status": "done"}, runs, binding)
+    assert not plugin_api._completion_is_approved({"status": "done"}, runs, events, binding)
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -108,6 +114,24 @@ def test_task_status_exposes_its_own_board_escalation_policy(monkeypatch, enable
 
     assert task["escalation_status"] == "changes_requested_pending"
     assert task["escalation_enabled"] is enabled
+
+
+def test_task_status_exposes_routed_runtime_hold_without_claiming_review_escalation(monkeypatch):
+    binding = {"board": "board-a", "task_id": "one", "implementation_profile": "impl",
+               "reviewer_profile": "review", "workspace_path": "/work"}
+    runtime = {"intent": {"status": "held", "reason": "Independent runtime reviewer requested changes."}}
+    monkeypatch.setattr(plugin_api, "effective_routing", lambda *_: {**binding, "implementation_profile": "strong", "reviewer_profile": "post-review"})
+    monkeypatch.setattr(plugin_api, "trusted_routing", lambda *_: {**binding, "implementation_profile": "strong", "reviewer_profile": "post-review"})
+    monkeypatch.setattr(plugin_api, "escalation_entry", lambda *_: None)
+    monkeypatch.setattr(plugin_api, "runtime_escalation_entry", lambda *_: runtime)
+    monkeypatch.setattr(plugin_api, "load_state", lambda: {"boards": {"board-a": {"escalation": {"enabled": True}}}})
+    monkeypatch.setattr(plugin_api, "_observe_task", lambda *_: ({"title": "Task", "status": "blocked"}, [], []))
+
+    task, _ = plugin_api._task_view(binding)
+
+    assert task["escalation_status"] is None
+    assert task["runtime_escalation_status"] == "held"
+    assert task["runtime_escalation_reason"] == "Independent runtime reviewer requested changes."
 
 
 def test_configuration_validates_and_updates_only_defaults(monkeypatch):
@@ -486,12 +510,14 @@ def test_status_hides_archived_bound_and_unbound_cards_but_keeps_done_cards(monk
                         [{"id": 2, "status": "running", "started_at": 99, "ended_at": None}], []),
         "done-unarchived": ({"id": task_id, "title": "Done", "status": "done", "created_at": 1}, [
             {"id": 3, "profile": "impl", "status": "review", "outcome": "review_requested", "ended_at": 98,
-             "metadata": {"local_first_review": {"implementation_run_id": 3, "implementation_profile": "impl",
-                          "reviewer_profile": "review", "candidate": {"head": "a"}}}},
+             "metadata": {"worker_session_id": "impl-session", "local_first_review": {"implementation_run_id": 3, "implementation_profile": "impl",
+                          "reviewer_profile": "review", "candidate": {"head": "a" * 40, "clean_tracked": True},
+                          "binding": {"board": "board-a", "task_id": "done-unarchived", "implementation_profile": "impl", "reviewer_profile": "review", "workspace_path": "/work"}}}},
             {"id": 4, "profile": "review", "status": "done", "outcome": "completed", "ended_at": 99,
-             "metadata": {"local_first_review": {"verdict": "approved", "implementation_run_id": 3,
-                          "reviewer_run_id": 4, "reviewer_profile": "review", "candidate": {"head": "a"}}}},
-        ], []),
+             "metadata": {"worker_session_id": "review-session", "local_first_review": {"verdict": "approved", "implementation_run_id": 3,
+                          "reviewer_run_id": 4, "reviewer_profile": "review", "candidate": {"head": "a" * 40, "clean_tracked": True}}}},
+        ], [{"kind": "review_requested", "run_id": 3}, {"kind": "claimed", "run_id": 4, "payload": {"source_status": "review"}},
+            {"kind": "completed", "run_id": 4}]),
     }[task_id])
 
     body = client().get("/status").json()
@@ -582,12 +608,14 @@ def test_done_requires_bound_reviewer_completion_and_matching_handoff_candidate(
         {"title": "Native", "status": "done"},
         [
             {"id": 1, "profile": "impl", "status": "review", "outcome": "review_requested", "ended_at": 2,
-             "metadata": {"local_first_review": {"implementation_run_id": 1, "implementation_profile": "impl",
-                          "reviewer_profile": "review", "candidate": {"head": "candidate"}}}},
+             "metadata": {"worker_session_id": "impl-session", "local_first_review": {"implementation_run_id": 1, "implementation_profile": "impl",
+                          "reviewer_profile": "review", "candidate": {"head": "a" * 40, "clean_tracked": True},
+                          "binding": {"board": "default", "task_id": "one", "implementation_profile": "impl", "reviewer_profile": "review", "workspace_path": "/work"}}}},
             {"id": 2, "profile": "review", "status": "done", "outcome": "completed", "ended_at": 3,
-             "metadata": {"local_first_review": {"verdict": "approved", "implementation_run_id": 1,
-                          "reviewer_run_id": 2, "reviewer_profile": "review", "candidate": {"head": "candidate"}}}},
-        ], [],
+             "metadata": {"worker_session_id": "review-session", "local_first_review": {"verdict": "approved", "implementation_run_id": 1,
+                          "reviewer_run_id": 2, "reviewer_profile": "review", "candidate": {"head": "a" * 40, "clean_tracked": True}}}},
+        ], [{"kind": "review_requested", "run_id": 1}, {"kind": "claimed", "run_id": 2, "payload": {"source_status": "review"}},
+            {"kind": "completed", "run_id": 2}],
     ))
     binding = {"board": "default", "task_id": "one", "implementation_profile": "impl", "reviewer_profile": "review", "workspace_path": "/work"}
 

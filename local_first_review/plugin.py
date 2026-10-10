@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
+from .review_evidence import changes_requested_verdicts
 from .state import (MAX_CHANGES, authorize_recovery_run, bind_first_owned_run, board_name, board_policy,
                     current_escalation_attempt, deliver_runtime_coder_context, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, publish_runtime_escalation_routing,
                     reconcile_pending_escalation, recovery_budget_exhausted, recovery_entry, reserve_runtime_escalation, runtime_escalation_entry,
@@ -397,8 +398,9 @@ def finish_implementation(args: dict[str, Any], **_: Any) -> str:
     return _result(value, message="Review requested. Stop work; the configured reviewer owns the next transition.")
 
 
-def _changes_count(runs: list[dict[str, Any]]) -> int:
-    return sum(1 for run in runs if isinstance(run, dict) and run.get("outcome") == "changes_requested")
+def _changes_count(runs: list[dict[str, Any]], events: list[dict[str, Any]], binding: dict[str, Any]) -> int:
+    """Count only distinct, candidate-bound native reviewer verdicts."""
+    return len(changes_requested_verdicts(runs, events, binding))
 
 
 def _pending_escalation_proof(task_id: str, board: str, entry: dict[str, Any], *,
@@ -480,7 +482,7 @@ def _reconcile_pending_escalation(task_id: str, board: str, *, required_run_id: 
 def _escalate_after_exhaustion(task_id: str, binding: dict[str, Any], show: dict[str, Any], reviewer_run_id: int,
                                review: dict[str, Any], rationale: str) -> dict[str, Any]:
     reserve_escalation(board_name(), task_id, review_run_id=reviewer_run_id, binding=binding,
-                       candidate=review["candidate"], change_count=_changes_count(show["runs"]))
+                       candidate=review["candidate"], change_count=_changes_count(show["runs"], show["events"], binding))
     try:
         value = _dispatch("kanban_request_changes", {"reason": rationale})
     except Exception as exc:
@@ -504,6 +506,7 @@ def submit_review(args: dict[str, Any], **_: Any) -> str:
     if verdict not in {"approved", "changes_requested"} or not rationale:
         raise GateError("verdict must be approved or changes_requested and rationale is required")
     task_id, _binding_value, show, reviewer_run_id, _workspace, _review = _review_context()
+    runtime = runtime_escalation_entry(task_id, board_name())
     if verdict == "approved":
         tool, native_args = "kanban_complete", {"summary": rationale, "metadata": {"local_first_review": {
             "verdict": "approved", "rationale": rationale, "candidate": _review["candidate"],
@@ -511,7 +514,14 @@ def submit_review(args: dict[str, Any], **_: Any) -> str:
             "reviewer_run_id": reviewer_run_id, "reviewer_profile": worker_profile(),
         }}}
         expected_status, expected_event = "done", "completed"
-    elif _changes_count(show["runs"]) >= (board_policy(board_name()) or {}).get("escalation", {}).get("normal_correction_limit", MAX_CHANGES):
+    elif isinstance(runtime, dict) and runtime.get("intent", {}).get("status") == "routed":
+        # A routed runtime escalation has its single recovery replacement already
+        # consumed. Preserve the reviewer finding in the terminal native block;
+        # never turn this negative verdict into another implementation/review loop.
+        tool, native_args = "kanban_block", {"reason": "Runtime escalation is exhausted; independent reviewer requested changes. Latest findings: " + rationale,
+                                              "kind": "needs_input"}
+        expected_status, expected_event = "blocked", None
+    elif _changes_count(show["runs"], show["events"], _binding_value) >= (board_policy(board_name()) or {}).get("escalation", {}).get("normal_correction_limit", MAX_CHANGES):
         policy = board_policy(board_name()) or {}
         escalation = policy.get("escalation", {})
         if escalation.get("enabled") is True:

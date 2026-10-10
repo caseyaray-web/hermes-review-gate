@@ -18,6 +18,7 @@ if _plugin_root not in sys.path:
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
+from local_first_review.review_evidence import approved_completion, changes_requested_verdicts
 from local_first_review.state import (ESCALATION_MAX_ATTEMPTS_LIMIT, MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT,
                                       activate_board, adopt_runtime_escalation, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
                                       recovery_budget_exhausted, runtime_escalation_entry, set_escalation_policy, set_recovery_policy, set_runtime_escalation_policy, task_binding, trusted_routing)
@@ -288,39 +289,14 @@ def _claimed_source_status(events: list[dict[str, Any]], run_id: Any) -> str | N
     return None
 
 
-def _completion_is_approved(task: dict[str, Any], runs: list[dict[str, Any]], binding: dict[str, Any]) -> bool:
-    """Only native completion carrying the gate's approval can make this done."""
-    if task.get("status") != "done":
-        return False
+def _completion_is_approved(task: dict[str, Any], runs: list[dict[str, Any]], events: list[dict[str, Any]],
+                            binding: dict[str, Any]) -> bool:
+    """Only an exact immutable handoff and native approval can make this done."""
     try:
         route = trusted_routing(binding["task_id"], binding["board"], binding)
     except (KeyError, ValueError):
         return False
-    for run in reversed(runs):
-        if run.get("outcome") != "completed" or run.get("ended_at") is None:
-            continue
-        metadata = run.get("metadata")
-        review = metadata.get("local_first_review") if isinstance(metadata, dict) else None
-        implementation_run_id = review.get("implementation_run_id") if isinstance(review, dict) else None
-        handoff = next((candidate for candidate in runs if candidate.get("id") == implementation_run_id), None)
-        handoff_metadata = handoff.get("metadata") if isinstance(handoff, dict) else None
-        handoff_review = handoff_metadata.get("local_first_review") if isinstance(handoff_metadata, dict) else None
-        return bool(
-            isinstance(review, dict) and review.get("verdict") == "approved"
-            and review.get("reviewer_run_id") == run.get("id")
-            and review.get("reviewer_profile") == run.get("profile")
-            and isinstance(review.get("reviewer_profile"), str)
-            and isinstance(implementation_run_id, int) and isinstance(handoff, dict)
-            and isinstance(handoff_review, dict)
-            and handoff.get("profile") == handoff_review.get("implementation_profile")
-            and handoff.get("outcome") == "review_requested"
-            and isinstance(handoff_review, dict)
-            and handoff_review.get("implementation_run_id") == implementation_run_id
-            and handoff_review.get("implementation_profile") == route["implementation_profile"]
-            and handoff_review.get("reviewer_profile") == route["reviewer_profile"]
-            and review.get("candidate") == handoff_review.get("candidate")
-        )
-    return False
+    return approved_completion(task, runs, events, binding, route)
 
 
 def _phase(task: dict[str, Any], runs: list[dict[str, Any]], events: list[dict[str, Any]], approved: bool) -> str:
@@ -389,14 +365,20 @@ def _task_view(binding: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
                                           for key in ("board", "task_id", "implementation_profile", "reviewer_profile")):
         published_route = None
     pending = escalation_entry(task_id, board)
+    runtime = runtime_escalation_entry(task_id, board)
     escalation_status = current_escalation_attempt(pending).get("intent", {}).get("status") if isinstance(pending, dict) else None
+    runtime_intent = runtime.get("intent") if isinstance(runtime, dict) else None
+    runtime_status = runtime_intent.get("status") if isinstance(runtime_intent, dict) else None
+    runtime_reason = runtime_intent.get("reason") if isinstance(runtime_intent, dict) and isinstance(runtime_intent.get("reason"), str) else None
     policy = load_state().get("boards", {}).get(board, {})
     escalation_enabled = policy.get("escalation", {}).get("enabled") is True
     base = {"board": board, "task_id": task_id, "implementation_profile": route["implementation_profile"],
             "reviewer_profile": route["reviewer_profile"],
             "original_implementation_profile": binding["implementation_profile"],
             "original_reviewer_profile": binding["reviewer_profile"], "effective_routing": published_route,
-            "escalation_status": escalation_status, "escalation_enabled": escalation_enabled, "process_liveness": PROCESS_LIVENESS}
+            "escalation_status": escalation_status, "escalation_enabled": escalation_enabled,
+            "runtime_escalation_status": runtime_status, "runtime_escalation_reason": runtime_reason,
+            "process_liveness": PROCESS_LIVENESS}
     try:
         task, runs, events = _observe_task(board, task_id)
     except TelemetryUnavailable as exc:
@@ -425,8 +407,8 @@ def _task_view(binding: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
             break
     summary = next((run.get("summary") for run in reversed(runs) if run.get("summary")), task.get("result"))
     handoff_summary = next((run.get("summary") for run in reversed(runs) if run.get("outcome") == "review_requested"), None)
-    changes = sum(run.get("outcome") == "changes_requested" for run in runs)
-    approved = _completion_is_approved(task, runs, binding)
+    changes = len(changes_requested_verdicts(runs, events, binding))
+    approved = _completion_is_approved(task, runs, events, binding)
     phase = _phase(task, runs, events, approved)
     stale = _active_run_is_stale(active, observed_at)
     try:
@@ -616,18 +598,12 @@ def _runtime_catchup_context(task: dict[str, Any], runs: list[dict[str, Any]], e
     workspace = task.get("workspace_path")
     if failure is None or not isinstance(workspace, str) or workspace != binding.get("workspace_path"):
         raise ValueError("runtime catch-up native failure or workspace evidence is invalid")
-    findings = []
-    for run in runs:
-        if not isinstance(run, dict) or run.get("outcome") != "changes_requested" or run.get("ended_at") is None:
-            continue
-        run_id = run.get("id")
-        if _claimed_source_status(events, run_id) != "review":
-            continue
-        if not any(event.get("kind") == "changes_requested" and event.get("run_id") == run_id for event in events):
-            continue
-        metadata = run.get("metadata")
-        review = metadata.get("local_first_review") if isinstance(metadata, dict) else None
-        findings.append({"run_id": run_id, "summary": run.get("summary"), "metadata": review})
+    findings = [
+        {"run_id": verdict["reviewer_run_id"], "summary": verdict["summary"],
+         "candidate": verdict["candidate"], "reviewer_profile": verdict["reviewer_profile"],
+         "reviewer_identity": verdict["reviewer_identity"]}
+        for verdict in changes_requested_verdicts(runs, events, binding)
+    ]
     if not findings:
         raise ValueError("runtime catch-up requires one prior genuine reviewer changes-requested verdict")
     checkpoint = plugin._workspace_checkpoint(workspace)
