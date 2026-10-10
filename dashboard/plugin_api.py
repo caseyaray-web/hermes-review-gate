@@ -640,12 +640,18 @@ def _runtime_catchup_context(task: dict[str, Any], runs: list[dict[str, Any]], e
 def runtime_escalation_catchup(body: RuntimeCatchupControl) -> dict[str, Any]:
     """Explicitly adopt one already-bound RM03 hold; native state stays untouched."""
     try:
+        # A client may lose the successful response after durable adoption.  The
+        # task is allowed exactly one immutable catch-up intent, so replaying
+        # the same scoped request returns that evidence without re-observing a
+        # now-progressed card or recapturing its checkpoint/context.
+        existing = runtime_escalation_entry(body.task_id, body.board)
+        if existing is not None:
+            return {"runtime_escalation": existing,
+                    "message": "Catch-up intent was already durable; no native reconciliation was replayed."}
         task, runs, events = _observe_task(body.board, body.task_id)
         binding = task_binding(body.task_id, body.board)
         if task is None or binding is None:
             raise ValueError("runtime catch-up requires an existing immutable task binding")
-        if runtime_escalation_entry(body.task_id, body.board) is not None:
-            raise ValueError("runtime catch-up already has an escalation intent")
         if not recovery_budget_exhausted(body.board, body.task_id, "implementation"):
             raise ValueError("runtime catch-up requires an exhausted implementation recovery budget")
         failure, checkpoint, context = _runtime_catchup_context(task, runs, events, binding)

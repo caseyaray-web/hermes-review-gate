@@ -232,6 +232,23 @@ def test_runtime_catchup_is_explicit_task_scoped_and_leaves_native_effects_for_a
     assert "next real dispatch tick" in response.json()["message"]
 
 
+def test_runtime_catchup_replay_returns_exact_durable_intent_without_recapturing_progress(monkeypatch):
+    """A lost API response retries the immutable adoption, not native observation."""
+    existing = {"board": "board-a", "task_id": "rm03", "failed_run_id": 31,
+                "intent": {"status": "routed"}, "checkpoint": {"head": "a" * 40, "dirty": ["partial.py"]}}
+    native_effects = []
+    monkeypatch.setattr(plugin_api, "runtime_escalation_entry", lambda board, task_id: existing)
+    monkeypatch.setattr(plugin_api, "_observe_task", lambda *_: (_ for _ in ()).throw(AssertionError("must not reread progressed native task")))
+    monkeypatch.setattr(plugin_api, "_runtime_catchup_context", lambda *_: (_ for _ in ()).throw(AssertionError("must not recapture checkpoint")))
+    monkeypatch.setattr(plugin_api, "adopt_runtime_escalation", lambda *args, **kwargs: native_effects.append((args, kwargs)))
+
+    response = client().post("/runtime-escalation/catch-up", json={"board": "board-a", "task_id": "rm03"})
+
+    assert response.status_code == 200
+    assert response.json()["runtime_escalation"] == existing
+    assert native_effects == []
+
+
 def test_escalation_control_persists_future_only_routing_and_shipped_controls(monkeypatch):
     calls = []
     monkeypatch.setattr(plugin_api, "set_escalation_policy", lambda board, **kwargs:

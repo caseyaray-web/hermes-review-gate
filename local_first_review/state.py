@@ -95,10 +95,12 @@ def _runtime_escalation_settings(value: Any) -> dict[str, Any]:
         raise ValueError("runtime escalation policy is invalid")
     enabled, attempts = value["enabled"], value["max_attempts"]
     implementation, reviewer = value["implementation_profile"], value["reviewer_profile"]
-    if type(enabled) is not bool or type(attempts) is not int or not 1 <= attempts <= ESCALATION_MAX_ATTEMPTS_LIMIT:
+    # Runtime exhaustion has one replacement route per failed-run lineage;
+    # accepting a larger number falsely advertises retries that do not exist.
+    if type(enabled) is not bool or type(attempts) is not int or attempts != 1:
         raise ValueError("runtime escalation policy is invalid")
-    if enabled and (not _text(implementation) or not _text(reviewer)):
-        raise ValueError("enabled runtime escalation requires implementation and reviewer profiles")
+    if enabled and (not _text(implementation) or not _text(reviewer) or implementation == reviewer):
+        raise ValueError("enabled runtime escalation requires distinct implementation and reviewer profiles")
     if not enabled and (implementation is not None or reviewer is not None):
         raise ValueError("disabled runtime escalation must not retain routing")
     return dict(value)
@@ -416,7 +418,7 @@ def adopt_runtime_escalation(board: str, task_id: str, **evidence: Any) -> dict[
 
 
 def update_runtime_escalation_intent(board: str, task_id: str, status: str) -> dict[str, Any]:
-    if status not in {"unblock_requested", "routed"}:
+    if status not in {"unblock_requested", "unblock_attempted", "unblock_verified", "reassign_attempted", "routed"}:
         raise ValueError("runtime escalation intent status is invalid")
     with locked_state(write=True) as data:
         entry = data["runtime_escalations"].get(binding_key(board, task_id))

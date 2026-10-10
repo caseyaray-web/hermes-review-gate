@@ -81,6 +81,27 @@ def test_effective_escalation_route_requires_exact_current_run_and_profile(monke
     assert refused and refused["action"] == "block" and "Effective escalation route" in refused["message"]
 
 
+def test_runtime_coder_context_is_not_delivered_to_the_post_escalation_reviewer(monkeypatch):
+    binding = _binding()
+    runtime = {"binding": binding, "intent": {"status": "routed"},
+               "attempts": [{"implementation_profile": "terra", "reviewer_profile": "terra-review"}],
+               "coder_context": {"checkpoint": {}}}
+    delivered = []
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "22")
+    monkeypatch.setenv("HERMES_PROFILE", "terra-review")
+    monkeypatch.setattr(plugin, "runtime_escalation_entry", lambda *_: runtime)
+    monkeypatch.setattr(plugin, "_routed_escalation_guard", lambda *_: None)
+    monkeypatch.setattr(plugin, "task_binding", lambda *_: binding)
+    monkeypatch.setattr(plugin, "trusted_routing", lambda *_: {"implementation_profile": "terra", "reviewer_profile": "terra-review"})
+    monkeypatch.setattr(plugin, "worker_profile", lambda: "terra-review")
+    monkeypatch.setattr(plugin, "deliver_runtime_coder_context", lambda *args: delivered.append(args) or {"checkpoint": {}})
+    monkeypatch.setattr(plugin, "recovery_entry", lambda *_: None)
+
+    assert plugin.guard("terminal", {}) is None
+    assert delivered == []
+
+
 def test_reconciled_escalation_still_refuses_direct_lifecycle_bypass(monkeypatch):
     """First-tool reconciliation must flow into the normal lifecycle fence."""
     binding = _binding()
@@ -311,6 +332,32 @@ def test_configured_phase_budget_counts_distinct_failed_runs_across_restart_and_
     assert third["failed_run_id"] == 3
 
 
+def test_runtime_reconciliation_recovers_lost_unblock_response_from_exact_ready_readback(monkeypatch):
+    """An unknown unblock outcome is never resent once native shows the route ready."""
+    binding = _binding()
+    entry = {"binding": binding, "failed_run_id": 7, "workspace_path": "/work",
+             "failure": {"run_id": 7, "event_id": 11, "kind": "gave_up", "payload": {}},
+             "checkpoint": {"head": "a" * 40, "dirty": []}, "consumed_attempts": 1,
+             "intent": {"status": "unblock_attempted"},
+             "attempts": [{"implementation_profile": "terra", "reviewer_profile": "terra-review"}]}
+    show = {"task": {"status": "ready", "assignee": "terra", "workspace_path": "/work"},
+            "runs": [], "events": []}
+    effects = []
+    monkeypatch.setattr(plugin, "task_binding", lambda *_: binding)
+    monkeypatch.setattr(plugin, "board_policy", lambda *_: {"runtime_escalation": {"enabled": True}})
+    monkeypatch.setattr(plugin, "profile_exists", lambda _: True)
+    monkeypatch.setattr(plugin, "_show", lambda *_: show)
+    monkeypatch.setattr(plugin, "_runtime_failure_record", lambda *_: entry["failure"])
+    monkeypatch.setattr(plugin, "_workspace_checkpoint", lambda *_: entry["checkpoint"])
+    monkeypatch.setattr(plugin, "_workspace_is_exclusive", lambda *_: True)
+    monkeypatch.setattr(plugin, "update_runtime_escalation_intent", lambda *_args: entry)
+    monkeypatch.setattr(plugin, "_dispatch", lambda *args: effects.append(args))
+    monkeypatch.setattr(plugin, "publish_runtime_escalation_routing", lambda *args, **kwargs: effects.append((args, kwargs)))
+
+    assert plugin._reconcile_runtime_exhaustion_escalation("task", "default", entry) is True
+    assert effects == [(("default", "task"), {"binding": binding})]
+
+
 def test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preserves_binding(tmp_path, monkeypatch):
     """Runtime escalation is a separately opted-in, task-scoped replacement route."""
     monkeypatch.setattr(state, "_is_materialized_linked_worktree", lambda _: True)
@@ -323,6 +370,12 @@ def test_runtime_exhaustion_escalation_requires_consumed_phase_budget_and_preser
     state.set_recovery_policy("default", enabled=True, max_per_phase=2)
     state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
                                         implementation_profile="terra", reviewer_profile="terra-review")
+    with pytest.raises(ValueError, match="runtime escalation policy"):
+        state.set_runtime_escalation_policy("default", enabled=True, max_attempts=2,
+                                            implementation_profile="terra", reviewer_profile="terra-review")
+    with pytest.raises(ValueError, match="distinct implementation"):
+        state.set_runtime_escalation_policy("default", enabled=True, max_attempts=1,
+                                            implementation_profile="terra", reviewer_profile="terra")
     binding = _binding()
     for failed_run_id in (2271, 2272):
         state.reserve_recovery("default", "task", failed_run_id=failed_run_id, phase="implementation",

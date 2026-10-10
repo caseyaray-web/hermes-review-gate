@@ -858,13 +858,13 @@ def _runtime_failure_record(show: dict[str, Any], failed_run_id: int) -> dict[st
 
 
 def _reconcile_runtime_exhaustion_escalation(task_id: str, board: str, entry: dict[str, Any]) -> bool:
-    """Resume one exact blocked exhausted task, then route its existing worktree."""
+    """Reconcile one exact persisted route without replaying ambiguous effects."""
     binding = task_binding(task_id, board)
     status = entry.get("intent", {}).get("status")
     if status == "catchup_requested":
         entry = update_runtime_escalation_intent(board, task_id, "unblock_requested")
         status = "unblock_requested"
-    if status != "unblock_requested":
+    if status not in {"unblock_requested", "unblock_attempted", "unblock_verified", "reassign_attempted"}:
         return False
     attempt = entry.get("attempts", [{}])[-1]
     target = attempt.get("implementation_profile") if isinstance(attempt, dict) else None
@@ -878,21 +878,31 @@ def _reconcile_runtime_exhaustion_escalation(task_id: str, board: str, entry: di
     observed = _show(task_id)
     task = observed.get("task", {})
     failure = _runtime_failure_record(observed, entry.get("failed_run_id"))
-    if (failure != entry.get("failure") or task.get("status") != "blocked"
-            or task.get("assignee") != binding.get("implementation_profile")
+    expected_assignees = ({binding.get("implementation_profile")} if task.get("status") == "blocked"
+                          else {binding.get("implementation_profile"), target})
+    if (failure != entry.get("failure") or task.get("status") not in {"blocked", "ready", "todo"}
+            or task.get("assignee") not in expected_assignees
             or task.get("workspace_path") != entry.get("workspace_path")
             or _workspace_checkpoint(entry["workspace_path"]) != entry.get("checkpoint")
             or not _workspace_is_exclusive(board, task_id, entry["workspace_path"])):
         return False
     if task.get("status") == "blocked":
-        value = _dispatch("kanban_unblock", {"task_id": task_id})
-        if value.get("status") not in {"ready", "todo"}:
-            return False
+        # Persist ambiguity before the native mutation. A response loss may
+        # leave the card ready, in which case a later tick must read it back
+        # rather than sending another unblock.
+        if status != "unblock_attempted":
+            entry = update_runtime_escalation_intent(board, task_id, "unblock_attempted")
+        _dispatch("kanban_unblock", {"task_id": task_id})
         observed = _show(task_id); task = observed.get("task", {})
+        if task.get("status") not in {"ready", "todo"}:
+            return False
+        entry = update_runtime_escalation_intent(board, task_id, "unblock_verified")
     if task.get("status") not in {"ready", "todo"}:
         return False
     if task.get("assignee") != target:
         from .native import reassign_ready_task
+        if entry.get("intent", {}).get("status") != "reassign_attempted":
+            entry = update_runtime_escalation_intent(board, task_id, "reassign_attempted")
         if not reassign_ready_task(board, task_id, target):
             return False
         observed = _show(task_id); task = observed.get("task", {})
@@ -1075,9 +1085,17 @@ def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | N
                 admission = _routed_escalation_guard(task_id, board_name(), runtime)
                 if admission:
                     return admission
-                packet = deliver_runtime_coder_context(board_name(), task_id, _run_id())
-                if packet is not None:
-                    return {"action": "block", "message": "Fresh runtime catch-up coder context (inspect and continue the existing dirty checkpoint; do not accept or clean it): " + json.dumps(packet, sort_keys=True)}
+                binding = task_binding(task_id, board_name())
+                if not isinstance(binding, dict):
+                    return {"action": "block", "message": "Runtime escalation binding is absent; no worker tool is authorized."}
+                route = trusted_routing(task_id, board_name(), binding)
+                # The packet is implementation handoff context. A post-handoff
+                # reviewer must get its normal review context instead, and may
+                # never consume the single coder delivery receipt.
+                if worker_profile() == route.get("implementation_profile"):
+                    packet = deliver_runtime_coder_context(board_name(), task_id, _run_id())
+                    if packet is not None:
+                        return {"action": "block", "message": "Fresh runtime catch-up coder context (inspect and continue the existing dirty checkpoint; do not accept or clean it): " + json.dumps(packet, sort_keys=True)}
             pending = escalation_entry(task_id, board_name())
             if pending and current_escalation_attempt(pending).get("intent", {}).get("status") == "changes_requested_pending":
                 # Only the exact newly assigned target claim may turn a pending
