@@ -1150,6 +1150,11 @@ def _safe(handler):
 
 
 def register(ctx: Any) -> None:
+    # PluginContext dispatches through the host's import-time global registry.
+    # CLI/gateway startup does not promise to preload Kanban tools, so make the
+    # supported native transport dependency explicit before retaining context.
+    import tools.kanban_tools  # noqa: F401
+
     global _CONTEXT
     _CONTEXT = ctx
     ctx.register_tool(name="finish_implementation", toolset="local_first_review",

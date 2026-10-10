@@ -67,7 +67,7 @@ def reconcile(task_id, board):
                 return hold(board, task_id, 'Blocked task no longer matches the original failed worker')
             state.update_runtime_escalation_intent(board, task_id, 'unblock_attempted')
             try:
-                result = p._dispatch('kanban_unblock', {'task_id': task_id})
+                result = p._dispatch('kanban_unblock', {'board': board, 'task_id': task_id})
             except Exception as exc:
                 state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', error=exc)
                 transport_error = f'{type(exc).__name__}: {exc}'

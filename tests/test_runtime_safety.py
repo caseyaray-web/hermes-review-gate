@@ -77,7 +77,7 @@ def test_runtime_effect_transport_pins_selected_board(runtime,monkeypatch):
     monkeypatch.setattr(plugin,'_dispatch',unblock)
     monkeypatch.setattr(native,'reassign_ready_task',reassign)
     assert plugin._reconcile_runtime_exhaustion_escalation('task','default',entry)
-    assert calls==[{'task_id':'task'}]
+    assert calls==[{'board':'default','task_id':'task'}]
     assert state.runtime_escalation_entry('task', 'default')['intent']['transport'] == {
         'operation': 'kanban_unblock', 'result': {'status': 'ready'},
     }
@@ -87,7 +87,7 @@ def test_runtime_unblock_transport_error_is_persisted_before_safe_hold(runtime, 
     binding, entry, show = runtime
 
     def refused(*_args):
-        raise plugin.GateError('native kanban_unblock refused: unknown parameter(s): board')
+        raise OSError('native transport link lost after call')
 
     monkeypatch.setattr(plugin, '_dispatch', refused)
 
@@ -98,12 +98,12 @@ def test_runtime_unblock_transport_error_is_persisted_before_safe_hold(runtime, 
     assert transport == {
         'operation': 'kanban_unblock',
         'error': {
-            'type': 'GateError',
-            'message': 'native kanban_unblock refused: unknown parameter(s): board',
+            'type': 'OSError',
+            'message': 'native transport link lost after call',
         },
     }
     assert stored['intent']['status'] == 'held'
-    assert 'Native unblock transport failed: GateError: native kanban_unblock refused' in stored['intent']['reason']
+    assert 'Native unblock transport failed: OSError: native transport link lost after call' in stored['intent']['reason']
     assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
 
 
