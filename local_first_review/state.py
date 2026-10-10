@@ -247,6 +247,26 @@ def _validate(data: Any) -> dict[str, Any]:
         entry_intent = entry.get("intent")
         if not isinstance(entry_intent, dict):
             raise ValueError("runtime escalation ledger is invalid")
+        history = entry_intent.get("held_reason_history")
+        if history is not None and (not isinstance(history, list) or any(not _text(reason) for reason in history)):
+            raise ValueError("runtime held reason history is invalid")
+        no_effect = entry_intent.get("operator_no_effect_reconciliation")
+        if no_effect is not None:
+            required = {"binding", "failure", "checkpoint", "failed_run_id", "snapshot", "snapshot_sha256"}
+            if not isinstance(no_effect, dict) or set(no_effect) != required:
+                raise ValueError("runtime held reconciliation evidence is invalid")
+            try:
+                snapshot_bytes = json.dumps(no_effect["snapshot"], sort_keys=True, separators=(",", ":")).encode()
+                import hashlib
+                digest = hashlib.sha256(snapshot_bytes).hexdigest()
+            except (TypeError, ValueError) as exc:
+                raise ValueError("runtime held reconciliation evidence is invalid") from exc
+            if (len(snapshot_bytes) > 524288 or no_effect["binding"] != entry["binding"]
+                    or no_effect["failure"] != entry.get("failure") or no_effect["checkpoint"] != entry.get("checkpoint")
+                    or no_effect["failed_run_id"] != entry["failed_run_id"] or no_effect["snapshot_sha256"] != digest
+                    or not isinstance(no_effect["snapshot"], dict)
+                    or set(no_effect["snapshot"]) != {"task", "runs", "events"}):
+                raise ValueError("runtime held reconciliation evidence is invalid")
         transport = _runtime_transport(entry_intent.get("transport"))
         for number, attempt in enumerate(entry["attempts"], start=1):
             if (not isinstance(attempt, dict) or attempt.get("attempt") != number
@@ -478,6 +498,47 @@ def update_runtime_escalation_intent(board: str, task_id: str, status: str, *, r
         if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
             attempts[-1]["intent"] = dict(attempts[-1].get("intent", {}), status=status)
         return json.loads(json.dumps(entry))
+
+
+def authorize_runtime_held_reconciliation(board: str, task_id: str, *, entry: dict[str, Any],
+                                           evidence: dict[str, Any]) -> dict[str, Any]:
+    """Persist operator no-effect proof and reopen exactly the reserved effect.
+
+    The caller supplies a complete read-only native snapshot while holding the
+    runtime operation lock.  This write intentionally creates no transport
+    receipt: no native effect has occurred yet.
+    """
+    required = {'binding', 'failure', 'checkpoint', 'failed_run_id', 'snapshot', 'snapshot_sha256'}
+    if not isinstance(evidence, dict) or set(evidence) != required:
+        raise ValueError('runtime held reconciliation evidence is invalid')
+    try:
+        snapshot_bytes = json.dumps(evidence['snapshot'], sort_keys=True, separators=(',', ':')).encode()
+    except (TypeError, ValueError) as exc:
+        raise ValueError('runtime held reconciliation evidence is invalid') from exc
+    import hashlib
+    if (len(snapshot_bytes) > 524288 or not isinstance(evidence['snapshot_sha256'], str)
+            or hashlib.sha256(snapshot_bytes).hexdigest() != evidence['snapshot_sha256']):
+        raise ValueError('runtime held reconciliation evidence is invalid')
+    with locked_state(write=True) as data:
+        current = data['runtime_escalations'].get(binding_key(board, task_id))
+        if (current != entry or current.get('intent', {}).get('status') != 'held'
+                or 'transport' in current.get('intent', {})):
+            raise ValueError('runtime held reconciliation intent changed')
+        if (evidence['binding'] != current.get('binding') or evidence['failure'] != current.get('failure')
+                or evidence['checkpoint'] != current.get('checkpoint')
+                or evidence['failed_run_id'] != current.get('failed_run_id')):
+            raise ValueError('runtime held reconciliation evidence does not match intent')
+        intent = dict(current['intent'])
+        history = list(intent.get('held_reason_history', []))
+        prior_reason = intent.get('reason')
+        if isinstance(prior_reason, str) and prior_reason and (not history or history[-1] != prior_reason):
+            history.append(prior_reason)
+        intent.update(status='unblock_requested', held_reason_history=history,
+                      operator_no_effect_reconciliation=json.loads(json.dumps(evidence)))
+        current['intent'] = intent
+        attempt = current['attempts'][-1]
+        attempt['intent'] = dict(attempt['intent'], status='unblock_requested')
+        return json.loads(json.dumps(current))
 
 
 def record_runtime_escalation_transport(board: str, task_id: str, operation: str, *,

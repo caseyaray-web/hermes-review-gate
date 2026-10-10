@@ -22,6 +22,7 @@ from local_first_review.review_evidence import approved_completion, changes_requ
 from local_first_review.state import (ESCALATION_MAX_ATTEMPTS_LIMIT, MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT,
                                       activate_board, adopt_runtime_escalation, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
                                       recovery_budget_exhausted, runtime_escalation_entry, set_escalation_policy, set_recovery_policy, set_runtime_escalation_policy, task_binding, trusted_routing)
+from local_first_review.runtime_escalation import reauthorize_held
 
 router = APIRouter()
 COUNT_NAMES = (
@@ -610,6 +611,21 @@ def _runtime_catchup_context(task: dict[str, Any], runs: list[dict[str, Any]], e
     context = {"original_contract": dict(task), "reviewer_findings": findings,
                "latest_failure": failure, "checkpoint": checkpoint}
     return failure, checkpoint, context
+
+
+@router.post("/runtime-escalation/reconcile-held")
+def runtime_escalation_reconcile_held(body: RuntimeCatchupControl) -> dict[str, Any]:
+    """Explicitly reauthorize one held intent only after a native no-effect proof."""
+    try:
+        if not reauthorize_held(body.task_id, body.board):
+            raise ValueError("held runtime intent lacks a complete exact no-effect proof; native state remains untouched")
+        entry = runtime_escalation_entry(body.task_id, body.board)
+        if entry is None:
+            raise ValueError("held runtime intent disappeared during reconciliation")
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"runtime_escalation": entry,
+            "message": "No-effect reconciliation is durable; the next real dispatch tick may resume this same intent."}
 
 
 @router.post("/runtime-escalation/catch-up")

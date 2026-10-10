@@ -93,6 +93,14 @@ raise SystemExit(pytest.main([*(sys.argv[1:] or ['tests']), '-q', '-o', 'addopts
 - STANDARDS axis: GO at `59c95de36dacb857026d40ec2afb1ee988a1ec3d`; no concrete rule/safety defect found.
 - SPEC axis: GO on correction re-review at `3d76e3452210028a8971abebb7fa944ee6fbc559`. Reviewer verified the removed recovery-policy coupling and retained evidence/budget/lease gates; parent JUnit reports 159 tests with zero failures/errors/skips. Delegated review runs intentionally skip native mutation cases. No remaining implementation blocker was reported.
 
+## Held-intent operator recovery (RM-03)
+
+A historical held intent with the reason `No unique native unblock receipt for the exact failure` has **no transport receipt**. Do not add one or modify native state manually. After the explicit catch-up intent exists, the operator may call the task-scoped `POST /runtime-escalation/reconcile-held` control for that same board/task.
+
+Under the runtime exclusive-operation lock, this control reads one complete native snapshot and refuses unless the immutable binding, enabled distinct configured profiles, exclusive lease, task workspace/owner, dirty checkpoint, exact latest terminal iteration-exhaustion run, and full event/run history still prove that no post-failure native effect occurred. It persists the complete snapshot, canonical SHA-256 digest, previous held reason history, and the original intent binding as no-effect reconciliation evidence. It does **not** create a transport receipt, refund/re-reserve the consumed attempt, or call native mutation transport. One later real dispatcher tick performs the already-reserved native unblock/reassignment; any failure re-holds the same intent.
+
+The joined parent-owned regression is `tests/test_runtime_native.py::test_joined_held_unknown_transport_reconciliation_resumes_same_attempt`; it covers no-receipt hold → explicit proof → real dispatch → strong implementation admission → independent post-review. Child contexts retain their native mutation guard and intentionally skip this parent-owned proof.
+
 ## RM-03 control and deployment boundary
 
-README documents the exact task-scoped controls for `default / t_57851039`: enable the separate runtime trigger using configured escalation profiles, then explicitly adopt that task through `/runtime-escalation/catch-up`. The next real dispatch tick reconciles the intent. These instructions were not executed against the live board. Deployment and live opt-in require separate authorization.
+README documents the exact task-scoped controls for `default / t_57851039`: enable the separate runtime trigger using configured escalation profiles, then explicitly adopt that task through `/runtime-escalation/catch-up`. For an already-held adopted intent, use `/runtime-escalation/reconcile-held` only after it can prove the no-effect barrier above. These instructions were not executed against the live board. Deployment and live opt-in require separate authorization.

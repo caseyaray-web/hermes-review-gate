@@ -131,6 +131,66 @@ def test_runtime_unblock_readback_error_is_held_after_transport_attempt(runtime,
     assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
 
 
+def test_explicit_held_reconciliation_proves_no_effect_then_allows_one_real_tick(runtime, monkeypatch):
+    """A legacy held intent has no receipt; operator proof authorizes, not fakes, it."""
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held',
+                                           reason='No unique native unblock receipt for the exact failure')
+    show['runs'].append({'id': 11, 'profile': 'impl', 'status': 'gave_up', 'outcome': 'gave_up',
+                         'started_at': 1, 'ended_at': 2})
+    before = copy.deepcopy(show)
+
+    assert runtime_escalation.reauthorize_held('task', 'default')
+
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'unblock_requested'
+    assert stored['intent']['held_reason_history'] == ['No unique native unblock receipt for the exact failure']
+    evidence = stored['intent']['operator_no_effect_reconciliation']
+    assert evidence['failed_run_id'] == 11
+    assert evidence['snapshot'] == before
+    assert 'transport' not in stored['intent']
+    assert show == before
+    assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
+
+    def unblock(name, args):
+        assert (name, args) == ('kanban_unblock', {'board': 'default', 'task_id': 'task'})
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
+        return {'status': 'ready'}
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *_: True)
+    assert runtime_escalation.reconcile('task', 'default') is False
+    assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'held'
+
+
+def test_held_reconciliation_refuses_any_later_native_effect_without_reauthorizing(runtime):
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held',
+                                           reason='No unique native unblock receipt for the exact failure')
+    show['events'].append({'id': 21, 'kind': 'claimed', 'run_id': 12, 'payload': {}})
+
+    assert not runtime_escalation.reauthorize_held('task', 'default')
+
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'held'
+    assert 'operator_no_effect_reconciliation' not in stored['intent']
+    assert stored['consumed_attempts'] == 1
+    assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
+
+
+def test_held_reconciliation_refuses_a_prior_transport_outcome(runtime):
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held',
+                                           reason='No unique native unblock receipt for the exact failure')
+    state.record_runtime_escalation_transport('default', 'task', 'kanban_unblock', result={'status': 'unknown'})
+
+    assert not runtime_escalation.reauthorize_held('task', 'default')
+    assert state.runtime_escalation_entry('task', 'default')['intent']['transport'] == {
+        'operation': 'kanban_unblock', 'result': {'status': 'unknown'},
+    }
+
+
 def test_runtime_transport_record_rejects_invalid_persisted_shape(runtime):
     with pytest.raises(ValueError, match='runtime escalation transport record is invalid'):
         with state.locked_state(write=True) as data:

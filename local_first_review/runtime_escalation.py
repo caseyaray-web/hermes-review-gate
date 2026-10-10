@@ -1,5 +1,7 @@
 """Bounded runtime escalation effect reconciliation and workspace admission."""
 from contextlib import contextmanager
+import hashlib
+import json
 import fcntl
 from . import state, native
 
@@ -29,6 +31,72 @@ def lease_valid(entry):
 
 def _events(show, kind, after):
     return [e for e in show['events'] if type(e.get('id')) is int and e['id'] > after and e.get('kind') == kind]
+
+
+def reauthorize_held(task_id, board):
+    """Require a complete no-effect proof before resuming one held intent.
+
+    This is an explicit operator boundary, not recovery automation.  It never
+    calls native mutation transport: a later dispatch tick owns the one already
+    reserved unblock attempt.
+    """
+    from . import plugin as p
+    with exclusive_operation() as acquired:
+        if not acquired:
+            return False
+        entry = state.runtime_escalation_entry(task_id, board)
+        if not isinstance(entry, dict) or entry.get('legacy_unverifiable'):
+            return False
+        if (entry.get('intent', {}).get('status') != 'held' or entry.get('consumed_attempts') != 1
+                or 'transport' in entry.get('intent', {})):
+            return False
+        binding = p.task_binding(task_id, board)
+        policy = p.board_policy(board) or {}
+        settings = policy.get('runtime_escalation', {})
+        attempt = entry.get('attempts', [{}])[0]
+        target, reviewer = attempt.get('implementation_profile'), attempt.get('reviewer_profile')
+        if (binding != entry.get('binding') or settings.get('enabled') is not True
+                or target == reviewer or target != settings.get('implementation_profile')
+                or reviewer != settings.get('reviewer_profile')
+                or not p.profile_exists(target) or not p.profile_exists(reviewer)
+                or not lease_valid(entry)):
+            return False
+        try:
+            observed = native.snapshot(board, task_id)
+            encoded = json.dumps(observed, sort_keys=True, separators=(',', ':')).encode()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        # Refuse incomplete/ambiguous snapshots rather than treating a partial
+        # history as a no-effect proof.
+        if (len(encoded) > 524288 or not isinstance(observed.get('task'), dict)
+                or not isinstance(observed.get('runs'), list) or not isinstance(observed.get('events'), list)):
+            return False
+        task, runs, events = observed['task'], observed['runs'], observed['events']
+        failed_run_id, failure = entry.get('failed_run_id'), entry.get('failure')
+        run_ids = [run.get('id') for run in runs if isinstance(run, dict)]
+        event_ids = [event.get('id') for event in events if isinstance(event, dict)]
+        if (len(run_ids) != len(runs) or len(event_ids) != len(events)
+                or any(type(value) is not int or value <= 0 for value in [*run_ids, *event_ids])
+                or len(set(run_ids)) != len(run_ids) or len(set(event_ids)) != len(event_ids)
+                or p._runtime_failure_record(observed, failed_run_id) != failure
+                or any(run_id > failed_run_id for run_id in run_ids)
+                or any(event_id > failure.get('event_id', 0) for event_id in event_ids)
+                or task.get('status') != 'blocked' or task.get('assignee') != binding.get('implementation_profile')
+                or task.get('workspace_path') != entry.get('workspace_path')
+                or p._workspace_checkpoint(entry['workspace_path']) != entry.get('checkpoint')
+                or not p._workspace_is_exclusive(board, task_id, entry['workspace_path'])):
+            return False
+        evidence = {
+            'binding': binding,
+            'failure': failure,
+            'checkpoint': entry['checkpoint'],
+            'failed_run_id': failed_run_id,
+            'snapshot': json.loads(encoded),
+            'snapshot_sha256': hashlib.sha256(encoded).hexdigest(),
+        }
+        state.authorize_runtime_held_reconciliation(board, task_id, entry=entry, evidence=evidence)
+        return True
+
 
 def reconcile(task_id, board):
     from . import plugin as p

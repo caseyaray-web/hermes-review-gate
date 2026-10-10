@@ -115,6 +115,40 @@ def test_joined_rm03_explicit_catchup_preserves_dirty_work_and_fresh_review(rm03
     assert state.task_binding(tid,'default')==b.rm_binding
     assert state.load_state()['recovery_budgets'][f'default:{tid}:implementation']==2
 
+
+
+def test_joined_held_unknown_transport_reconciliation_resumes_same_attempt(rm03):
+    """Old held RM03 has no receipt; explicit proof resumes its original attempt."""
+    b = rm03
+    tid = b.rm_tid
+    adopted = adopt(b)
+    assert 'transport' not in adopted['runtime_escalation']['intent']
+    state.update_runtime_escalation_intent('default', tid, 'held',
+                                           reason='No unique native unblock receipt for the exact failure')
+    before = b.show(tid)
+
+    reconciled = api.runtime_escalation_reconcile_held(api.RuntimeCatchupControl(board='default', task_id=tid))
+
+    entry = reconciled['runtime_escalation']
+    assert entry['intent']['status'] == 'unblock_requested'
+    assert entry['intent']['held_reason_history'] == ['No unique native unblock receipt for the exact failure']
+    assert entry['intent']['operator_no_effect_reconciliation']['snapshot'] == before
+    assert 'transport' not in entry['intent']
+    assert b.show(tid) == before
+    assert entry['consumed_attempts'] == 1
+    assert state.load_state()['recovery_budgets'][f'default:{tid}:implementation'] == 2
+
+    plugin.watchdog_tick(board='default')
+    assert b.dispatch(expected=tid).assignee == 'strong'
+    assert plugin.guard('kanban_show', {}) is not None
+    subprocess.check_call(['git', '-C', str(b.rm_workspace), 'add', '.'])
+    subprocess.check_call(['git', '-C', str(b.rm_workspace), 'commit', '-qm', 'resume original RM03 held attempt'])
+    assert b.call('finish_implementation', summary='Completed the original held RM03 attempt.')['ok']
+    assert b.dispatch(expected=tid).assignee == 'post-review'
+    assert b.call('submit_review', verdict='approved', rationale='Fresh independent post-review.')['ok']
+    assert b.show(tid)['task']['status'] == 'done'
+
+
 @pytest.mark.parametrize('lost',['unblock','reassign'])
 def test_joined_lost_response_restart_never_repeats_native_effect(rm03,monkeypatch,lost):
     b=rm03;tid=b.rm_tid;adopt(b)

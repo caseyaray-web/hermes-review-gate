@@ -231,6 +231,20 @@ def test_shipped_dashboard_exposes_recovery_limit_not_zero_as_pause():
     assert "Use Pause failed-run recovery to stop automatic recovery." in bundle
 
 
+def test_runtime_held_reconciliation_is_explicit_task_scoped_and_defers_effects(monkeypatch):
+    existing = {'board': 'board-a', 'task_id': 'rm03', 'intent': {'status': 'held'}}
+    calls = []
+    monkeypatch.setattr(plugin_api, 'reauthorize_held', lambda task_id, board: calls.append((task_id, board)) or True)
+    monkeypatch.setattr(plugin_api, 'runtime_escalation_entry', lambda task_id, board: existing)
+
+    response = client().post('/runtime-escalation/reconcile-held', json={'board': 'board-a', 'task_id': 'rm03'})
+
+    assert response.status_code == 200
+    assert calls == [('rm03', 'board-a')]
+    assert response.json()['runtime_escalation'] == existing
+    assert 'next real dispatch tick' in response.json()['message']
+
+
 def test_runtime_catchup_is_explicit_task_scoped_and_leaves_native_effects_for_a_tick(monkeypatch):
     binding = {"board": "board-a", "task_id": "rm03", "implementation_profile": "impl",
                "reviewer_profile": "review", "workspace_path": "/work"}

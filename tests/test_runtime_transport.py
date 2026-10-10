@@ -43,7 +43,7 @@ else:
     # Parent execution proves the real transport against an isolated board.
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
     assert kb.kanban_db_path().is_relative_to(Path(HOME_PATH))
-    kb.init_db()
+    kbc.init_db()
     conn = kbc.connect()
     task_id = kb.create_task(conn, title='Disposable transport proof', assignee='default', initial_status='blocked')
     result = json.loads(context.dispatch_tool('kanban_unblock', {'board': 'default', 'task_id': task_id}))
@@ -57,7 +57,9 @@ print('RUNTIME_TRANSPORT_RESULT=' + json.dumps({'mode':mode, 'result':result}, s
 """.replace("REPO_AND_CORE", repr([str(plugin_root), core_root])).replace("HOME_PATH", repr(str(home)))
     env = dict(os.environ)
     for name in list(env):
-        if name.startswith(("HERMES_KANBAN_", "HERMES_PROFILE", "HERMES_SESSION")):
+        if name.startswith(("HERMES_KANBAN_", "HERMES_PROFILE", "HERMES_SESSION")) or name in {
+            "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_SUPERVISED_CHILD",
+        }:
             env.pop(name)
     env.update({
         "HOME": str(tmp_path / "os-home"),
