@@ -51,7 +51,7 @@ def phase_budget_key(board: str, task_id: str, phase: str) -> str:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 9, "implementation_profile": None, "reviewer_profile": None,
+    return {"version": 10, "implementation_profile": None, "reviewer_profile": None,
             "tasks": {}, "boards": {}, "recovery": {}, "recovery_budgets": {}, "workspace_leases": {},
             "escalations": {}, "runtime_escalations": {}, "effective_routing": {}}
 
@@ -171,13 +171,23 @@ def _migrate(data: Any) -> dict[str, Any]:
         # v8 intents predate explicit catch-up context. They remain auditable,
         # but only a new task-scoped adoption carries a fresh coder packet.
         data = dict(data); data["version"] = 9
+    if data.get("version") == 9:
+        # v9 retry records stored only the then-current checkpoint. Preserve
+        # that historical value as both sides of the initial retry boundary.
+        data = dict(data); data["version"] = 10
+        for entry in data.get("runtime_escalations", {}).values():
+            history = entry.get("intent", {}).get("operator_retry_history") if isinstance(entry, dict) else None
+            if isinstance(history, list):
+                for index, item in enumerate(history):
+                    if isinstance(item, dict) and set(item) == {"request_id", "snapshot", "checkpoint", "prior_implementation_run_id", "status", "unblock_event_id"}:
+                        history[index] = dict(item, prior_checkpoint=item["checkpoint"], prior_transport=None)
     return data
 
 
 def _validate(data: Any) -> dict[str, Any]:
     data = _migrate(data)
     required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases", "escalations", "runtime_escalations", "effective_routing")
-    if data.get("version") != 9 or any(not isinstance(data.get(k), dict) for k in required_roots):
+    if data.get("version") != 10 or any(not isinstance(data.get(k), dict) for k in required_roots):
         raise ValueError("review-gate configuration has an invalid shape")
     for key, binding in data["tasks"].items():
         if not isinstance(key, str) or not isinstance(binding, dict):
@@ -287,12 +297,15 @@ def _validate(data: Any) -> dict[str, Any]:
         if retry_history is not None:
             if (not isinstance(retry_history, list) or not retry_history
                     or any(not isinstance(item, dict)
-                           or set(item) != {"request_id", "snapshot", "checkpoint", "prior_implementation_run_id", "status", "unblock_event_id"}
-                           or not _text(item.get("request_id")) or item.get("checkpoint") != entry.get("checkpoint")
+                           or set(item) != {"request_id", "snapshot", "prior_checkpoint", "checkpoint", "prior_implementation_run_id", "prior_transport", "status", "unblock_event_id"}
+                           or not _text(item.get("request_id")) or not isinstance(item.get("prior_checkpoint"), dict)
+                           or not isinstance(item.get("checkpoint"), dict)
                            or not isinstance(item.get("snapshot"), dict) or set(item["snapshot"]) != {"task", "runs", "events"}
-                           or item.get("status") not in {"authorized", "routed", "held"}
+                           or (item.get("prior_transport") is not None and _runtime_transport(item.get("prior_transport")) is None)
+                           or item.get("status") not in {"authorized", "unblock_attempted", "routed", "held"}
                            or (item.get("unblock_event_id") is not None and type(item.get("unblock_event_id")) is not int)
-                           for item in retry_history)):
+                           for item in retry_history)
+                    or retry_history[-1].get("checkpoint") != entry.get("checkpoint")):
                 raise ValueError("runtime operator retry history is invalid")
         transport_history = entry_intent.get("transport_history")
         if transport_history is not None:
@@ -615,9 +628,10 @@ def authorize_operator_continuation(board: str, task_id: str, *, entry: dict[str
 
 
 def authorize_operator_runtime_retry(board: str, task_id: str, *, entry: dict[str, Any], request_id: str,
-                                     snapshot: dict[str, Any]) -> dict[str, Any]:
+                                     snapshot: dict[str, Any], checkpoint: dict[str, Any]) -> dict[str, Any]:
     """Append a manual retry window without refunding automatic escalation."""
-    if not _text(request_id) or not isinstance(snapshot, dict) or set(snapshot) != {"task", "runs", "events"}:
+    if (not _text(request_id) or not isinstance(snapshot, dict) or set(snapshot) != {"task", "runs", "events"}
+            or not isinstance(checkpoint, dict)):
         raise ValueError("runtime operator retry request is invalid")
     with locked_state(write=True) as data:
         current = data['runtime_escalations'].get(binding_key(board, task_id))
@@ -628,15 +642,29 @@ def authorize_operator_runtime_retry(board: str, task_id: str, *, entry: dict[st
         if any(item.get('request_id') == request_id for item in history if isinstance(item, dict)):
             raise ValueError("runtime operator retry request is already recorded")
         prior_pin = current.get('implementation_run_id')
+        prior_checkpoint = json.loads(json.dumps(current['checkpoint']))
+        prior_transport = json.loads(json.dumps(intent['transport'])) if 'transport' in intent else None
         history.append({'request_id': request_id, 'snapshot': json.loads(json.dumps(snapshot)),
-                        'checkpoint': json.loads(json.dumps(current['checkpoint'])),
-                        'prior_implementation_run_id': prior_pin, 'status': 'authorized', 'unblock_event_id': None})
+                        'prior_checkpoint': prior_checkpoint, 'checkpoint': json.loads(json.dumps(checkpoint)),
+                        'prior_implementation_run_id': prior_pin, 'prior_transport': prior_transport,
+                        'status': 'authorized', 'unblock_event_id': None})
         if prior_pin is not None:
             intent['prior_implementation_run_ids'] = [*intent.get('prior_implementation_run_ids', []), prior_pin]
+        if 'operator_no_effect_reconciliation' in intent:
+            intent['prior_operator_no_effect_reconciliations'] = [
+                *intent.get('prior_operator_no_effect_reconciliations', []),
+                intent.pop('operator_no_effect_reconciliation'),
+            ]
+        context = current.get('coder_context')
+        if isinstance(context, dict):
+            intent['prior_coder_contexts'] = [*intent.get('prior_coder_contexts', []), context]
+            current['coder_context'] = dict(context, checkpoint=json.loads(json.dumps(checkpoint)))
         intent.update(status='unblock_requested', operator_retry_history=history)
         current['intent'] = intent
+        current['checkpoint'] = json.loads(json.dumps(checkpoint))
         current['implementation_run_id'] = None
-        current['attempts'][-1]['intent'] = dict(current['attempts'][-1]['intent'], status='unblock_requested')
+        current['attempts'][-1]['intent'] = dict(current['attempts'][-1]['intent'], status='unblock_requested',
+                                                 checkpoint=json.loads(json.dumps(checkpoint)))
         return json.loads(json.dumps(current))
 
 
@@ -650,6 +678,18 @@ def record_operator_runtime_retry_result(board: str, task_id: str, *, request_id
         if not isinstance(history, list) or not history or history[-1].get('request_id') != request_id:
             raise ValueError("runtime operator retry history changed")
         history[-1] = dict(history[-1], status=status, unblock_event_id=unblock_event_id)
+        return json.loads(json.dumps(entry))
+
+
+def mark_operator_runtime_retry_unblock_attempted(board: str, task_id: str, *, request_id: str) -> dict[str, Any]:
+    """Persist the one manual native-send boundary before issuing the effect."""
+    with locked_state(write=True) as data:
+        entry = data['runtime_escalations'].get(binding_key(board, task_id))
+        history = entry.get('intent', {}).get('operator_retry_history') if isinstance(entry, dict) else None
+        if (not isinstance(history, list) or not history or history[-1].get('request_id') != request_id
+                or history[-1].get('status') != 'authorized' or entry.get('intent', {}).get('status') != 'routed'):
+            raise ValueError("runtime operator retry send authority changed")
+        history[-1] = dict(history[-1], status='unblock_attempted')
         return json.loads(json.dumps(entry))
 
 

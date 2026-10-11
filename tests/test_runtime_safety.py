@@ -478,6 +478,58 @@ def test_explicit_operator_retry_refuses_active_or_checkpoint_drift_without_writ
     assert state.runtime_escalation_entry('task', 'default') == before
 
 
+def test_explicit_operator_retry_accepts_current_dirty_checkpoint_and_archives_prior_evidence(runtime, monkeypatch):
+    """A new explicit retry continues the same task after inspected partial work."""
+    binding, entry, show = runtime
+    old_checkpoint = entry['checkpoint']
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='first bounded route failed')
+    show['task']['assignee'] = 'strong'
+    state.record_runtime_escalation_transport('default', 'task', 'kanban_unblock', result={'status': 'ready'})
+    with state.locked_state(write=True) as data:
+        data['runtime_escalations']['default:task']['implementation_run_id'] = 2274
+    current_checkpoint = {'head': 'b' * 40, 'dirty': [{'path': 'partial.py', 'status': 'modified'}]}
+    monkeypatch.setattr(plugin, '_workspace_checkpoint', lambda _: current_checkpoint)
+
+    def unblock(_name, _args):
+        show['task'].update(status='ready', assignee='strong')
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
+        return {'ok': True, 'status': 'ready'}
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    result = runtime_escalation.operator_retry('task', 'default', 'operator-current-work')
+
+    assert result['ok'] is True
+    stored = state.runtime_escalation_entry('task', 'default')
+    retry = stored['intent']['operator_retry_history'][-1]
+    assert stored['checkpoint'] == current_checkpoint
+    assert retry['prior_checkpoint'] == old_checkpoint
+    assert retry['checkpoint'] == current_checkpoint
+    assert retry['prior_implementation_run_id'] == 2274
+    assert retry['prior_transport'] == {'operation': 'kanban_unblock', 'result': {'status': 'ready'}}
+    assert stored['consumed_attempts'] == 1
+
+
+def test_operator_retry_attempted_send_is_held_without_restart_resend(runtime, monkeypatch):
+    """A durable attempted-send marker makes an uncertain manual effect one-shot."""
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='first bounded route failed')
+    show['task']['assignee'] = 'strong'
+    sends = []
+
+    def lost_response(*_args):
+        sends.append('unblock')
+        raise OSError('response lost after native call')
+
+    monkeypatch.setattr(plugin, '_dispatch', lost_response)
+    assert not runtime_escalation.operator_retry('task', 'default', 'operator-lost-response')['ok']
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'held'
+    assert stored['intent']['operator_retry_history'][-1]['status'] == 'held'
+    assert state.effective_routing('task', 'default') is None
+    runtime_escalation.reconcile('task', 'default')
+    assert sends == ['unblock']
+
+
 def test_single_action_resume_refuses_later_unproven_run_without_state_change(runtime):
     """A later protocol-failed run cannot be inferred effect-free from its own summary."""
     binding, entry, show = runtime
@@ -759,6 +811,24 @@ def test_failed_stronger_attempt_is_held_without_refunding_or_recovery(runtime):
     assert stored['runtime_escalations']['default:task']['intent']['status']=='held'
     assert stored['recovery_budgets']['default:task:implementation']==2
     assert stored['runtime_escalations']['default:task']['consumed_attempts']==1
+
+
+def test_operator_retry_monitor_holds_a_fresh_reviewer_failure_not_historical_runs(runtime, monkeypatch):
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='historical stronger failure')
+    show['task']['assignee'] = 'strong'
+    def unblock(*_args):
+        show['task'].update(status='ready', assignee='strong')
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
+        return {'status': 'ready'}
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    assert runtime_escalation.operator_retry('task', 'default', 'reviewer-window')['ok']
+    show['task'].update(status='review', assignee='post-review', current_run_id=None)
+    show['runs'].append({'id': 12, 'profile': 'post-review', 'status': 'gave_up',
+                         'outcome': 'gave_up', 'ended_at': 30})
+    show['events'].append({'id': 22, 'kind': 'claimed', 'run_id': 12, 'payload': {'source_status': 'review'}})
+    runtime_escalation.monitor('task', 'default')
+    assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'held'
 
 
 @pytest.mark.parametrize('change',['binding','prior_escalation'])

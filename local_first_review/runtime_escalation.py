@@ -346,18 +346,19 @@ def _reauthorize_held_locked(task_id, board):
     return True, None
 
 
-def _operator_retry_refusal(entry, binding, observed, p):
+def _operator_retry_refusal(entry, binding, observed, p, checkpoint):
     """Validate a fresh explicit retry without re-litigating historical effects."""
     task = observed.get('task') if isinstance(observed, dict) else None
     runs = observed.get('runs') if isinstance(observed, dict) else None
-    if (not isinstance(task, dict) or not isinstance(runs, list) or binding != entry.get('binding')
-            or task.get('id') != entry.get('task_id') or task.get('status') != 'blocked'
-            or task.get('current_run_id') is not None or any(run.get('ended_at') is None for run in runs if isinstance(run, dict))
+    if (not isinstance(checkpoint, dict) or not isinstance(task, dict) or not isinstance(runs, list)
+            or binding != entry.get('binding') or task.get('id') != entry.get('task_id')
+            or task.get('status') != 'blocked' or task.get('current_run_id') is not None
+            or any(run.get('ended_at') is None for run in runs if isinstance(run, dict))
             or task.get('workspace_path') != entry.get('workspace_path')
-            or p._workspace_checkpoint(entry['workspace_path']) != entry.get('checkpoint')
+            or p._workspace_checkpoint(entry['workspace_path']) != checkpoint
             or not p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path'])
             or not lease_valid(entry)):
-        return 'Task is not an idle blocked task with its immutable workspace checkpoint and lease.'
+        return 'Task is not an idle blocked task with its inspected workspace checkpoint and lease.'
     settings = (p.board_policy(entry['board']) or {}).get('runtime_escalation', {})
     attempts = entry.get('attempts')
     attempt = attempts[-1] if isinstance(attempts, list) and attempts else None
@@ -373,43 +374,100 @@ def _operator_retry_refusal(entry, binding, observed, p):
     return None
 
 
+def _operator_retry_post_unblock_current(entry, binding, observed, p, retry, prior_events):
+    """Require current route authority and an exact target-owned post-unblock lane."""
+    task = observed.get('task') if isinstance(observed, dict) else None
+    runs = observed.get('runs') if isinstance(observed, dict) else None
+    events = observed.get('events') if isinstance(observed, dict) else None
+    attempts = entry.get('attempts') if isinstance(entry, dict) else None
+    attempt = attempts[-1] if isinstance(attempts, list) and attempts else None
+    if not isinstance(task, dict) or not isinstance(runs, list) or not isinstance(events, list) or not isinstance(attempt, dict):
+        return False
+    target, reviewer = attempt.get('implementation_profile'), attempt.get('reviewer_profile')
+    route = {'board': entry.get('board'), 'task_id': entry.get('task_id'), 'attempt': attempt.get('attempt'),
+             'implementation_profile': target, 'reviewer_profile': reviewer}
+    unblocks = [event for event in events if isinstance(event, dict) and event.get('id') not in prior_events
+                and event.get('kind') == 'unblocked' and type(event.get('id')) is int]
+    if (len(unblocks) != 1 or binding != entry.get('binding')
+            or entry.get('intent', {}).get('status') != 'routed'
+            or state.effective_routing(entry['task_id'], entry['board']) != route
+            or retry.get('checkpoint') != entry.get('checkpoint')
+            or task.get('id') != entry.get('task_id') or task.get('workspace_path') != entry.get('workspace_path')
+            or task.get('assignee') != target or not isinstance(target, str) or not isinstance(reviewer, str)
+            or target == reviewer or not lease_valid(entry)
+            or p._workspace_checkpoint(entry['workspace_path']) != entry.get('checkpoint')
+            or not p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path'])
+            or not p.profile_exists(target) or not p.profile_exists(reviewer)):
+        return False
+    if task.get('status') in {'ready', 'todo'}:
+        return task.get('current_run_id') is None and entry.get('implementation_run_id') is None
+    if task.get('status') != 'running':
+        return False
+    run_id = entry.get('implementation_run_id')
+    active = [run for run in runs if isinstance(run, dict) and run.get('id') == run_id
+              and run.get('profile') == target and run.get('ended_at') is None]
+    claims = [event for event in events if isinstance(event, dict) and event.get('kind') == 'claimed'
+              and event.get('run_id') == run_id and type(event.get('id')) is int and event['id'] > unblocks[0]['id']]
+    return (type(run_id) is int and run_id > entry.get('failed_run_id', run_id)
+            and task.get('current_run_id') == run_id and len(active) == 1 and len(claims) == 1
+            and (claims[0].get('payload') or {}).get('source_status') in {None, 'ready', 'todo'})
+
+
 def _reconcile_operator_retry_locked(task_id, board, entry, p):
-    """Route-first implementation of a single already-recorded manual request."""
+    """Send one explicitly authorized retry; attempted sends are never replayed."""
     binding = p.task_binding(task_id, board)
     history = entry.get('intent', {}).get('operator_retry_history')
     retry = history[-1] if isinstance(history, list) and history else None
     if not isinstance(retry, dict):
         return False
     request_id = retry['request_id']
+    if retry.get('status') != 'authorized':
+        hold(board, task_id, 'Operator retry native effect was already attempted without a verified readback')
+        state.record_operator_runtime_retry_result(board, task_id, request_id=request_id, status='held')
+        return False
     try:
         observed = native.snapshot(board, task_id)
     except Exception as exc:
         hold(board, task_id, f'Operator retry native preflight failed: {type(exc).__name__}: {exc}')
         state.record_operator_runtime_retry_result(board, task_id, request_id=request_id, status='held')
         return False
-    refusal = _operator_retry_refusal(entry, binding, observed, p)
+    refusal = _operator_retry_refusal(entry, binding, observed, p, retry.get('checkpoint'))
     if refusal:
         hold(board, task_id, refusal)
         state.record_operator_runtime_retry_result(board, task_id, request_id=request_id, status='held')
         return False
     prior_events = {event.get('id') for event in observed['events'] if isinstance(event, dict)}
-    # Publish before unblock: the normal worker guard owns the claim window.
+    # Publish before unblock: the real worker guard owns the claim window.
     state.publish_runtime_escalation_routing(board, task_id, binding=binding)
+    try:
+        state.mark_operator_runtime_retry_unblock_attempted(board, task_id, request_id=request_id)
+    except ValueError as exc:
+        hold(board, task_id, f'Operator retry send authority changed: {exc}')
+        state.record_operator_runtime_retry_result(board, task_id, request_id=request_id, status='held')
+        return False
     try:
         result = p._dispatch('kanban_unblock', {'board': board, 'task_id': task_id})
     except Exception as exc:
         state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', error=exc)
-    else:
-        state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', result=result)
+        hold(board, task_id, f'Operator retry native unblock transport is uncertain: {type(exc).__name__}: {exc}')
+        state.record_operator_runtime_retry_result(board, task_id, request_id=request_id, status='held')
+        return False
+    state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', result=result)
     try:
         after = native.snapshot(board, task_id)
-        unblocks = [event for event in _events(after, 'unblocked', 0) if event.get('id') not in prior_events]
     except Exception as exc:
         hold(board, task_id, f'Operator retry native unblock readback failed: {type(exc).__name__}: {exc}')
         state.record_operator_runtime_retry_result(board, task_id, request_id=request_id, status='held')
         return False
-    if len(unblocks) != 1 or after.get('task', {}).get('status') not in {'ready', 'todo', 'running'}:
-        hold(board, task_id, 'Operator retry has no unique native unblock receipt.')
+    entry = state.runtime_escalation_entry(task_id, board)
+    binding = p.task_binding(task_id, board)
+    history = entry.get('intent', {}).get('operator_retry_history') if isinstance(entry, dict) else None
+    current_retry = history[-1] if isinstance(history, list) and history else None
+    unblocks = [event for event in _events(after, 'unblocked', 0) if event.get('id') not in prior_events]
+    if (len(unblocks) != 1 or not isinstance(entry, dict) or not isinstance(binding, dict)
+            or not isinstance(current_retry, dict)
+            or not _operator_retry_post_unblock_current(entry, binding, after, p, current_retry, prior_events)):
+        hold(board, task_id, 'Operator retry has no unique native unblock receipt and current authority.')
         state.record_operator_runtime_retry_result(board, task_id, request_id=request_id, status='held')
         return False
     state.record_operator_runtime_retry_result(board, task_id, request_id=request_id,
@@ -444,12 +502,13 @@ def operator_retry(task_id, board, request_id):
             observed = native.snapshot(board, task_id)
         except Exception as exc:
             return {'ok': False, 'reason': f'Native retry preflight is unavailable: {type(exc).__name__}: {exc}'}
-        refusal = _operator_retry_refusal(entry, binding, observed, p)
+        checkpoint = p._workspace_checkpoint(entry['workspace_path'])
+        refusal = _operator_retry_refusal(entry, binding, observed, p, checkpoint)
         if refusal:
             return {'ok': False, 'reason': refusal}
         try:
             entry = state.authorize_operator_runtime_retry(board, task_id, entry=entry, request_id=request_id,
-                                                           snapshot=observed)
+                                                           snapshot=observed, checkpoint=checkpoint)
             ok = _reconcile_operator_retry_locked(task_id, board, entry, p)
         except ValueError as exc:
             return {'ok': False, 'reason': str(exc)}
@@ -533,8 +592,9 @@ def reconcile(task_id, board):
         if not entry:
             return False
         status = entry['intent']['status']
-        if (status == 'unblock_requested'
-                and isinstance(entry.get('intent', {}).get('operator_retry_history'), list)):
+        if (status in {'unblock_requested', 'routed'}
+                and isinstance(entry.get('intent', {}).get('operator_retry_history'), list)
+                and entry['intent']['operator_retry_history'][-1].get('status') != 'routed'):
             return _reconcile_operator_retry_locked(task_id, board, entry, p)
         if status in {'routed', 'held'}:
             return status == 'routed'
@@ -718,16 +778,27 @@ def monitor(task_id, board):
         if not entry or entry['intent']['status']!='routed':
             return
         show=native.snapshot(board, task_id)
-        # A manual retry starts a new monitoring window.  Historical failures
-        # (including the archived previous admission pin) cannot re-hold it.
+        # A manual retry begins at its own unblock receipt, not at the original
+        # failure.  Include both fresh implementation and reviewer runs; prior
+        # failed runs and their terminal task lane are historical evidence only.
         retry_history = entry.get('intent', {}).get('operator_retry_history')
         pinned = entry.get('implementation_run_id')
         if isinstance(retry_history, list) and retry_history:
-            later = [r for r in show['runs'] if r.get('id') == pinned] if isinstance(pinned, int) else []
+            retry = retry_history[-1]
+            boundary = retry.get('unblock_event_id') if isinstance(retry, dict) else None
+            attempts = entry.get('attempts') or []
+            route = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+            profiles = {route.get('implementation_profile'), route.get('reviewer_profile')}
+            fresh_ids = {event.get('run_id') for event in show['events'] if isinstance(event, dict)
+                         and type(boundary) is int and event.get('kind') == 'claimed' and type(event.get('id')) is int
+                         and event['id'] > boundary}
+            later = [run for run in show['runs'] if run.get('id') in fresh_ids and run.get('profile') in profiles]
         else:
             later=[r for r in show['runs'] if type(r.get('id')) is int and r['id']>entry['failed_run_id']]
-        failures=[r for r in later if r.get('ended_at') is not None and r.get('outcome') not in {'review_requested','completed'}]
-        if failures or show['task'].get('status') in {'blocked','triage','failed'}:
+        failures=[r for r in later if r.get('ended_at') is not None and r.get('outcome') not in {'review_requested','completed','approved'}]
+        fresh_task_terminal = (not isinstance(retry_history, list) or not retry_history
+                               or any(run.get('id') == pinned for run in later))
+        if failures or (fresh_task_terminal and show['task'].get('status') in {'blocked','triage','failed'}):
             hold(board,task_id,'Bounded stronger implementation/review attempt failed; no further automatic attempt is permitted')
 
 
