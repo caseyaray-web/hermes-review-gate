@@ -22,7 +22,7 @@ from local_first_review.review_evidence import approved_completion, changes_requ
 from local_first_review.state import (ESCALATION_MAX_ATTEMPTS_LIMIT, MAX_CHANGES, RECOVERY_MAX_PER_PHASE_LIMIT,
                                       activate_board, adopt_runtime_escalation, current_escalation_attempt, effective_routing, enroll_task, escalation_entry, load_state, locked_state, profile_exists, profiles,
                                       recovery_budget_exhausted, runtime_escalation_entry, set_escalation_policy, set_recovery_policy, set_runtime_escalation_policy, task_binding, trusted_routing)
-from local_first_review.runtime_escalation import resume_held
+from local_first_review.runtime_escalation import operator_retry, resume_held
 
 router = APIRouter()
 COUNT_NAMES = (
@@ -88,6 +88,15 @@ class RuntimeCatchupControl(BaseModel):
     board: str = Field(min_length=1, max_length=64)
     task_id: str = Field(min_length=1, max_length=128)
     operator_receipt: dict[str, Any] | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RuntimeOperatorRetryControl(BaseModel):
+    """One explicit, idempotent retry request for a held runtime route."""
+    board: str = Field(min_length=1, max_length=64)
+    task_id: str = Field(min_length=1, max_length=128)
+    request_id: str = Field(min_length=1, max_length=128)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -624,6 +633,18 @@ def runtime_escalation_resume_held(body: RuntimeCatchupControl) -> dict[str, Any
         raise HTTPException(409, str(exc)) from exc
     if not result.get("ok"):
         raise HTTPException(409, result.get("reason", "Held runtime intent was not resumed."))
+    return result
+
+
+@router.post("/runtime-escalation/operator-retry")
+def runtime_escalation_operator_retry(body: RuntimeOperatorRetryControl) -> dict[str, Any]:
+    """Authorize exactly one task-scoped manual retry for this request ID."""
+    try:
+        result = operator_retry(body.task_id, body.board, body.request_id)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not result.get("ok"):
+        raise HTTPException(409, result.get("reason", "Runtime operator retry was not authorized."))
     return result
 
 

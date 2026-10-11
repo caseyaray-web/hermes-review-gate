@@ -231,6 +231,49 @@ def test_joined_old_profile_claim_race_is_pretool_held(rm03,monkeypatch):
     assert b.kb.get_task(b.conn,b.rm_child).status=='todo'
 
 
+def test_joined_operator_retry_claims_exact_latest_window_after_historical_failures(rm03, monkeypatch):
+    """A disposable native retry admits only the post-unblock strong claim."""
+    b = rm03
+    tid = b.rm_tid
+    adopt(b)
+    plugin.watchdog_tick(board='default')
+    assert b.dispatch(expected=tid).assignee == 'strong'
+    assert b.kb.block_task(b.conn, tid, reason='bounded strong run failed', kind='needs_input',
+                           expected_run_id=b.kb.get_task(b.conn, tid).current_run_id)
+    b.clear()
+    plugin.watchdog_tick(board='default')
+    held = state.runtime_escalation_entry(tid, 'default')
+    assert held['intent']['status'] == 'held'
+    historical_checkpoint = held['checkpoint']
+    (b.rm_workspace / 'operator-inspected-partial.py').write_text('preserve this partial retry work\n')
+
+    dispatch = plugin._dispatch
+    admitted = []
+    def claim_during_unblock(name, args):
+        result = dispatch(name, args)
+        if name == 'kanban_unblock':
+            task = b.dispatch(expected=tid)
+            assert task.assignee == 'strong'
+            admitted.append(task.current_run_id)
+            assert plugin.guard('kanban_show', {}) is not None
+            assert plugin.guard('kanban_show', {}) is None
+        return result
+    monkeypatch.setattr(plugin, '_dispatch', claim_during_unblock)
+
+    b.clear()
+    retried = runtime_escalation.operator_retry(tid, 'default', 'disposable-native-retry-1')
+    assert retried['ok'], retried
+    entry = state.runtime_escalation_entry(tid, 'default')
+    retry = entry['intent']['operator_retry_history'][-1]
+    assert retry['prior_checkpoint'] == historical_checkpoint
+    assert retry['checkpoint'] == plugin._workspace_checkpoint(str(b.rm_workspace))
+    assert retry['status'] == 'routed'
+    assert admitted == [entry['implementation_run_id']]
+    show = b.show(tid)
+    assert runtime_escalation.admit(tid, 'default', admitted[0], 'strong', show) is None
+    assert runtime_escalation.admit(tid, 'default', admitted[0] + 1, 'strong', show) is not None
+
+
 def test_joined_exact_target_claim_between_unblock_and_route_publication_is_one_use(rm03, monkeypatch):
     """The reviewed held continuation admits only its one synchronous strong claim."""
     b = rm03
