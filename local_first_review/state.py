@@ -674,7 +674,7 @@ def recovery_budget_exhausted(board: str, task_id: str, phase: str) -> bool:
 
 
 def publish_runtime_escalation_routing(board: str, task_id: str, *, binding: dict[str, Any]) -> dict[str, Any]:
-    """Publish routing only after the caller has read back native unblock/reassign."""
+    """Publish an exact route only while the caller holds native-effect authority."""
     key = binding_key(board, task_id)
     with locked_state(write=True) as data:
         entry = data["runtime_escalations"].get(key)
@@ -690,6 +690,30 @@ def publish_runtime_escalation_routing(board: str, task_id: str, *, binding: dic
         entry["intent"] = dict(entry["intent"], status="routed")
         attempt["intent"] = dict(attempt["intent"], status="routed")
         return json.loads(json.dumps(route))
+
+
+def revoke_runtime_escalation_routing(board: str, task_id: str, *, reason: str) -> dict[str, Any]:
+    """Fail closed after a pre-published unblock transport cannot be proven.
+
+    Route publication intentionally precedes native unblock so a newly runnable
+    card never has an unpublished dispatch window.  If that native effect or
+    its readback is uncertain, revoke the route and hold the same spent intent
+    atomically; neither the ledger nor effective routing can then authorize a
+    worker tool.
+    """
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("runtime escalation hold reason is invalid")
+    key = binding_key(board, task_id)
+    with locked_state(write=True) as data:
+        entry = data["runtime_escalations"].get(key)
+        if not isinstance(entry, dict):
+            raise ValueError("runtime escalation intent is absent")
+        data["effective_routing"].pop(key, None)
+        entry["intent"] = dict(entry.get("intent", {}), status="held", reason=reason)
+        attempts = entry.get("attempts")
+        if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict):
+            attempts[-1]["intent"] = dict(attempts[-1].get("intent", {}), status="held")
+        return json.loads(json.dumps(entry))
 
 
 def effective_routing(task_id: str, board: str | None = None) -> dict[str, Any] | None:

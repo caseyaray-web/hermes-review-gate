@@ -24,8 +24,12 @@ def exclusive_operation():
     """Serialize native effects with supported runtime control writers."""
     return state.runtime_escalation_operation()
 
-def hold(board, task_id, reason):
-    state.update_runtime_escalation_intent(board, task_id, 'held', reason=reason + '; inspect the exact native run and workspace before operator intervention')
+def hold(board, task_id, reason, *, revoke_route=True):
+    reason = reason + '; inspect the exact native run and workspace before operator intervention'
+    if revoke_route:
+        state.revoke_runtime_escalation_routing(board, task_id, reason=reason)
+    else:
+        state.update_runtime_escalation_intent(board, task_id, 'held', reason=reason)
     return False
 
 def lease_valid(entry):
@@ -90,22 +94,53 @@ def _operator_continuation_refusal(entry, binding, observed, p, receipt, *, reco
     return None
 
 
-def _continuation_post_unblock_current(entry, binding, observed, p, target):
-    """Recheck mutable authority before publishing the continuation route."""
+def _continuation_post_unblock_current(entry, binding, observed, p, target, unblock_event_id):
+    """Accept only an idle target or its exact routed-window implementation run."""
     policy = p.board_policy(entry['board']) or {}
     settings = policy.get('runtime_escalation', {})
     task = observed.get('task') if isinstance(observed, dict) else None
-    reviewer = entry['attempts'][0].get('reviewer_profile')
-    return (isinstance(task, dict) and binding == entry.get('binding')
-            and settings.get('enabled') is True and lease_valid(entry)
-            and target == settings.get('implementation_profile')
-            and isinstance(reviewer, str) and p.profile_exists(target) and p.profile_exists(reviewer)
-            and p._runtime_failure_record(observed, entry['failed_run_id']) == entry['failure']
-            and task.get('workspace_path') == entry['workspace_path']
-            and task.get('status') in {'ready', 'todo'} and task.get('assignee') == target
-            and task.get('current_run_id') is None
-            and p._workspace_checkpoint(entry['workspace_path']) == entry['checkpoint']
-            and p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path']))
+    runs = observed.get('runs') if isinstance(observed, dict) else None
+    events = observed.get('events') if isinstance(observed, dict) else None
+    attempts = entry.get('attempts') if isinstance(entry, dict) else None
+    attempt = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 and isinstance(attempts[0], dict) else None
+    reviewer = attempt.get('reviewer_profile') if isinstance(attempt, dict) else None
+    route = state.effective_routing(entry['task_id'], entry['board'])
+    expected_route = {'board': entry['board'], 'task_id': entry['task_id'], 'attempt': 1,
+                      'implementation_profile': target, 'reviewer_profile': reviewer}
+    common = (isinstance(task, dict) and isinstance(runs, list) and isinstance(events, list)
+              and isinstance(attempt, dict) and binding == entry.get('binding')
+              and entry.get('intent', {}).get('status') == 'routed'
+              and attempt.get('intent', {}).get('status') == 'routed'
+              and route == expected_route
+              and settings.get('enabled') is True and lease_valid(entry)
+              and target == attempt.get('implementation_profile') == settings.get('implementation_profile')
+              and isinstance(reviewer, str) and reviewer == settings.get('reviewer_profile')
+              and target != reviewer and p.profile_exists(target) and p.profile_exists(reviewer)
+              and p._runtime_failure_record(observed, entry['failed_run_id']) == entry['failure']
+              and task.get('workspace_path') == entry['workspace_path']
+              and task.get('assignee') == target
+              and p._workspace_checkpoint(entry['workspace_path']) == entry['checkpoint']
+              and p._workspace_is_exclusive(entry['board'], entry['task_id'], entry['workspace_path']))
+    if not common:
+        return False
+    assert isinstance(task, dict) and isinstance(runs, list) and isinstance(events, list)
+    assert isinstance(attempt, dict)
+    if task.get('status') in {'ready', 'todo'}:
+        return task.get('current_run_id') is None and entry.get('implementation_run_id') is None
+    run_id = entry.get('implementation_run_id')
+    if task.get('status') != 'running' or type(run_id) is not int or run_id <= entry['failed_run_id']:
+        return False
+    active = [run for run in runs if isinstance(run, dict) and run.get('ended_at') is None]
+    claims = [event for event in events if isinstance(event, dict)
+              and type(event.get('id')) is int and event['id'] > unblock_event_id
+              and event.get('kind') == 'claimed' and event.get('run_id') == run_id]
+    if (task.get('current_run_id') != run_id or len(active) != 1
+            or active[0].get('id') != run_id or active[0].get('profile') != target
+            or active[0].get('status') != 'running' or len(claims) != 1):
+        return False
+    payload = claims[0].get('payload')
+    source = payload.get('source_status') if isinstance(payload, dict) else None
+    return source in {None, 'ready', 'todo'}
 
 
 def _reconciliation_proof(entry):
@@ -187,8 +222,12 @@ def _reassignment_barrier(board, task_id, p, expected_assignee):
     if not isinstance(attempt, dict) or not isinstance(task, dict):
         return None
     target, reviewer = attempt.get('implementation_profile'), attempt.get('reviewer_profile')
+    route = {'board': board, 'task_id': task_id, 'attempt': attempt.get('attempt'),
+             'implementation_profile': target, 'reviewer_profile': reviewer}
     unblocks = _events(observed, 'unblocked', entry.get('failure', {}).get('event_id'))
-    if (binding != entry.get('binding') or settings.get('enabled') is not True or not lease_valid(entry)
+    if (entry.get('intent', {}).get('status') not in {'routed', 'reassign_attempted'}
+            or state.effective_routing(task_id, board) != route
+            or binding != entry.get('binding') or settings.get('enabled') is not True or not lease_valid(entry)
             or not isinstance(target, str) or not isinstance(reviewer, str) or target == reviewer
             or target != settings.get('implementation_profile') or reviewer != settings.get('reviewer_profile')
             or not p.profile_exists(target) or not p.profile_exists(reviewer)
@@ -201,6 +240,45 @@ def _reassignment_barrier(board, task_id, p, expected_assignee):
             or len(unblocks) != 1):
         return None
     return entry, binding, target, observed, unblocks[0]
+
+
+def _reassign_with_current_authority(board, task_id, entry, binding, target, p):
+    """Fence route revocation across the supported native reassignment call."""
+    key = state.binding_key(board, task_id)
+    try:
+        checkpoint = p._workspace_checkpoint(entry['workspace_path'])
+        exclusive = p._workspace_is_exclusive(board, task_id, entry['workspace_path'])
+        policy = p.board_policy(board)
+    except Exception:
+        return False, None
+    attempts = entry.get('attempts')
+    attempt = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 else None
+    if not isinstance(attempt, dict):
+        return False, None
+    route = {'board': board, 'task_id': task_id, 'attempt': attempt.get('attempt'),
+             'implementation_profile': target, 'reviewer_profile': attempt.get('reviewer_profile')}
+    error = None
+    with state.locked_state(write=True) as data:
+        current = data['runtime_escalations'].get(key)
+        board_policy = data['boards'].get(board)
+        if (current != entry or current.get('intent', {}).get('status') != 'routed'
+                or board_policy != policy
+                or board_policy.get('runtime_escalation', {}).get('enabled') is not True
+                or board_policy.get('runtime_escalation', {}).get('implementation_profile') != target
+                or data['tasks'].get(key) != binding
+                or data['effective_routing'].get(key) != route
+                or data['workspace_leases'].get(entry['workspace_path'])
+                != f"{board}:{task_id}:{entry['failed_run_id']}:runtime_escalation"
+                or checkpoint != entry.get('checkpoint') or not exclusive
+                or current.get('implementation_run_id') is not None):
+            return False, None
+        current['intent'] = dict(current['intent'], status='reassign_attempted')
+        current['attempts'][-1]['intent'] = dict(current['attempts'][-1]['intent'], status='reassign_attempted')
+        try:
+            native.reassign_ready_task(board, task_id, target)
+        except Exception as exc:
+            error = exc
+    return True, error
 
 
 def reauthorize_held(task_id, board):
@@ -413,7 +491,11 @@ def reconcile(task_id, board):
                     return hold(board, task_id, 'Runtime authority or no-effect proof changed before native unblock')
             except Exception as exc:
                 return hold(board, task_id, f'Runtime authority revalidation failed before native unblock: {type(exc).__name__}: {exc}')
+            # Publish the exact effective route while the task is still blocked.
+            # The route alone cannot admit a worker; after native unblock the
+            # ordinary routed guard verifies task/run/profile/claim ownership.
             state.update_runtime_escalation_intent(board, task_id, 'unblock_attempted')
+            state.publish_runtime_escalation_routing(board, task_id, binding=binding)
             try:
                 result = p._dispatch('kanban_unblock', {'board': board, 'task_id': task_id})
             except Exception as exc:
@@ -424,15 +506,23 @@ def reconcile(task_id, board):
             try:
                 observed = native.snapshot(board, task_id)
             except Exception as exc:
-                return hold(board, task_id, f'Native unblock readback failed: {type(exc).__name__}: {exc}')
+                return hold(board, task_id, f'Native unblock readback failed: {type(exc).__name__}: {exc}', revoke_route=True)
             task = observed['task']
         unblocks = _events(observed, 'unblocked', entry['failure']['event_id'])
         if continuation:
             prior_events = continuation[0].get('snapshot', {}).get('events', []) if isinstance(continuation, list) and continuation else []
             prior_ids = {event.get('id') for event in prior_events if isinstance(event, dict)}
             fresh = [event for event in unblocks if event.get('id') not in prior_ids]
-            if (len(fresh) != 1 or not _continuation_post_unblock_current(
-                    entry, binding, observed, p, target)):
+            if len(fresh) != 1:
+                return hold(board, task_id, 'No unique native unblock receipt or current authority for the reviewed continuation')
+            # A route-first synchronous dispatcher may have admitted its exact
+            # target before this readback. Re-load the durable pin made by that
+            # guard; never infer a current run from native state alone.
+            entry = state.runtime_escalation_entry(task_id, board)
+            binding = p.task_binding(task_id, board)
+            if (not isinstance(entry, dict) or not isinstance(binding, dict)
+                    or not _continuation_post_unblock_current(
+                        entry, binding, observed, p, target, fresh[0]['id'])):
                 return hold(board, task_id, 'No unique native unblock receipt or current authority for the reviewed continuation')
             # The target already owns this card; a reassignment would be a
             # second native effect and is forbidden by the attestation scope.
@@ -460,12 +550,13 @@ def reconcile(task_id, board):
                 return hold(board, task_id, 'Old-profile claim or unresolved reassignment; refusing duplicate effect')
             if task.get('assignee') != binding['implementation_profile']:
                 return hold(board, task_id, 'Native owner changed before reassignment')
-            state.update_runtime_escalation_intent(board, task_id, 'reassign_attempted')
             reassign_error = None
-            try:
-                native.reassign_ready_task(board, task_id, target)
-            except Exception as exc:
-                reassign_error = f'{type(exc).__name__}: {exc}'
+            reassigned, effect_error = _reassign_with_current_authority(
+                board, task_id, entry, binding, target, p)
+            if not reassigned:
+                return hold(board, task_id, 'Runtime authority changed immediately before native reassignment')
+            if effect_error is not None:
+                reassign_error = f'{type(effect_error).__name__}: {effect_error}'
             try:
                 observed = native.snapshot(board, task_id)
             except Exception as exc:
@@ -493,6 +584,9 @@ def reconcile(task_id, board):
             claims=[e for e in _events(observed,'claimed',assigned[0]['id']) if e.get('run_id')==task.get('current_run_id')]
             if len(runs)!=1 or len(claims)!=1 or runs[0].get('profile')!=target or runs[0].get('ended_at') is not None:
                 return hold(board,task_id,'Ambiguous claim raced native reassignment')
+        pinned = entry.get('implementation_run_id')
+        if pinned is not None and task.get('current_run_id') != pinned:
+            return hold(board, task_id, 'A different implementation run was pinned before route publication')
         state.publish_runtime_escalation_routing(board, task_id, binding=binding)
         return True
 
@@ -518,44 +612,76 @@ def admit(task_id, board, run_id, profile, show):
     from . import plugin as p
     def reject(reason):
         return {'action':'block','message':'Runtime escalation admission refused: '+reason}
-    with exclusive_operation() as acquired:
-        if not acquired:
-            return reject('workspace routing operation is busy; retry after reconciliation')
-        entry = state.runtime_escalation_entry(task_id, board)
-        policy = state.board_policy(board) or {}
-        settings = policy.get('runtime_escalation', {})
-        if not entry or entry['intent']['status'] != 'routed':
-            return reject('route is not published')
-        if settings.get('enabled') is not True or not lease_valid(entry):
-            return reject('policy is paused or exclusive workspace lease changed')
-        route=entry['attempts'][0]
-        task=show['task']
-        if (task.get('workspace_path')!=entry['workspace_path'] or task.get('current_run_id')!=run_id
-                or task.get('assignee')!=profile or task.get('status')!='running'
-                or not p._workspace_is_exclusive(board,task_id,entry['workspace_path'])
-                or not p.profile_exists(route['implementation_profile']) or not p.profile_exists(route['reviewer_profile'])):
-            return reject('native run/workspace ownership does not match the reserved route')
-        active=[r for r in show['runs'] if r.get('id')==run_id and r.get('profile')==profile and r.get('ended_at') is None]
-        if len(active)!=1 or type(run_id) is not int or run_id<=entry['failed_run_id']:
-            return reject('not an exact fresh native run')
-        if profile==route['reviewer_profile']:
-            if not entry.get('implementation_run_id'):
-                return reject('no admitted implementation exists for this review')
-            claims=[e for e in show['events'] if e.get('kind')=='claimed' and e.get('run_id')==run_id]
-            if len(claims)!=1 or (claims[0].get('payload') or {}).get('source_status')!='review':
-                return reject('independent reviewer lacks an exact review claim')
-            return None
-        if profile!=route['implementation_profile']:
-            return reject('wrong implementation profile')
-        pinned=entry.get('implementation_run_id')
-        if pinned is not None:
-            return None if pinned==run_id else reject('bounded implementation attempt already spent')
-        if p._workspace_checkpoint(entry['workspace_path'])!=entry['checkpoint']:
-            hold(board,task_id,'Workspace checkpoint changed before first coder tool')
-            return reject('workspace checkpoint changed before first coder tool')
+    entry = state.runtime_escalation_entry(task_id, board)
+    policy = state.board_policy(board)
+    if not isinstance(entry, dict) or not isinstance(policy, dict):
+        return reject('route is not published')
+    settings = policy.get('runtime_escalation', {})
+    attempts = entry.get('attempts')
+    route = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 and isinstance(attempts[0], dict) else None
+    task = show.get('task') if isinstance(show, dict) else None
+    runs = show.get('runs') if isinstance(show, dict) else None
+    events = show.get('events') if isinstance(show, dict) else None
+    if (entry.get('intent', {}).get('status') != 'routed' or not isinstance(route, dict)
+            or not isinstance(task, dict) or not isinstance(runs, list) or not isinstance(events, list)):
+        return reject('route or native admission evidence is incomplete')
+    implementation, reviewer = route.get('implementation_profile'), route.get('reviewer_profile')
+    expected_route = {'board': board, 'task_id': task_id, 'attempt': route.get('attempt'),
+                      'implementation_profile': implementation, 'reviewer_profile': reviewer}
+
+    def authority_current(data):
+        current = data['runtime_escalations'].get(state.binding_key(board, task_id))
+        current_policy = data['boards'].get(board)
+        return (current == entry and current_policy == policy
+                and data['tasks'].get(state.binding_key(board, task_id)) == entry.get('binding')
+                and data['effective_routing'].get(state.binding_key(board, task_id)) == expected_route
+                and data['workspace_leases'].get(entry['workspace_path'])
+                == f"{entry['board']}:{entry['task_id']}:{entry['failed_run_id']}:runtime_escalation")
+
+    if (settings.get('enabled') is not True or not lease_valid(entry)
+            or implementation != settings.get('implementation_profile')
+            or reviewer != settings.get('reviewer_profile')
+            or not isinstance(implementation, str) or not isinstance(reviewer, str)
+            or implementation == reviewer
+            or not p.profile_exists(implementation) or not p.profile_exists(reviewer)):
+        return reject('policy, route, profile, or exclusive workspace lease changed')
+    if (task.get('id') != task_id or task.get('workspace_path') != entry.get('workspace_path')
+            or task.get('current_run_id') != run_id or task.get('assignee') != profile
+            or task.get('status') != 'running'
+            or not p._workspace_is_exclusive(board, task_id, entry['workspace_path'])):
+        return reject('native run/workspace ownership does not match the reserved route')
+    active = [run for run in runs if isinstance(run, dict) and run.get('id') == run_id
+              and run.get('profile') == profile and run.get('ended_at') is None]
+    if len(active) != 1 or type(run_id) is not int or run_id <= entry.get('failed_run_id', run_id):
+        return reject('not an exact fresh native run')
+    claims = [event for event in events if isinstance(event, dict)
+              and event.get('kind') == 'claimed' and event.get('run_id') == run_id]
+    if profile == reviewer:
+        if not entry.get('implementation_run_id'):
+            return reject('no admitted implementation exists for this review')
+        if len(claims) != 1 or (claims[0].get('payload') or {}).get('source_status') != 'review':
+            return reject('independent reviewer lacks an exact review claim')
         with state.locked_state(write=True) as data:
-            current=data['runtime_escalations'][state.binding_key(board,task_id)]
-            if current!=entry:
-                return reject('runtime intent changed during admission')
-            current['implementation_run_id']=run_id
+            if not authority_current(data):
+                return reject('runtime route, policy, binding, or lease changed during admission')
         return None
+    if profile != implementation:
+        return reject('wrong implementation profile')
+    if len(claims) != 1 or (claims[0].get('payload') or {}).get('source_status') not in {None, 'ready', 'todo'}:
+        return reject('implementation lacks an exact routed claim')
+    pinned = entry.get('implementation_run_id')
+    if pinned is not None:
+        with state.locked_state(write=True) as data:
+            if not authority_current(data):
+                return reject('runtime route, policy, binding, or lease changed during admission')
+            current_pin = data['runtime_escalations'][state.binding_key(board, task_id)].get('implementation_run_id')
+            return None if current_pin == run_id else reject('bounded implementation attempt already spent')
+    if p._workspace_checkpoint(entry['workspace_path']) != entry['checkpoint']:
+        hold(board, task_id, 'Workspace checkpoint changed before first coder tool')
+        return reject('workspace checkpoint changed before first coder tool')
+    key = state.binding_key(board, task_id)
+    with state.locked_state(write=True) as data:
+        if not authority_current(data):
+            return reject('runtime route, policy, binding, or lease changed during admission')
+        data['runtime_escalations'][key]['implementation_run_id'] = run_id
+    return None

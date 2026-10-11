@@ -263,7 +263,8 @@ def test_resume_held_exact_operator_receipt_persists_then_routes_once(runtime, m
         assert persisted['intent']['operator_continuation_history'] == [{
             'receipt': receipt, 'snapshot': copy.deepcopy(show),
         }]
-        assert persisted['intent']['status'] == 'unblock_attempted'
+        assert persisted['intent']['status'] == 'routed'
+        assert state.effective_routing('task', 'default')['implementation_profile'] == 'strong'
         assert persisted['intent']['transport'] == original_transport
         show['task']['status'] = 'ready'
         show['events'].append({'id': 36, 'kind': 'unblocked', 'run_id': None,
@@ -557,6 +558,82 @@ def test_runtime_policy_writer_is_busy_during_native_unblock_authority(runtime, 
     assert effects == ['strong']
 
 
+def test_reconciliation_does_not_resurrect_route_revoked_by_worker_admission(runtime, monkeypatch):
+    """An in-flight reconciler cannot republish after the worker guard holds."""
+    binding, entry, show = runtime
+    reassignments = []
+
+    def unblock(*_args):
+        assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'routed'
+        assert state.effective_routing('task', 'default') is not None
+        state.revoke_runtime_escalation_routing('default', 'task', reason='worker guard rejected changed checkpoint')
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
+        return {'status': 'ready'}
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *args: reassignments.append(args))
+
+    assert not runtime_escalation.reconcile('task', 'default')
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert reassignments == []
+    assert stored['intent']['status'] == 'held'
+    assert state.effective_routing('task', 'default') is None
+def test_reconciliation_rechecks_authority_after_barrier_before_reassignment(runtime, monkeypatch):
+    """A revoked route cannot authorize the following native reassignment."""
+    binding, entry, show = runtime
+    reassignments = []
+    original_barrier = runtime_escalation._reassignment_barrier
+    revoked = []
+
+    def revoke_after_barrier(*args):
+        result = original_barrier(*args)
+        if result is not None and not revoked:
+            revoked.append(True)
+            state.revoke_runtime_escalation_routing('default', 'task', reason='concurrent route revocation')
+        return result
+
+    monkeypatch.setattr(runtime_escalation, '_reassignment_barrier', revoke_after_barrier)
+    monkeypatch.setattr(native, 'reassign_ready_task', lambda *args: reassignments.append(args))
+    monkeypatch.setattr(plugin, '_dispatch', lambda *_: (
+        show['task'].update(status='ready'),
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None}),
+        {'status': 'ready'},
+    )[-1])
+
+    assert not runtime_escalation.reconcile('task', 'default')
+    assert revoked == [True]
+    assert reassignments == []
+    assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'held'
+    assert state.effective_routing('task', 'default') is None
+def test_reconciliation_holds_when_a_different_run_is_pinned_after_route_publication(runtime, monkeypatch):
+    """A stale pinned run cannot survive a route-first reconciliation."""
+    binding, entry, show = runtime
+    with state.locked_state(write=True) as data:
+        data['runtime_escalations']['default:task']['implementation_run_id'] = 12
+
+    def unblock(*_args):
+        show['task']['status'] = 'ready'
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
+        return {'status': 'ready'}
+
+    def reassign(_board, _task, profile):
+        show['task'].update(status='running', assignee=profile, current_run_id=13)
+        show['runs'] = [{'id': 13, 'profile': profile, 'status': 'running', 'ended_at': None}]
+        show['events'].extend([
+            {'id': 22, 'kind': 'assigned', 'run_id': None, 'payload': {'from': 'impl', 'assignee': profile}},
+            {'id': 23, 'kind': 'claimed', 'run_id': 13, 'payload': {'source_status': 'ready'}},
+        ])
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    monkeypatch.setattr(native, 'reassign_ready_task', reassign)
+
+    assert not runtime_escalation.reconcile('task', 'default')
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['intent']['status'] == 'held'
+    assert state.effective_routing('task', 'default') is None
+
+
 def test_reassign_final_barrier_holds_when_lease_changes_after_unblock_readback(runtime, monkeypatch):
     """A lease change after the unblock receipt must prevent reassignment/publish."""
     binding, entry, show = runtime
@@ -691,11 +768,73 @@ def test_first_run_admission_requires_exact_checkpoint_and_exclusive_route(runti
     assert 'implementation_run_id' not in state.runtime_escalation_entry('task','default')
 
 
+def test_exact_routed_admission_pins_while_reconciliation_operation_is_held(runtime):
+    """Only the exact routed worker may pin inside reconciliation's operation lock."""
+    binding, entry, show = runtime
+    state.publish_runtime_escalation_routing('default', 'task', binding=binding)
+    show['task'].update(status='running', assignee='strong', current_run_id=12)
+    show['runs'] = [{'id': 12, 'profile': 'strong', 'status': 'running', 'ended_at': None}]
+    show['events'].append({'id': 21, 'kind': 'claimed', 'run_id': 12,
+                           'payload': {'source_status': 'ready'}})
+
+    with runtime_escalation.exclusive_operation() as acquired:
+        assert acquired
+        assert runtime_escalation.admit('task', 'default', 12, 'strong', show) is None
+        assert runtime_escalation.admit('task', 'default', 12, 'impl', show) is not None
+        assert runtime_escalation.admit('task', 'default', 13, 'strong', show) is not None
+
+    assert state.runtime_escalation_entry('task', 'default')['implementation_run_id'] == 12
+
+
+def test_reviewer_admission_refuses_route_revoked_during_validation(runtime, monkeypatch):
+    """A stale reviewer guard cannot authorize tools after the route is held."""
+    binding, entry, show = runtime
+    state.publish_runtime_escalation_routing('default', 'task', binding=binding)
+    with state.locked_state(write=True) as data:
+        data['runtime_escalations']['default:task']['implementation_run_id'] = 12
+    show['task'].update(status='running', assignee='post-review', current_run_id=13)
+    show['runs'] = [{'id': 13, 'profile': 'post-review', 'status': 'running', 'ended_at': None}]
+    show['events'].append({'id': 21, 'kind': 'claimed', 'run_id': 13,
+                           'payload': {'source_status': 'review'}})
+    original_exclusive = plugin._workspace_is_exclusive
+
+    def revoke_during_admission(*args):
+        state.revoke_runtime_escalation_routing('default', 'task', reason='concurrent hold')
+        return original_exclusive(*args)
+
+    monkeypatch.setattr(plugin, '_workspace_is_exclusive', revoke_during_admission)
+
+    assert runtime_escalation.admit('task', 'default', 13, 'post-review', show) is not None
+    assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'held'
+    assert state.effective_routing('task', 'default') is None
+def test_pinned_implementation_admission_refuses_route_revoked_during_validation(runtime, monkeypatch):
+    """An existing coder pin does not outlive a concurrent route revocation."""
+    binding, entry, show = runtime
+    state.publish_runtime_escalation_routing('default', 'task', binding=binding)
+    with state.locked_state(write=True) as data:
+        data['runtime_escalations']['default:task']['implementation_run_id'] = 12
+    show['task'].update(status='running', assignee='strong', current_run_id=12)
+    show['runs'] = [{'id': 12, 'profile': 'strong', 'status': 'running', 'ended_at': None}]
+    show['events'].append({'id': 21, 'kind': 'claimed', 'run_id': 12,
+                           'payload': {'source_status': 'ready'}})
+    original_exclusive = plugin._workspace_is_exclusive
+
+    def revoke_during_admission(*args):
+        state.revoke_runtime_escalation_routing('default', 'task', reason='concurrent hold')
+        return original_exclusive(*args)
+
+    monkeypatch.setattr(plugin, '_workspace_is_exclusive', revoke_during_admission)
+
+    assert runtime_escalation.admit('task', 'default', 12, 'strong', show) is not None
+    assert state.runtime_escalation_entry('task', 'default')['intent']['status'] == 'held'
+    assert state.effective_routing('task', 'default') is None
 def test_admission_pins_one_run_then_permits_its_edits_not_a_second_attempt(runtime,monkeypatch):
     binding,entry,show=runtime
     state.publish_runtime_escalation_routing('default','task',binding=binding)
     show['task'].update(status='running',assignee='strong',current_run_id=12)
     show['runs']=[{'id':12,'profile':'strong','status':'running','ended_at':None}]
+    show['events'].append({'id': 21, 'kind': 'claimed', 'run_id': 12,
+                           'payload': {'source_status': 'ready'}})
     assert runtime_escalation.admit('task','default',12,'strong',show) is None
     monkeypatch.setattr(plugin,'_workspace_checkpoint',lambda _: {'head':'b'*40,'dirty':[]})
     assert runtime_escalation.admit('task','default',12,'strong',show) is None
@@ -703,6 +842,41 @@ def test_admission_pins_one_run_then_permits_its_edits_not_a_second_attempt(runt
     show['runs']=[{'id':13,'profile':'strong','status':'running','ended_at':None}]
     assert runtime_escalation.admit('task','default',13,'strong',show) is not None
     assert state.runtime_escalation_entry('task','default')['implementation_run_id']==12
+
+
+@pytest.mark.parametrize('outcome', ['exception', 'unknown_result', 'duplicate_unblock'])
+def test_pre_published_route_is_revoked_when_unblock_is_uncertain(runtime, monkeypatch, outcome):
+    """A spent/uncertain native send cannot leave effective route authority."""
+    binding, entry, show = runtime
+    calls = []
+    observed_before_send = []
+
+    def unblock(*_args):
+        calls.append('unblock')
+        published = state.runtime_escalation_entry('task', 'default')
+        assert published['intent']['status'] == 'routed'
+        assert state.effective_routing('task', 'default')['implementation_profile'] == 'strong'
+        observed_before_send.append(True)
+        if outcome == 'exception':
+            raise OSError('response lost')
+        if outcome == 'unknown_result':
+            return {'status': 'unknown'}
+        show['task']['status'] = 'ready'
+        show['events'].extend([
+            {'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None},
+            {'id': 22, 'kind': 'unblocked', 'run_id': None, 'payload': None},
+        ])
+        return {'status': 'ready'}
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+
+    assert not runtime_escalation.reconcile('task', 'default')
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert calls == ['unblock']
+    assert observed_before_send == [True]
+    assert stored['intent']['status'] == 'held'
+    assert state.effective_routing('task', 'default') is None
+    assert runtime_escalation.admit('task', 'default', 12, 'strong', show) is not None
 
 
 @pytest.mark.parametrize('change', ['checkpoint','lease','profile','paused'])
