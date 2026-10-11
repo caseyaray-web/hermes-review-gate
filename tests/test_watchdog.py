@@ -338,6 +338,7 @@ def test_configured_phase_budget_counts_distinct_failed_runs_across_restart_and_
 
 def test_runtime_reconciliation_recovers_lost_unblock_response_from_exact_ready_readback(runtime, monkeypatch):
     binding, entry, show = runtime
+    state.publish_runtime_escalation_routing('default', 'task', binding=binding)
     state.update_runtime_escalation_intent('default', 'task', 'reassign_attempted')
     show['task'].update(status='ready', assignee='strong')
     show['events'].extend([

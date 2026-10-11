@@ -1,5 +1,7 @@
 """Installed-Hermes RM-03 catch-up: no providers, real native lifecycle."""
 import copy
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -28,13 +30,16 @@ def test_native_old_review_retry_cannot_manufacture_correction_threshold(board):
 
 
 @pytest.fixture
-def rm03(board):
+def rm03(board, monkeypatch):
     b=board
     assert b.kb.block_task(b.conn,b.pred,reason='Unrelated fixture control stays parked',kind='needs_input')
     state.activate_board('default',activation_id='rm03-existing-hold')
     state.set_recovery_policy('default',enabled=True,max_per_phase=2)
     state.set_escalation_policy('default',enabled=True,normal_correction_limit=2,max_attempts=1,implementation_profile='strong',reviewer_profile='post-review')
-    tid=b.kb.create_task(b.conn,title='RM-03 contract',body='Continue the existing meal planner changes; preserve downstream gates.',assignee='impl',priority=500,max_retries=1,workspace_kind='worktree',workspace_path=str(b.repo_root))
+    from hermes_cli import kanban_db as kb
+    with monkeypatch.context() as fixed_id:
+        fixed_id.setattr(kb, '_new_task_id', lambda: 't_57851039')
+        tid=b.kb.create_task(b.conn,title='RM-03 contract',body='Continue the existing meal planner changes; preserve downstream gates.',assignee='impl',priority=500,max_retries=1,workspace_kind='worktree',workspace_path=str(b.repo_root))
     workspace=b.workspace(tid)
     downstream=b.kb.create_task(b.conn,title='RM03 gated successor',parents=[tid],assignee='impl',workspace_kind='worktree',workspace_path=str(b.repo_root))
     assert b.dispatch(expected=tid).assignee=='impl'
@@ -224,6 +229,179 @@ def test_joined_old_profile_claim_race_is_pretool_held(rm03,monkeypatch):
     assert state.runtime_escalation_entry(tid,'default')['intent']['status']=='held'
     assert not any(e['kind']=='assigned' and (e['payload'] or {}).get('assignee')=='strong' for e in b.show(tid)['events'])
     assert b.kb.get_task(b.conn,b.rm_child).status=='todo'
+
+
+def test_joined_exact_target_claim_between_unblock_and_route_publication_is_one_use(rm03, monkeypatch):
+    """The reviewed held continuation admits only its one synchronous strong claim."""
+    b = rm03
+    tid = b.rm_tid
+
+    # Make the exact latest native failure belong to the eventual strong owner.
+    # A post-failure block creates a terminal run, so the reviewed continuation
+    # must begin from this already-blocked final failure rather than manufacture
+    # its status after adoption.
+    assert b.kb.get_task(b.conn, tid).status == 'blocked', b.kb.get_task(b.conn, tid)
+    assert b.kb.unblock_task(b.conn, tid)
+    assert native.reassign_ready_task('default', tid, 'strong')
+    strong_task = b.dispatch(expected=tid)
+    assert strong_task.assignee == 'strong'
+    assert b.kbd._record_task_failure(
+        b.conn, tid,
+        'Iteration budget exhausted (180/180) — task could not complete within the allowed iterations',
+        outcome='timed_out', release_claim=True, end_run=True,
+        event_payload_extra={'budget_used': 180, 'budget_max': 180},
+    )
+    assert b.kb.get_task(b.conn, tid).status == 'blocked'
+    assert b.kb.get_task(b.conn, tid).assignee == 'strong'
+    assert b.kb.get_task(b.conn, tid).current_run_id is None
+
+    # This is a new target-owned failure, not the original implementation
+    # catch-up.  Reserve the task-scoped runtime intent from the exact native
+    # failure evidence without trying to adopt the historical RM-03 failure.
+    show = b.show(tid)
+    run_id = strong_task.current_run_id
+    assert isinstance(run_id, int)
+    failure = plugin._runtime_failure_record(show, run_id)
+    assert failure is not None
+    policy = state.board_policy('default')
+    assert policy is not None
+    watermark = policy['runtime_escalation_watermark']
+    assert isinstance(watermark, int) and run_id > watermark
+    assert state.recovery_budget_exhausted('default', tid, 'implementation')
+    checkpoint = plugin._workspace_checkpoint(str(b.rm_workspace))
+    coder_context = {
+        'original_contract': dict(show['task']),
+        'reviewer_findings': [
+            dict(value, run_id=value['reviewer_run_id'])
+            for value in plugin.changes_requested_verdicts(show['runs'], show['events'], b.rm_binding)
+        ],
+        'latest_failure': failure,
+        'checkpoint': checkpoint,
+    }
+    entry = state.reserve_runtime_escalation(
+        'default', tid, failed_run_id=run_id, phase='implementation',
+        binding=b.rm_binding, checkpoint=checkpoint, failure=failure,
+        workspace_path=str(b.rm_workspace), coder_context=coder_context, catchup=False,
+    )
+    assert entry['intent']['status'] == 'unblock_requested'
+    assert entry['failed_run_id'] == run_id
+    assert state.recovery_budget_exhausted('default', tid, 'implementation')
+
+    # Comments are supported native operations that append the reviewed event
+    # manifest without producing post-failure task runs.
+    for sequence in range(15):
+        assert b.kb.add_comment(b.conn, tid, 'fixture-operator',
+                                f'Reviewed post-hold continuation evidence {sequence}.')
+
+    held = b.show(tid)
+    assert held['task']['status'] == 'blocked'
+    assert held['task']['assignee'] == 'strong'
+    assert held['task']['current_run_id'] is None
+    manifest = [
+        {'kind': event['kind'], 'run_id': event['run_id'], 'created_at': event.get('created_at'),
+         'payload': event['payload']}
+        for event in held['events'] if event['id'] > entry['failure']['event_id']
+    ]
+    assert len(manifest) == 15
+    receipt = {
+        'scope': 'fixture-exact-operator-continuation', 'sessions': [],
+        'later_runs': [],
+        'later_event_manifest_sha256': hashlib.sha256(
+            json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+    }
+    proof = {
+        'binding': entry['binding'], 'failure': entry['failure'],
+        'checkpoint': entry['checkpoint'], 'failed_run_id': entry['failed_run_id'],
+        'snapshot': held,
+        'snapshot_sha256': hashlib.sha256(
+            json.dumps(held, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+    }
+    # Build the reviewed held continuation through state APIs only.  The
+    # no-effect proof is taken from the complete native read above; no fixture
+    # writes state internals or invents task identity.
+    entry = state.update_runtime_escalation_intent('default', tid, 'held', reason='fixture held continuation')
+    entry = state.authorize_runtime_held_reconciliation('default', tid, entry=entry, evidence=proof)
+    assert entry['intent']['status'] == 'unblock_requested'
+    entry = state.update_runtime_escalation_intent('default', tid, 'held', reason='fixture held continuation')
+    entry = state.record_runtime_escalation_transport(
+        'default', tid, 'kanban_unblock', result={'ok': True, 'status': 'ready', 'task_id': tid},
+    )
+    assert entry['intent']['status'] == 'held'
+    assert entry['intent']['transport'] == {'operation': 'kanban_unblock', 'result': {
+        'ok': True, 'status': 'ready', 'task_id': tid,
+    }}
+    # The reviewed one-shot continuation is intentionally scoped to this
+    # fixture's canonical native task.  Keep the literal production fence
+    # honest rather than replacing its receipt validator in the test.
+    assert tid == 't_57851039'
+    monkeypatch.setattr(runtime_escalation, 'OPERATOR_CONTINUATION_RECEIPT', receipt)
+
+    admitted = []
+    dispatch = plugin._dispatch
+    def claim_after_unblock(name, args):
+        # The durable effective route must exist before the blocked card becomes
+        # claimable.  This assertion is intentionally inside the real native
+        # transport boundary, before the actual unblock call below.
+        pre_effect = state.runtime_escalation_entry(tid, 'default')
+        assert pre_effect['intent']['status'] == 'routed'
+        assert state.effective_routing(tid, 'default')['implementation_profile'] == 'strong'
+        result = dispatch(name, args)
+        if name == 'kanban_unblock':
+            tick = b.kbd.dispatch_once(b.conn, spawn_fn=lambda *a, **k: os.getpid(), max_spawn=1,
+                                       reconcile_orphans=False)
+            assert tick.spawned == [(tid, 'strong', str(b.rm_workspace))]
+            task = b.kb.get_task(b.conn, tid)
+            run_id = task.current_run_id
+            assert isinstance(run_id, int)
+            monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
+            monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run_id))
+            monkeypatch.setenv('HERMES_PROFILE', 'strong')
+            admitted.append(run_id)
+            first = plugin.guard('kanban_show', {})
+            assert first and first['message'].startswith('Fresh runtime catch-up coder context')
+            assert plugin.guard('kanban_show', {}) is None
+            lifecycle = plugin.guard('kanban_complete', {})
+            assert lifecycle and lifecycle['action'] == 'block'
+            monkeypatch.setenv('HERMES_PROFILE', 'impl')
+            wrong_profile = plugin.guard('kanban_show', {})
+            assert wrong_profile and wrong_profile['action'] == 'block'
+            monkeypatch.setenv('HERMES_PROFILE', 'strong')
+            monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run_id + 1))
+            wrong_run = plugin.guard('kanban_show', {})
+            assert wrong_run and wrong_run['action'] == 'block'
+            monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run_id))
+            current_entry = state.runtime_escalation_entry(tid, 'default')
+            current_show = b.show(tid)
+            fresh_unblocks = [e for e in current_show['events'] if e['kind'] == 'unblocked' and e['id'] > entry['failure']['event_id']]
+            assert runtime_escalation._continuation_post_unblock_current(
+                current_entry, state.task_binding(tid, 'default'), current_show, plugin, 'strong',
+                fresh_unblocks[-1]['id']) is True, (current_entry, current_show, fresh_unblocks)
+        return result
+    monkeypatch.setattr(plugin, '_dispatch', claim_after_unblock)
+
+    current = state.runtime_escalation_entry(tid, 'default')
+    current_show = b.show(tid)
+    later_runs = [{key: run.get(key) for key in ('id', 'profile', 'status', 'outcome', 'started_at', 'ended_at')}
+                  for run in current_show['runs'] if run.get('id', 0) > entry['failed_run_id']]
+    manifest_now = [{'kind': e['kind'], 'run_id': e['run_id'], 'created_at': e.get('created_at'), 'payload': e['payload']}
+                    for e in current_show['events'] if e['id'] > entry['failure']['event_id']]
+    assert later_runs == []
+    assert len(manifest_now) == 15
+    assert hashlib.sha256(json.dumps(manifest_now, sort_keys=True, separators=(',', ':')).encode()).hexdigest() == receipt['later_event_manifest_sha256']
+    assert runtime_escalation._operator_continuation_refusal(
+        current, state.task_binding(tid, 'default'), current_show, plugin, receipt, recorded=False) is None
+    # Native operator reconciliation runs outside any worker invocation context.
+    b.clear()
+    resumed = runtime_escalation.resume_held(tid, 'default', operator_receipt=receipt)
+    assert resumed['ok'], resumed
+    assert admitted and state.runtime_escalation_entry(tid, 'default')['implementation_run_id'] == admitted[0]
+    assert state.runtime_escalation_entry(tid, 'default')['intent']['status'] == 'routed'
+    assert state.effective_routing(tid, 'default')['implementation_profile'] == 'strong'
+
+    show = b.show(tid)
+    assert runtime_escalation.admit(tid, 'default', admitted[0] + 1, 'strong', show) is not None
+    assert runtime_escalation.admit(tid, 'default', admitted[0], 'impl', show) is not None
+    assert runtime_escalation.admit(tid, 'default', admitted[0], 'strong', show) is None
 
 
 def test_joined_negative_post_escalation_review_holds_without_another_coder(rm03):
