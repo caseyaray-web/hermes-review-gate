@@ -245,6 +245,11 @@ def test_joined_operator_retry_claims_exact_latest_window_after_historical_failu
     held = state.runtime_escalation_entry(tid, 'default')
     assert held['intent']['status'] == 'held'
     historical_checkpoint = held['checkpoint']
+    # A prior failed coder run already consumed the one-shot context packet.
+    # The explicit retry must archive this marker and create a new delivery
+    # window for its exact newly admitted native run.
+    with state.locked_state(write=True) as data:
+        data['runtime_escalations'][f'default:{tid}']['coder_context_delivery_run_id'] = 2274
     (b.rm_workspace / 'operator-inspected-partial.py').write_text('preserve this partial retry work\n')
 
     dispatch = plugin._dispatch
@@ -255,8 +260,13 @@ def test_joined_operator_retry_claims_exact_latest_window_after_historical_failu
             task = b.dispatch(expected=tid)
             assert task.assignee == 'strong'
             admitted.append(task.current_run_id)
-            assert plugin.guard('kanban_show', {}) is not None
+            delivered = plugin.guard('kanban_show', {})
+            assert delivered and 'Fresh runtime catch-up coder context' in delivered['message']
             assert plugin.guard('kanban_show', {}) is None
+            monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(task.current_run_id + 1))
+            wrong_run = plugin.guard('kanban_show', {})
+            assert wrong_run and wrong_run['action'] == 'block'
+            monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(task.current_run_id))
         return result
     monkeypatch.setattr(plugin, '_dispatch', claim_during_unblock)
 
@@ -267,6 +277,9 @@ def test_joined_operator_retry_claims_exact_latest_window_after_historical_failu
     retry = entry['intent']['operator_retry_history'][-1]
     assert retry['prior_checkpoint'] == historical_checkpoint
     assert retry['checkpoint'] == plugin._workspace_checkpoint(str(b.rm_workspace))
+    assert retry['prior_coder_context_delivery_run_id'] == 2274
+    assert entry['coder_context']['checkpoint'] == retry['checkpoint']
+    assert entry['coder_context_delivery_run_id'] == admitted[0]
     assert retry['status'] == 'routed'
     assert admitted == [entry['implementation_run_id']]
     show = b.show(tid)

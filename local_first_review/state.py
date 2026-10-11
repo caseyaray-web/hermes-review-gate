@@ -51,7 +51,7 @@ def phase_budget_key(board: str, task_id: str, phase: str) -> str:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 10, "implementation_profile": None, "reviewer_profile": None,
+    return {"version": 11, "implementation_profile": None, "reviewer_profile": None,
             "tasks": {}, "boards": {}, "recovery": {}, "recovery_budgets": {}, "workspace_leases": {},
             "escalations": {}, "runtime_escalations": {}, "effective_routing": {}}
 
@@ -181,13 +181,24 @@ def _migrate(data: Any) -> dict[str, Any]:
                 for index, item in enumerate(history):
                     if isinstance(item, dict) and set(item) == {"request_id", "snapshot", "checkpoint", "prior_implementation_run_id", "status", "unblock_event_id"}:
                         history[index] = dict(item, prior_checkpoint=item["checkpoint"], prior_transport=None)
+    if data.get("version") == 10:
+        # v10 retry records predate the archived one-shot coder delivery
+        # marker.  They remain complete historical records; absence means the
+        # old delivery marker was not captured by that retry schema.
+        data = dict(data); data["version"] = 11
+        for entry in data.get("runtime_escalations", {}).values():
+            history = entry.get("intent", {}).get("operator_retry_history") if isinstance(entry, dict) else None
+            if isinstance(history, list):
+                for index, item in enumerate(history):
+                    if isinstance(item, dict):
+                        history[index] = dict(item, prior_coder_context_delivery_run_id=None)
     return data
 
 
 def _validate(data: Any) -> dict[str, Any]:
     data = _migrate(data)
     required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases", "escalations", "runtime_escalations", "effective_routing")
-    if data.get("version") != 10 or any(not isinstance(data.get(k), dict) for k in required_roots):
+    if data.get("version") != 11 or any(not isinstance(data.get(k), dict) for k in required_roots):
         raise ValueError("review-gate configuration has an invalid shape")
     for key, binding in data["tasks"].items():
         if not isinstance(key, str) or not isinstance(binding, dict):
@@ -297,10 +308,13 @@ def _validate(data: Any) -> dict[str, Any]:
         if retry_history is not None:
             if (not isinstance(retry_history, list) or not retry_history
                     or any(not isinstance(item, dict)
-                           or set(item) != {"request_id", "snapshot", "prior_checkpoint", "checkpoint", "prior_implementation_run_id", "prior_transport", "status", "unblock_event_id"}
+                           or set(item) != {"request_id", "snapshot", "prior_checkpoint", "checkpoint", "prior_implementation_run_id", "prior_coder_context_delivery_run_id", "prior_transport", "status", "unblock_event_id"}
                            or not _text(item.get("request_id")) or not isinstance(item.get("prior_checkpoint"), dict)
                            or not isinstance(item.get("checkpoint"), dict)
                            or not isinstance(item.get("snapshot"), dict) or set(item["snapshot"]) != {"task", "runs", "events"}
+                           or (item.get("prior_coder_context_delivery_run_id") is not None
+                               and (type(item.get("prior_coder_context_delivery_run_id")) is not int
+                                    or item["prior_coder_context_delivery_run_id"] <= 0))
                            or (item.get("prior_transport") is not None and _runtime_transport(item.get("prior_transport")) is None)
                            or item.get("status") not in {"authorized", "unblock_attempted", "routed", "held"}
                            or (item.get("unblock_event_id") is not None and type(item.get("unblock_event_id")) is not int)
@@ -642,11 +656,14 @@ def authorize_operator_runtime_retry(board: str, task_id: str, *, entry: dict[st
         if any(item.get('request_id') == request_id for item in history if isinstance(item, dict)):
             raise ValueError("runtime operator retry request is already recorded")
         prior_pin = current.get('implementation_run_id')
+        prior_delivery = current.get('coder_context_delivery_run_id')
         prior_checkpoint = json.loads(json.dumps(current['checkpoint']))
         prior_transport = json.loads(json.dumps(intent['transport'])) if 'transport' in intent else None
         history.append({'request_id': request_id, 'snapshot': json.loads(json.dumps(snapshot)),
                         'prior_checkpoint': prior_checkpoint, 'checkpoint': json.loads(json.dumps(checkpoint)),
-                        'prior_implementation_run_id': prior_pin, 'prior_transport': prior_transport,
+                        'prior_implementation_run_id': prior_pin,
+                        'prior_coder_context_delivery_run_id': prior_delivery,
+                        'prior_transport': prior_transport,
                         'status': 'authorized', 'unblock_event_id': None})
         if prior_pin is not None:
             intent['prior_implementation_run_ids'] = [*intent.get('prior_implementation_run_ids', []), prior_pin]
@@ -663,6 +680,9 @@ def authorize_operator_runtime_retry(board: str, task_id: str, *, entry: dict[st
         current['intent'] = intent
         current['checkpoint'] = json.loads(json.dumps(checkpoint))
         current['implementation_run_id'] = None
+        # The retry is a new exact coder run.  Keep the historical receipt in
+        # its append-only retry record and let that new run receive its packet.
+        current.pop('coder_context_delivery_run_id', None)
         current['attempts'][-1]['intent'] = dict(current['attempts'][-1]['intent'], status='unblock_requested',
                                                  checkpoint=json.loads(json.dumps(checkpoint)))
         return json.loads(json.dumps(current))
