@@ -438,6 +438,7 @@ def test_explicit_operator_retry_archives_prior_pin_routes_first_and_is_idempote
     show['task']['assignee'] = 'strong'
     with state.locked_state(write=True) as data:
         data['runtime_escalations']['default:task']['implementation_run_id'] = 2274
+        data['runtime_escalations']['default:task']['coder_context_delivery_run_id'] = 2274
     calls = []
 
     def unblock(name, args):
@@ -457,8 +458,10 @@ def test_explicit_operator_retry_archives_prior_pin_routes_first_and_is_idempote
     stored = state.runtime_escalation_entry('task', 'default')
     assert stored['consumed_attempts'] == 1
     assert stored['implementation_run_id'] is None
+    assert stored.get('coder_context_delivery_run_id') is None
     assert stored['intent']['prior_implementation_run_ids'] == [2274]
     retry = stored['intent']['operator_retry_history'][-1]
+    assert retry['prior_coder_context_delivery_run_id'] == 2274
     assert retry['request_id'] == 'operator-request-1'
     assert retry['prior_implementation_run_id'] == 2274
     assert retry['status'] == 'routed' and retry['unblock_event_id'] == 21
