@@ -271,6 +271,24 @@ def test_runtime_resume_held_passes_the_explicit_operator_continuation_receipt(m
     assert calls == [('t_57851039', 'default', receipt)]
 
 
+def test_runtime_operator_retry_passes_task_scoped_request_id_and_returns_idempotent_result(monkeypatch):
+    calls = []
+    monkeypatch.setattr(plugin_api, 'operator_retry', lambda task_id, board, request_id:
+                        calls.append((task_id, board, request_id)) or {'ok': True, 'runtime_escalation': {},
+                                                                         'message': 'routed'}, raising=False)
+    response = client().post('/runtime-escalation/operator-retry', json={
+        'board': 'board-a', 'task_id': 'task-a', 'request_id': 'request-001',
+    })
+    assert response.status_code == 200
+    assert calls == [('task-a', 'board-a', 'request-001')]
+    assert response.json()['message'] == 'routed'
+
+
+def test_runtime_operator_retry_requires_request_id(monkeypatch):
+    response = client().post('/runtime-escalation/operator-retry', json={'board': 'board-a', 'task_id': 'task-a'})
+    assert response.status_code == 422
+
+
 def test_legacy_runtime_reconcile_route_is_an_alias_for_single_action_resume(monkeypatch):
     existing = {'board': 'board-a', 'task_id': 'rm03', 'intent': {'status': 'routed'}}
     calls = []

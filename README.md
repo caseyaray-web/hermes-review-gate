@@ -91,6 +91,14 @@ Then explicitly select the existing task with `POST /runtime-escalation/catch-up
 
 If a native effect is ambiguous, a checkpoint/owner/profile changes, or the bounded stronger attempt fails, the runtime intent remains held with a diagnostic reason. Neither recovery nor correction budgets are refunded. The coder's first normal tool is refused once with the durable continuation context, then only the exact admitted run may use tools. A fresh independent post-escalation review is still mandatory. Runtime status/hold reason and original/effective routing are exposed in dashboard telemetry.
 
+### Explicit operator runtime retry
+
+For a deliberately held runtime intent, an authenticated dashboard operator may submit `POST /runtime-escalation/operator-retry` with `board`, `task_id`, and a caller-generated `request_id`. The request ID is durable idempotency: replaying a routed ID returns the existing route and does not send another unblock. A new request ID is a separate explicit operator decision, not an automatic recovery grant.
+
+Before recording the request, the route validates that the task is blocked with no active claim/run, retains the exact immutable binding and task-scoped worktree, verifies its checkpoint, exclusive lease, enabled configured implementation/reviewer profiles, and captures the current native task/runs/events snapshot without changing files. It appends that checkpoint to retry history, archives any previous implementation admission pin, leaves automatic runtime-attempt consumption unchanged, publishes the exact effective route while blocked, and then calls native unblock. A unique unblock readback is required. The normal worker guard must still admit and pin the exact fresh task/run/profile claim, and the independent review gate remains unchanged.
+
+Historical failed runs do not immediately re-hold this newly authorized retry: monitoring scopes manual-retry failure handling to its new admitted implementation run. If the new worker fails, the route is held and no automatic retry is sent. An uncertain unblock/readback revokes route authority and leaves the manual request recorded as held; inspect native history before any new request ID.
+
 **This repository change does not enable either control on the live board, resume RM-03, touch its dirty files, or authorize deployment.**
 
 ## Optional autonomous failed-run recovery

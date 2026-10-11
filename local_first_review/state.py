@@ -283,6 +283,17 @@ def _validate(data: Any) -> dict[str, Any]:
                 raise ValueError("runtime operator continuation history is invalid") from exc
             if len(continuation_bytes) > 524288:
                 raise ValueError("runtime operator continuation history is invalid")
+        retry_history = entry_intent.get("operator_retry_history")
+        if retry_history is not None:
+            if (not isinstance(retry_history, list) or not retry_history
+                    or any(not isinstance(item, dict)
+                           or set(item) != {"request_id", "snapshot", "checkpoint", "prior_implementation_run_id", "status", "unblock_event_id"}
+                           or not _text(item.get("request_id")) or item.get("checkpoint") != entry.get("checkpoint")
+                           or not isinstance(item.get("snapshot"), dict) or set(item["snapshot"]) != {"task", "runs", "events"}
+                           or item.get("status") not in {"authorized", "routed", "held"}
+                           or (item.get("unblock_event_id") is not None and type(item.get("unblock_event_id")) is not int)
+                           for item in retry_history)):
+                raise ValueError("runtime operator retry history is invalid")
         transport_history = entry_intent.get("transport_history")
         if transport_history is not None:
             if (not isinstance(transport_history, list) or any(_runtime_transport(item) is None for item in transport_history)
@@ -601,6 +612,45 @@ def authorize_operator_continuation(board: str, task_id: str, *, entry: dict[str
         current['intent'] = intent
         current['attempts'][-1]['intent'] = dict(current['attempts'][-1]['intent'], status='unblock_requested')
         return json.loads(json.dumps(current))
+
+
+def authorize_operator_runtime_retry(board: str, task_id: str, *, entry: dict[str, Any], request_id: str,
+                                     snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Append a manual retry window without refunding automatic escalation."""
+    if not _text(request_id) or not isinstance(snapshot, dict) or set(snapshot) != {"task", "runs", "events"}:
+        raise ValueError("runtime operator retry request is invalid")
+    with locked_state(write=True) as data:
+        current = data['runtime_escalations'].get(binding_key(board, task_id))
+        if current != entry or current.get('intent', {}).get('status') != 'held':
+            raise ValueError("runtime operator retry intent changed")
+        intent = dict(current['intent'])
+        history = list(intent.get('operator_retry_history', []))
+        if any(item.get('request_id') == request_id for item in history if isinstance(item, dict)):
+            raise ValueError("runtime operator retry request is already recorded")
+        prior_pin = current.get('implementation_run_id')
+        history.append({'request_id': request_id, 'snapshot': json.loads(json.dumps(snapshot)),
+                        'checkpoint': json.loads(json.dumps(current['checkpoint'])),
+                        'prior_implementation_run_id': prior_pin, 'status': 'authorized', 'unblock_event_id': None})
+        if prior_pin is not None:
+            intent['prior_implementation_run_ids'] = [*intent.get('prior_implementation_run_ids', []), prior_pin]
+        intent.update(status='unblock_requested', operator_retry_history=history)
+        current['intent'] = intent
+        current['implementation_run_id'] = None
+        current['attempts'][-1]['intent'] = dict(current['attempts'][-1]['intent'], status='unblock_requested')
+        return json.loads(json.dumps(current))
+
+
+def record_operator_runtime_retry_result(board: str, task_id: str, *, request_id: str, status: str,
+                                         unblock_event_id: int | None = None) -> dict[str, Any]:
+    if status not in {'routed', 'held'}:
+        raise ValueError("runtime operator retry status is invalid")
+    with locked_state(write=True) as data:
+        entry = data['runtime_escalations'].get(binding_key(board, task_id))
+        history = entry.get('intent', {}).get('operator_retry_history') if isinstance(entry, dict) else None
+        if not isinstance(history, list) or not history or history[-1].get('request_id') != request_id:
+            raise ValueError("runtime operator retry history changed")
+        history[-1] = dict(history[-1], status=status, unblock_event_id=unblock_event_id)
+        return json.loads(json.dumps(entry))
 
 
 def record_runtime_escalation_transport(board: str, task_id: str, operation: str, *,

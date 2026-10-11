@@ -431,6 +431,53 @@ def test_runtime_unblock_readback_error_is_held_after_transport_attempt(runtime,
     assert state.load_state()['recovery_budgets']['default:task:implementation'] == 2
 
 
+def test_explicit_operator_retry_archives_prior_pin_routes_first_and_is_idempotent(runtime, monkeypatch):
+    """Manual retry is distinct from automatic budget and cannot replay a request ID."""
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='prior stronger worker failed')
+    show['task']['assignee'] = 'strong'
+    with state.locked_state(write=True) as data:
+        data['runtime_escalations']['default:task']['implementation_run_id'] = 2274
+    calls = []
+
+    def unblock(name, args):
+        calls.append((name, args, state.effective_routing('task', 'default')))
+        show['task'].update(status='ready', assignee='strong')
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
+        return {'ok': True, 'status': 'ready'}
+
+    monkeypatch.setattr(plugin, '_dispatch', unblock)
+    result = runtime_escalation.operator_retry('task', 'default', 'operator-request-1')
+
+    assert result['ok'] is True
+    assert calls == [('kanban_unblock', {'board': 'default', 'task_id': 'task'}, {
+        'board': 'default', 'task_id': 'task', 'attempt': 1,
+        'implementation_profile': 'strong', 'reviewer_profile': 'post-review',
+    })]
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored['consumed_attempts'] == 1
+    assert stored['implementation_run_id'] is None
+    assert stored['intent']['prior_implementation_run_ids'] == [2274]
+    retry = stored['intent']['operator_retry_history'][-1]
+    assert retry['request_id'] == 'operator-request-1'
+    assert retry['prior_implementation_run_id'] == 2274
+    assert retry['status'] == 'routed' and retry['unblock_event_id'] == 21
+    replay = runtime_escalation.operator_retry('task', 'default', 'operator-request-1')
+    assert replay['ok'] is True
+    assert len(calls) == 1
+
+
+def test_explicit_operator_retry_refuses_active_or_checkpoint_drift_without_writing(runtime, monkeypatch):
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='held')
+    before = state.runtime_escalation_entry('task', 'default')
+    show['task']['current_run_id'] = 99
+    show['runs'].append({'id': 99, 'ended_at': None})
+    result = runtime_escalation.operator_retry('task', 'default', 'operator-request-active')
+    assert result['ok'] is False
+    assert state.runtime_escalation_entry('task', 'default') == before
+
+
 def test_single_action_resume_refuses_later_unproven_run_without_state_change(runtime):
     """A later protocol-failed run cannot be inferred effect-free from its own summary."""
     binding, entry, show = runtime
