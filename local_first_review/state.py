@@ -196,6 +196,16 @@ def _migrate(data: Any) -> dict[str, Any]:
 
 
 def _validate(data: Any) -> dict[str, Any]:
+    # Diagnose newer writers before migration or any state write. Their pending
+    # effects cannot be made safe by discarding fields or relabelling the schema.
+    version = data.get("version") if isinstance(data, dict) else None
+    if type(version) is int and version > 11:
+        raise ValueError(
+            f"review-gate unsupported schema version {version}; this runtime supports "
+            "schema 11 and migrations from earlier versions. Use a compatible reviewed "
+            "runtime or an evidence-preserving migration on a copy first. "
+            "Do not downgrade the version, discard fields, or reset receipts/budgets."
+        )
     data = _migrate(data)
     required_roots = ("boards", "recovery", "recovery_budgets", "workspace_leases", "escalations", "runtime_escalations", "effective_routing")
     if data.get("version") != 11 or any(not isinstance(data.get(k), dict) for k in required_roots):

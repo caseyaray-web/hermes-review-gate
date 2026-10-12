@@ -40,13 +40,17 @@ For new board-policy-managed work, create the task with a repository-root `workt
 
 ```sh
 hermes kanban --board default create 'Implement the feature' \
-  --assignee impl --workspace worktree:/absolute/project \
+  --assignee impl --workspace worktree:/absolute/project --max-retries 1 \
   --body 'Acceptance criteria and required checks. Finish through finish_implementation; reviewers use submit_review.' --json
 ```
 
 Replace `impl`, the repository, and the body with the intended profile and acceptance criteria. Verify in `hermes kanban show TASK_ID` that `workspace_kind` is `worktree` and, after native dispatch, `workspace_path` resolves under `.worktrees/TASK_ID`. The dashboard's explicit **Enroll task** action is reserved for already-materialized linked worktrees; it refuses repository roots and shared `dir:` paths. Do not use it as a substitute for native worktree resolution. Existing bindings retain their original profiles and paths; there is no automatic migration.
 
-Configuration is stored in `local-first-review.json` in the shared native Kanban home (`HERMES_KANBAN_HOME` for dispatcher workers). It contains defaults and bindings, not phases or verdicts.
+For the existing autonomous exhaustion-recovery contract, **set `--max-retries 1` on every newly created managed ticket**. This task override takes precedence over `kanban.failure_limit`: native Kanban records the first exhausted run as `gave_up` with `effective_limit: 1`, then the plugin's separately configured durable per-phase budget owns any continuation. Omitting the flag can leave a ticket outside the plugin's narrow recovery eligibility. Do not change native recovery logic or globally lower unrelated tickets' retry limits. This creation recipe does not change an existing ticket, enable recovery/escalation, or repair ambiguous prior-run history.
+
+The assignee must match the board policy's implementation profile. Select the independent reviewer in that policy, not by assigning the new card directly to the reviewer; the plugin routes review after handoff. Install/enable the same artifact in all selected implementation/review profiles and ensure `sdlc-review` is discoverable in the reviewers' Kanban context. Example profile roles in the audited deployment are `worker-code-local` (implementation), `worker-architect-sol` (review), and `worker-code-terra` / `worker-review-terra` (escalated implementation/review); these names do not guarantee model/provider readiness. Verify effective profile configuration before release. This is an operator creation contract, not automatic enforcement on arbitrary native cards.
+
+Configuration is stored in `local-first-review.json` in the shared native Kanban home (`HERMES_KANBAN_HOME` for dispatcher workers). It contains defaults, bindings, recovery budgets and effect receipts; do not reset or manually downgrade it.
 
 ## Worker and reviewer flow
 

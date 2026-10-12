@@ -669,7 +669,7 @@ def test_native_rm02_started_iteration_exhaustion_is_adopted_and_admitted(board,
         assert b.kbd._record_task_failure(
             b.conn, task_id,
             'Iteration budget exhausted (180/180) — task could not complete within the allowed iterations',
-            outcome='timed_out', release_claim=True, end_run=True,
+            outcome='timed_out', failure_limit=4, release_claim=True, end_run=True,
             event_payload_extra={'budget_used': 180, 'budget_max': 180},
         )
     finally:
@@ -679,6 +679,13 @@ def test_native_rm02_started_iteration_exhaustion_is_adopted_and_admitted(board,
     failed_run = failed['runs'][0]
     assert failed_run['outcome'] == 'gave_up'
     terminal = next(event for event in failed['events'] if event['kind'] == 'gave_up' and event['run_id'] == failed_run['id'])
+    # The documented task override wins over a dispatcher's broader default;
+    # the existing plugin budget, not native repeated runs, owns continuation.
+    assert failed['task']['max_retries'] == 1
+    assert failed['task']['workspace_kind'] == 'worktree'
+    assert Path(failed['task']['workspace_path']) == workspace
+    assert terminal['payload']['effective_limit'] == 1
+    assert terminal['payload']['limit_source'] == 'task'
     assert terminal['payload']['trigger_outcome'] == 'timed_out'
     assert terminal['payload']['budget_used'] == terminal['payload']['budget_max'] == 180
     assert any(event['kind'] == 'spawned' and event['run_id'] == failed_run['id'] for event in failed['events'])
