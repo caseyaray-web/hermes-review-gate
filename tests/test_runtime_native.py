@@ -24,7 +24,7 @@ def test_native_old_review_retry_cannot_manufacture_correction_threshold(board):
         assert b.call('submit_review',verdict='changes_requested',rationale='Duplicate old verdict.')['error']
     show=b.show()
     assert plugin._changes_count(show['runs'],show['events'],state.task_binding(b.pred,'default'))==1
-    assert show['task']['status'] in {'blocked','triage'}
+    assert (show['task']['status'], show['task']['block_kind'], show['task']['block_recurrences']) == ('scheduled', 'needs_input', 1)
     assert state.effective_routing(b.pred,'default') is None
     assert b.kb.get_task(b.conn,b.child).status=='todo'
 

@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from typing import Any
 
 from .review_evidence import changes_requested_verdicts, correction_count
+from .native import needs_stable_operator_hold
 from .state import (MAX_CHANGES, authorize_recovery_run, bind_first_owned_run, board_name, board_policy,
                     current_escalation_attempt, deliver_runtime_coder_context, escalation_entry, is_managed, pin_recovery_receipt, profile_exists, publish_runtime_escalation_routing,
                     reconcile_pending_escalation, recovery_budget_exhausted, recovery_entry, reserve_runtime_escalation, runtime_escalation_entry,
@@ -495,6 +496,21 @@ def _escalate_after_exhaustion(task_id: str, binding: dict[str, Any], show: dict
     return value
 
 
+def _operator_hold_transition(show: dict[str, Any], reason: str) -> tuple[str, dict[str, Any], str]:
+    """Choose a per-task native hold without allowing a repeat into triage.
+
+    The ordinary first hold remains the human-visible ``needs_input`` block.
+    Only the exact repetition that native would promote to ``triage`` uses
+    ``kanban_schedule``. Scheduled cards are not dispatchable or
+    auto-decomposable and require an explicit native unblock, so this neither
+    changes global auto-decompose settings nor releases dependencies.
+    """
+    task = show.get("task") if isinstance(show, dict) else None
+    if needs_stable_operator_hold(task):
+        return "kanban_schedule", {"reason": reason}, "scheduled"
+    return "kanban_block", {"reason": reason, "kind": "needs_input"}, "blocked"
+
+
 def submit_review(args: dict[str, Any], **_: Any) -> str:
     _arguments(args, {"verdict", "rationale"})
     _session()
@@ -518,12 +534,13 @@ def submit_review(args: dict[str, Any], **_: Any) -> str:
         # A routed runtime escalation has its single recovery replacement already
         # consumed. Preserve the reviewer finding in the terminal native block;
         # never turn this negative verdict into another implementation/review loop.
-        tool, native_args = "kanban_block", {"reason": "Runtime escalation is exhausted; independent reviewer requested changes. Latest findings: " + rationale,
-                                              "kind": "needs_input"}
-        expected_status, expected_event = "blocked", None
+        tool, native_args, expected_status = _operator_hold_transition(
+            show, "Runtime escalation is exhausted; independent reviewer requested changes. Latest findings: " + rationale)
+        expected_event = None
     elif any(v['candidate'] == _review['candidate'] for v in changes_requested_verdicts(show['runs'], show['events'], _binding_value)):
-        tool, native_args = 'kanban_block', {'reason': 'Unchanged rejected candidate was retried; no additional correction budget was charged. Latest findings: ' + rationale, 'kind':'needs_input'}
-        expected_status, expected_event = 'blocked', None
+        tool, native_args, expected_status = _operator_hold_transition(
+            show, 'Unchanged rejected candidate was retried; no additional correction budget was charged. Latest findings: ' + rationale)
+        expected_event = None
     elif _changes_count(show["runs"], show["events"], _binding_value) >= (board_policy(board_name()) or {}).get("escalation", {}).get("normal_correction_limit", MAX_CHANGES):
         policy = board_policy(board_name()) or {}
         escalation = policy.get("escalation", {})
@@ -536,13 +553,15 @@ def submit_review(args: dict[str, Any], **_: Any) -> str:
                 # for exact native/operator reconciliation instead.
                 raise
             except (ValueError, GateError) as exc:
-                tool, native_args = "kanban_block", {"reason": "Review escalation exhausted or refused; operator attention required. Latest findings: " + rationale, "kind": "needs_input"}
-                expected_status, expected_event = "blocked", None
+                tool, native_args, expected_status = _operator_hold_transition(
+                    show, "Review escalation exhausted or refused; operator attention required. Latest findings: " + rationale)
+                expected_event = None
             else:
                 return _result(value, verdict=verdict, escalated=True)
         else:
-            tool, native_args = "kanban_block", {"reason": "Review changes exhausted; operator attention required. Latest findings: " + rationale, "kind": "needs_input"}
-            expected_status, expected_event = "blocked", None
+            tool, native_args, expected_status = _operator_hold_transition(
+                show, "Review changes exhausted; operator attention required. Latest findings: " + rationale)
+            expected_event = None
     else:
         tool, native_args = "kanban_request_changes", {"reason": rationale}
         expected_status, expected_event = "ready", "changes_requested"
@@ -1053,6 +1072,47 @@ def _routed_escalation_guard(task_id: str, board: str, entry: dict[str, Any]) ->
     return None
 
 
+def _runtime_coder_delivery_envelope(*, board: str, task_id: str, run_id: int, profile: str,
+                                    binding: dict[str, Any], packet: dict[str, Any]) -> dict[str, Any]:
+    """Wrap the sealed v11 packet in live, verified delivery authority.
+
+    ``coder_context`` remains the schema-limited historical packet.  The
+    envelope is deliberately built here, after native admission, rather than
+    persisted: run/profile/route are volatile authority and must not be copied
+    into the durable v11 context contract.
+    """
+    entry = runtime_escalation_entry(task_id, board)
+    if (not isinstance(entry, dict) or entry.get("binding") != binding
+            or entry.get("intent", {}).get("status") != "routed"
+            or entry.get("implementation_run_id") != run_id
+            or entry.get("workspace_path") != binding.get("workspace_path")):
+        raise GateError("runtime coder delivery authority changed")
+    route = trusted_routing(task_id, board, binding)
+    if route.get("implementation_profile") != profile:
+        raise GateError("runtime coder delivery profile is no longer routed")
+    history = entry.get("intent", {}).get("operator_retry_history", [])
+    if not isinstance(history, list):
+        raise GateError("runtime coder retry history is invalid")
+    # Native snapshots are retained durably for audit but can be too large for
+    # model context.  Deliver only the retry identities and checkpoint/receipt
+    # evidence needed to understand the continuation, never a new authority.
+    evidence_fields = ("request_id", "prior_checkpoint", "checkpoint", "prior_implementation_run_id",
+                       "prior_coder_context_delivery_run_id", "prior_transport", "status", "unblock_event_id")
+    evidence = [{field: item.get(field) for field in evidence_fields}
+                for item in history if isinstance(item, dict)]
+    if len(evidence) != len(history):
+        raise GateError("runtime coder retry history is invalid")
+    return {
+        "context": packet,
+        "admission": {"run_id": run_id, "profile": profile,
+                      "workspace_path": entry["workspace_path"], "route": route},
+        "historical_retry_evidence": evidence,
+        "next_action": "Inspect and continue the existing dirty checkpoint; do not accept or clean it.",
+        "history_authority": ("Historical retry evidence is context only, not current blocked-task authority; "
+                              "only the current routed admission above authorizes tools."),
+    }
+
+
 def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | None:
     """Protect only normal model tool calls; environment owns the worker task id."""
     runtime = None
@@ -1080,9 +1140,15 @@ def guard(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | N
                 # reviewer must get its normal review context instead, and may
                 # never consume the single coder delivery receipt.
                 if worker_profile() == route.get("implementation_profile"):
-                    packet = deliver_runtime_coder_context(board_name(), task_id, _run_id())
+                    run_id, profile = _run_id(), worker_profile()
+                    if not isinstance(profile, str) or not profile:
+                        return {"action": "block", "message": "Runtime escalation worker profile is unavailable; no coder context is authorized."}
+                    packet = deliver_runtime_coder_context(board_name(), task_id, run_id)
                     if packet is not None:
-                        return {"action": "block", "message": "Fresh runtime catch-up coder context (inspect and continue the existing dirty checkpoint; do not accept or clean it): " + json.dumps(packet, sort_keys=True)}
+                        envelope = _runtime_coder_delivery_envelope(
+                            board=board_name(), task_id=task_id, run_id=run_id, profile=profile,
+                            binding=binding, packet=packet)
+                        return {"action": "block", "message": "Fresh runtime catch-up coder context: " + json.dumps(envelope, sort_keys=True)}
             pending = escalation_entry(task_id, board_name())
             if pending and current_escalation_attempt(pending).get("intent", {}).get("status") == "changes_requested_pending":
                 # Only the exact newly assigned target claim may turn a pending

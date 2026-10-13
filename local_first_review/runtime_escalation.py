@@ -448,11 +448,12 @@ def _reconcile_operator_retry_locked(task_id, board, entry, p):
     try:
         result = p._dispatch('kanban_unblock', {'board': board, 'task_id': task_id})
     except Exception as exc:
+        # A lost response is not proof that the supported native effect failed.
+        # Persist its exact transport exception, then reconcile only from a
+        # complete, unique native readback.  This attempt is already spent.
         state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', error=exc)
-        hold(board, task_id, f'Operator retry native unblock transport is uncertain: {type(exc).__name__}: {exc}')
-        state.record_operator_runtime_retry_result(board, task_id, request_id=request_id, status='held')
-        return False
-    state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', result=result)
+    else:
+        state.record_runtime_escalation_transport(board, task_id, 'kanban_unblock', result=result)
     try:
         after = native.snapshot(board, task_id)
     except Exception as exc:
@@ -813,7 +814,9 @@ def admit(task_id, board, run_id, profile, show):
         return reject('route is not published')
     settings = policy.get('runtime_escalation', {})
     attempts = entry.get('attempts')
-    route = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 and isinstance(attempts[0], dict) else None
+    # A retry continuation retains prior attempts as immutable provenance.  The
+    # live worker contract is always the final, currently published attempt.
+    route = attempts[-1] if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict) else None
     task = show.get('task') if isinstance(show, dict) else None
     runs = show.get('runs') if isinstance(show, dict) else None
     events = show.get('events') if isinstance(show, dict) else None

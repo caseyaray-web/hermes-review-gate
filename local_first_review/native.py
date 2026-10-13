@@ -5,6 +5,24 @@ import sqlite3
 from typing import Any
 
 
+def needs_stable_operator_hold(task: dict[str, Any] | None) -> bool:
+    """Whether another ``needs_input`` block would be promoted to triage.
+
+    Hermes makes a repeated typed block a ``triage`` task at its native loop
+    limit. The gateway's auto-decomposer consumes triage tasks, so an
+    operator-owned hold must use the supported per-task ``scheduled`` lane on
+    that final repetition instead. This helper is read-only: it neither resets
+    native recurrence accounting nor changes dispatcher policy.
+    """
+    if not isinstance(task, dict) or task.get("block_kind") != "needs_input":
+        return False
+    recurrences = task.get("block_recurrences")
+    if type(recurrences) is not int:
+        return False
+    from hermes_cli import kanban_db as kb
+    return recurrences >= kb.BLOCK_RECURRENCE_LIMIT - 1
+
+
 def _connection(board: str) -> sqlite3.Connection:
     from hermes_cli import kanban_db as kb
     path = kb.kanban_db_path(board=board)

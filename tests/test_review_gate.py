@@ -264,8 +264,7 @@ def test_correction_limit_from_native_runs(board):
         assert result['ok'],result
         b.gated()
     show=b.show()
-    assert show['task']['status'] in ('blocked', 'triage')
-    assert show['task']['block_kind']=='needs_input'
+    assert (show['task']['status'], show['task']['block_kind'], show['task']['block_recurrences']) == ('scheduled', 'needs_input', 1)
     assert len([r for r in show['runs'] if r['outcome']=='changes_requested'])==2
     assert 'Missing required behavior 2' in show['runs'][-1]['summary']
 
@@ -489,7 +488,8 @@ def test_escalation_disabled_and_exhausted_attempt_hold_operator(board):
         if cycle < 2:
             (b.repo / 'implementation.txt').write_text(f'correction {cycle}\n')
             b.git('add', '.'); b.git('commit', '-qm', f'correction {cycle}')
-    assert b.show()['task']['status'] in {'blocked', 'triage'}
+    held = b.show()['task']
+    assert (held['status'], held['block_kind'], held['block_recurrences']) == ('scheduled', 'needs_input', 1)
 
 
 def test_ambiguous_handoff_native_readback_and_restart(board,monkeypatch):

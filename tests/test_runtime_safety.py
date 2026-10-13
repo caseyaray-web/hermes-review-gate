@@ -470,6 +470,39 @@ def test_explicit_operator_retry_archives_prior_pin_routes_first_and_is_idempote
     assert len(calls) == 1
 
 
+def test_admission_uses_current_paid_continuation_contract_not_historical_attempt(runtime):
+    """The live paid worker is pinned from the current route, never old failure provenance."""
+    binding, entry, show = runtime
+    state.set_runtime_escalation_policy('default', enabled=True, max_attempts=1,
+                                        implementation_profile='paid', reviewer_profile='paid-review')
+    current_attempt = {
+        'attempt': 2, 'implementation_profile': 'paid', 'reviewer_profile': 'paid-review',
+        'intent': {'status': 'routed'},
+    }
+    current_route = {
+        'board': 'default', 'task_id': 'task', 'attempt': 2,
+        'implementation_profile': 'paid', 'reviewer_profile': 'paid-review',
+    }
+    with state.locked_state(write=True) as data:
+        stored = data['runtime_escalations']['default:task']
+        stored['consumed_attempts'] = 2
+        stored['attempts'].append(current_attempt)
+        stored['intent']['status'] = 'routed'
+        data['effective_routing']['default:task'] = current_route
+    show['task'].update(status='running', assignee='paid', current_run_id=12)
+    show['runs'] = [{'id': 12, 'profile': 'paid', 'status': 'running', 'ended_at': None}]
+    show['events'].append({'id': 21, 'kind': 'claimed', 'run_id': 12,
+                           'payload': {'source_status': 'ready'}})
+
+    assert runtime_escalation.admit('task', 'default', 12, 'paid', show) is None
+    assert runtime_escalation.admit('task', 'default', 12, 'strong', show) is not None
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored is not None
+    assert stored['implementation_run_id'] == 12
+    assert stored['attempts'][0]['implementation_profile'] == 'strong'
+    assert stored['attempts'][-1] == current_attempt
+
+
 def test_explicit_operator_retry_refuses_active_or_checkpoint_drift_without_writing(runtime, monkeypatch):
     binding, entry, show = runtime
     state.update_runtime_escalation_intent('default', 'task', 'held', reason='held')
@@ -512,8 +545,8 @@ def test_explicit_operator_retry_accepts_current_dirty_checkpoint_and_archives_p
     assert stored['consumed_attempts'] == 1
 
 
-def test_operator_retry_attempted_send_is_held_without_restart_resend(runtime, monkeypatch):
-    """A durable attempted-send marker makes an uncertain manual effect one-shot."""
+def test_operator_retry_lost_response_reconciles_unique_native_unblock_without_resend(runtime, monkeypatch):
+    """A lost reply is transport evidence, not proof that the native unblock failed."""
     binding, entry, show = runtime
     state.update_runtime_escalation_intent('default', 'task', 'held', reason='first bounded route failed')
     show['task']['assignee'] = 'strong'
@@ -521,15 +554,55 @@ def test_operator_retry_attempted_send_is_held_without_restart_resend(runtime, m
 
     def lost_response(*_args):
         sends.append('unblock')
+        show['task'].update(status='ready', assignee='strong')
+        show['events'].append({'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None})
         raise OSError('response lost after native call')
 
     monkeypatch.setattr(plugin, '_dispatch', lost_response)
-    assert not runtime_escalation.operator_retry('task', 'default', 'operator-lost-response')['ok']
+    result = runtime_escalation.operator_retry('task', 'default', 'operator-lost-response')
+
+    assert result['ok'] is True
     stored = state.runtime_escalation_entry('task', 'default')
+    assert stored is not None
+    assert stored['intent']['status'] == 'routed'
+    assert stored['intent']['operator_retry_history'][-1]['status'] == 'routed'
+    assert stored['intent']['operator_retry_history'][-1]['unblock_event_id'] == 21
+    assert stored['intent']['transport_history'][-1]['error'] == {
+        'type': 'OSError', 'message': 'response lost after native call',
+    }
+    assert state.effective_routing('task', 'default')['implementation_profile'] == 'strong'
+    replay = runtime_escalation.operator_retry('task', 'default', 'operator-lost-response')
+    assert replay['ok'] is True
+    assert sends == ['unblock']
+
+
+def test_operator_retry_lost_response_with_ambiguous_readback_holds_without_resend(runtime, monkeypatch):
+    """A transport exception cannot authorize a retry unless one exact unblock is read back."""
+    binding, entry, show = runtime
+    state.update_runtime_escalation_intent('default', 'task', 'held', reason='first bounded route failed')
+    show['task']['assignee'] = 'strong'
+    sends = []
+
+    def lost_response(*_args):
+        sends.append('unblock')
+        show['task'].update(status='ready', assignee='strong')
+        show['events'].extend([
+            {'id': 21, 'kind': 'unblocked', 'run_id': None, 'payload': None},
+            {'id': 22, 'kind': 'unblocked', 'run_id': None, 'payload': None},
+        ])
+        raise OSError('response lost after native call')
+
+    monkeypatch.setattr(plugin, '_dispatch', lost_response)
+    result = runtime_escalation.operator_retry('task', 'default', 'operator-ambiguous-response')
+
+    assert result['ok'] is False
+    stored = state.runtime_escalation_entry('task', 'default')
+    assert stored is not None
     assert stored['intent']['status'] == 'held'
     assert stored['intent']['operator_retry_history'][-1]['status'] == 'held'
+    assert stored['intent']['transport_history'][-1]['error']['type'] == 'OSError'
     assert state.effective_routing('task', 'default') is None
-    runtime_escalation.reconcile('task', 'default')
+    assert runtime_escalation.operator_retry('task', 'default', 'operator-ambiguous-response')['ok'] is False
     assert sends == ['unblock']
 
 
